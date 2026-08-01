@@ -1,0 +1,220 @@
+/* Epic Astro Story — web port */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: #05060f;
+  font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(1200px 700px at 50% -10%, #141a3a 0%, transparent 60%),
+    radial-gradient(900px 500px at 85% 110%, #1a1030 0%, transparent 55%),
+    #05060f;
+  touch-action: none;
+}
+
+#screen {
+  background: #000;
+  border-radius: 6px;
+  box-shadow: 0 30px 90px rgba(0,0,0,.65), 0 0 0 1px rgba(120,140,255,.12);
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  max-width: 100vw;
+  max-height: 100vh;
+}
+
+#game-ui { position: fixed; inset: 0; pointer-events: none; z-index: 20; }
+#game-ui > * { pointer-events: auto; }
+
+/* ---------- HUD ---------- */
+#log-btn {
+  position: fixed; right: 14px; bottom: 14px; z-index: 40;
+  width: 40px; height: 40px; border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+  background: rgba(30,36,70,.85); color: #cfe0ff;
+  border: 1px solid rgba(140,160,255,.35);
+  font-size: 18px; cursor: pointer;
+  backdrop-filter: blur(4px);
+}
+#log-btn:hover { background: rgba(50,60,110,.95); }
+
+#fps {
+  position: fixed; left: 10px; top: 8px; z-index: 40;
+  color: #9fe6a0; font: 12px/1.4 ui-monospace, Consolas, monospace;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+}
+
+#ai-docs-btn {
+  position: fixed; right: 14px; top: 14px; z-index: 40;
+  min-width: 36px; height: 28px; padding: 0 8px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #4338ca, #7c3aed);
+  color: #fff; font-size: 12px; font-weight: 700; letter-spacing: .5px;
+  border: 1px solid rgba(255,255,255,.35);
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(80,60,220,.5);
+}
+#ai-docs-btn:hover { filter: brightness(1.15); }
+
+#ai-docs-modal {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(4,6,18,.72);
+  display: none; align-items: center; justify-content: center;
+  backdrop-filter: blur(3px);
+}
+#ai-docs-modal.open { display: flex; }
+#ai-docs-card {
+  width: min(920px, 94vw); height: min(680px, 90vh);
+  background: #0d1126; color: #dbe4ff;
+  border: 1px solid rgba(130,150,255,.25);
+  border-radius: 12px; overflow: hidden;
+  box-shadow: 0 40px 120px rgba(0,0,0,.7);
+  display: flex; flex-direction: column;
+}
+#ai-docs-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #232a52, #1a1440);
+  border-bottom: 1px solid rgba(130,150,255,.2);
+  font-weight: 600; font-size: 14px;
+}
+#ai-docs-close {
+  background: none; border: 0; color: #9fb2ff; font-size: 16px; cursor: pointer; padding: 4px 8px;
+}
+#ai-docs-close:hover { color: #fff; }
+#ai-docs-body {
+  padding: 18px 22px; overflow-y: auto; font-size: 13.5px; line-height: 1.55;
+}
+#ai-docs-body h2 { font-size: 19px; margin: 4px 0 10px; color: #fff; }
+#ai-docs-body h3 { font-size: 15px; margin: 18px 0 8px; color: #b6c6ff; }
+#ai-docs-body p, #ai-docs-body li, #ai-docs-body td, #ai-docs-body th { color: #c4cfee; }
+#ai-docs-body ul, #ai-docs-body ol { padding-left: 22px; margin: 6px 0; }
+#ai-docs-body li { margin: 4px 0; }
+#ai-docs-body code {
+  background: rgba(120,140,255,.12); color: #d8e3ff;
+  padding: 1px 5px; border-radius: 4px; font-size: 12px;
+}
+#ai-docs-body pre {
+  background: #070a1a; color: #a8f0b0;
+  border: 1px solid rgba(130,150,255,.15);
+  padding: 12px 14px; border-radius: 8px; overflow-x: auto;
+  font: 12px/1.5 ui-monospace, Consolas, monospace; margin: 8px 0;
+}
+#ai-docs-body table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12.5px; }
+#ai-docs-body td, #ai-docs-body th {
+  border: 1px solid rgba(130,150,255,.18); padding: 6px 8px; text-align: left; vertical-align: top;
+}
+#ai-docs-body th { background: rgba(120,140,255,.1); color: #e6ecff; }
+
+/* ---------- log panel ---------- */
+#log-panel {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  height: 220px; background: rgba(5,8,22,.96);
+  border-top: 1px solid rgba(130,150,255,.25);
+  transform: translateY(100%); transition: transform .18s ease-out;
+  display: flex; flex-direction: column;
+}
+#log-panel.open { transform: translateY(0); }
+#log-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 12px; font-size: 12px; color: #aab8ff;
+  border-bottom: 1px solid rgba(130,150,255,.15);
+}
+#log-close { background: none; border: 0; color: #aab8ff; cursor: pointer; font-size: 13px; padding: 2px 8px; }
+#log-box {
+  flex: 1; overflow-y: auto; padding: 8px 12px;
+  font: 11px/1.45 ui-monospace, Consolas, monospace;
+  color: #9fb7d8; white-space: pre-wrap; word-break: break-all;
+}
+
+/* ---------- Android-style dialogs ---------- */
+.dlg-shadow {
+  position: fixed; inset: 0; z-index: 30;
+  background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center;
+}
+.dlg-box {
+  min-width: 260px; max-width: min(460px, 90vw);
+  background: #f6f6f6; color: #111;
+  border-radius: 6px; overflow: hidden;
+  box-shadow: 0 22px 60px rgba(0,0,0,.6);
+  font-family: Roboto, "Droid Sans", sans-serif;
+}
+.dlg-title {
+  padding: 14px 16px 8px; font-size: 17px; font-weight: 500; color: #222;
+}
+.dlg-msg { padding: 10px 16px; font-size: 14.5px; color: #333; white-space: pre-wrap; }
+.dlg-input {
+  display: block; width: calc(100% - 32px); margin: 6px 16px 10px;
+  padding: 8px 10px; font-size: 15px;
+  border: 1px solid #bbb; border-radius: 2px; outline: none;
+}
+.dlg-input:focus { border-color: #4285f4; box-shadow: 0 0 0 2px rgba(66,133,244,.25); }
+.dlg-list { max-height: 40vh; overflow-y: auto; padding: 4px 0; }
+.dlg-item { padding: 12px 16px; font-size: 15px; cursor: pointer; }
+.dlg-item:hover { background: #e8eef9; }
+.dlg-btns { display: flex; justify-content: flex-end; padding: 6px 8px 10px; gap: 4px; }
+.dlg-btn {
+  padding: 8px 14px; font-size: 14px; border: 0; border-radius: 2px;
+  background: transparent; color: #2a5bd7; font-weight: 500; cursor: pointer;
+  text-transform: uppercase; letter-spacing: .3px;
+}
+.dlg-btn:hover { background: rgba(42,91,215,.1); }
+.dlg-btn:active { background: rgba(42,91,215,.2); }
+
+/* ---------- toast ---------- */
+.toast {
+  position: fixed; bottom: 42px; left: 50%; transform: translateX(-50%) translateY(20px);
+  background: rgba(20,20,20,.92); color: #eee;
+  padding: 10px 18px; border-radius: 6px; font-size: 14px; z-index: 35;
+  opacity: 0; transition: opacity .25s, transform .25s;
+  max-width: 80vw; text-align: center;
+  pointer-events: none;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ---------- loading ---------- */
+#loading {
+  position: fixed; inset: 0; z-index: 55;
+  background: radial-gradient(800px 500px at 50% 30%, #0d1330 0%, #05060f 70%);
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity .5s ease;
+}
+#loading.hidden { opacity: 0; pointer-events: none; }
+.load-inner { text-align: center; color: #cdd7ff; max-width: 320px; padding: 20px; }
+.load-icon { width: 72px; height: 72px; border-radius: 14px; margin-bottom: 18px; box-shadow: 0 12px 40px rgba(60,80,200,.45); }
+.load-title { font-size: 22px; font-weight: 700; letter-spacing: .4px; }
+.load-sub { font-size: 12px; opacity: .6; margin-top: 6px; margin-bottom: 26px; }
+#load-bar {
+  height: 6px; border-radius: 3px; background: rgba(120,140,255,.18); overflow: hidden;
+}
+#load-bar-fill {
+  height: 100%; width: 0%;
+  background: linear-gradient(90deg, #4f6ef7, #8f5cf5);
+  border-radius: 3px; transition: width .25s ease;
+}
+#load-status { margin-top: 12px; font-size: 12px; opacity: .75; font-family: ui-monospace, Consolas, monospace; }
+
+/* ---------- finish overlay ---------- */
+.finish-overlay {
+  position: fixed; inset: 0; z-index: 45;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(5,7,16,.9); color: #dfe6ff;
+  font-size: 18px; text-align: center; line-height: 1.7;
+}
+
+@media (max-width: 640px) {
+  .dlg-box { min-width: 220px; }
+  #log-panel { height: 180px; }
+}

@@ -1,0 +1,7 @@
+{
+  "package": "net.kairosoft.android.frontier_en",
+  "versionCode": 2,
+  "versionName": "1.0.1",
+  "mainActivity": "net.kairosoft.android.frontier_en.Main",
+  "appName": "Epic Astro Story"
+}

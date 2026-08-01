@@ -1,0 +1,133 @@
+Signature-Version: 1.0
+Created-By: 1.0 (Android SignApk)
+SHA1-Digest-Manifest: Z6R1sBBqtyo4QmDtFcPMr5kycPc=
+
+Name: res/raw/secchi.ogg
+SHA1-Digest: 7Wr2MqwqXOnsljfBgXPhBuBeRFs=
+
+Name: res/raw/tekkyo.ogg
+SHA1-Digest: v10j3Whf1a1Q6tHHRWA052zcrIg=
+
+Name: assets/map.dat
+SHA1-Digest: /MgydYraA2nQFO6scd0PzcoCPNc=
+
+Name: assets/com.dat
+SHA1-Digest: 7GTDHxDAMAJjvOopG98mmoxpbHw=
+
+Name: res/raw/battle.ogg
+SHA1-Digest: 45pCXRBX4i2j+ktHgfdbezdZTJQ=
+
+Name: res/raw/sad.ogg
+SHA1-Digest: /yAuRWcEylweYUgN/8Sk4i6n0UU=
+
+Name: assets/vehicle.dat
+SHA1-Digest: LfvNpyBsQPlcfH82/BQG2SiwiVg=
+
+Name: res/raw/damage.ogg
+SHA1-Digest: 6saaE6RuyWd9g2p5NRIZE2qzvDE=
+
+Name: resources.arsc
+SHA1-Digest: VUUVzb+EfCkEU6fnOi7a0x3BpVM=
+
+Name: res/raw/main3.ogg
+SHA1-Digest: mbg/ztyZIcsEA5qmXOPto9AcVjo=
+
+Name: assets/xls.dat
+SHA1-Digest: sWg/hGKMl8tdhy7C1WASDirjjcI=
+
+Name: res/raw/title.ogg
+SHA1-Digest: wmwVMnY6xoWGfJQKY21KYiy3Vr8=
+
+Name: assets/weapon.dat
+SHA1-Digest: 4QUArfbTcGXI5BoMd4XtpvILpqk=
+
+Name: assets/battle_body.dat
+SHA1-Digest: iMu/GMkpjy3S6jy4RJwKXMy7xkw=
+
+Name: AndroidManifest.xml
+SHA1-Digest: 1irzUX05PBYXdlw74+tVl2sZVuc=
+
+Name: res/drawable-ldpi/icon.png
+SHA1-Digest: 6RYKFVAfbnI8KAlerWNrHdH7CEk=
+
+Name: res/raw/happy.ogg
+SHA1-Digest: 7Dmz5jsIRm7n2/XjcSo+G93LDjY=
+
+Name: res/drawable-mdpi/icon.png
+SHA1-Digest: /TJcEZhx0JdU02W3UnHNXsqJJdU=
+
+Name: assets/normal_body.dat
+SHA1-Digest: 64hL8tWrzPfrw51jqq4xwlnYkBU=
+
+Name: res/raw/main1.ogg
+SHA1-Digest: KKOIXuXh0oCnmdxqOpRvk8Yh83o=
+
+Name: res/raw/money_nyuukin.ogg
+SHA1-Digest: xAKVYY+b99hMyMXb5QAgD5q7eyM=
+
+Name: assets/training.dat
+SHA1-Digest: lETW1htLX5IsbXuZc1KYXmlfYh4=
+
+Name: res/raw/manzokudo_up.ogg
+SHA1-Digest: hAGxJe3bhEguc8+H0qGl7KwOl34=
+
+Name: assets/head.dat
+SHA1-Digest: Wm73ob621aty1MhXNNISFJFJLGI=
+
+Name: assets/event.dat
+SHA1-Digest: E8IDycgg64U2cBaRyUVtr9TAubY=
+
+Name: assets/planet.dat
+SHA1-Digest: SUPx/4IPPn0UzW9UeDWG9ALP+mI=
+
+Name: assets/system.dat
+SHA1-Digest: qJKDb19748r4CkGbGZYY14nznR4=
+
+Name: res/raw/snd.inf
+SHA1-Digest: Um9NWra2Jp7TRogzRPzNd9nsNzQ=
+
+Name: res/raw/win.ogg
+SHA1-Digest: btXPB8h0hdmNGY4X070OWBeeyJo=
+
+Name: assets/title.dat
+SHA1-Digest: 5WXQHPUUN8WclEVyfHDEooS5TS0=
+
+Name: assets/chip.dat
+SHA1-Digest: 6cJVLUNkrao4QBeUeLNCjmrHmZY=
+
+Name: assets/lineup.dat
+SHA1-Digest: RZUeBOXtYrjA6/zsioWyw3Q9t3w=
+
+Name: classes.dex
+SHA1-Digest: SAGQm3mJ0g54ZK6P+/8MLZPIhr4=
+
+Name: res/raw/lose.ogg
+SHA1-Digest: Ve31GvMYRBGPnTzE9CAYkoggWOY=
+
+Name: res/layout/main.xml
+SHA1-Digest: gOeKvuvk6hfXKFf0IvpgLUT1clc=
+
+Name: assets/load.dat
+SHA1-Digest: FSRzTI0jvB7EVyrwu7ekcaaP9+0=
+
+Name: res/raw/death.ogg
+SHA1-Digest: QdpMtw95LUo5oecr9K6S7eQBAag=
+
+Name: assets/battle.dat
+SHA1-Digest: zEYohprcFnvxGcuascE8T3W4YS4=
+
+Name: assets/battlefield.dat
+SHA1-Digest: 6yZ4gw68DGHJZO7IbYCIYZYO2Ns=
+
+Name: res/raw/money_shukkin.ogg
+SHA1-Digest: f/DjapseqIcZ0V/xMsbizYCcAf0=
+
+Name: res/raw/main2.ogg
+SHA1-Digest: T62jBatzVG8tsn6rcdW1XgVJglg=
+
+Name: res/drawable-hdpi/icon.png
+SHA1-Digest: Q3r6VK3X32PYVrva1KZvxEvBFQ0=
+
+Name: assets/game.dat
+SHA1-Digest: TcwmHgYSqPr+plg2EGanClObH3I=
+

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Epic Astro Story — web port</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="icon" href="game/files/res/drawable-hdpi/icon.png">
+</head>
+<body>
+  <div id="stage">
+    <canvas id="screen" width="800" height="480"></canvas>
+    <div id="game-ui"></div>
+
+    <!-- HUD -->
+    <button id="log-btn" title="VM console">ⓘ</button>
+    <div id="fps"></div>
+
+    <!-- VM log panel -->
+    <div id="log-panel">
+      <div id="log-head"><span>VM console</span><button id="log-close">✕</button></div>
+      <pre id="log-box"></pre>
+    </div>
+
+    <!-- loading screen -->
+    <div id="loading">
+      <div class="load-inner">
+        <img class="load-icon" src="game/files/res/drawable-hdpi/icon.png" alt="">
+        <div class="load-title">Epic Astro Story</div>
+        <div class="load-sub">original APK · executed by the browser Dalvik VM</div>
+        <div id="load-bar"><div id="load-bar-fill"></div></div>
+        <div id="load-status">starting…</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/dex.js"></script>
+  <script src="js/png.js"></script>
+  <script src="js/vm.js"></script>
+  <script src="js/natives-core.js"></script>
+  <script src="js/natives-android.js"></script>
+  <script src="js/host.js"></script>
+  <script src="js/boot.js"></script>
+  <script src="js/aidocs.js"></script>
+</body>
+</html>
