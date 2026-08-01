@@ -1473,8 +1473,10 @@ function installAndroidNatives(vm, host) {
   vm.registerNative({
     desc: 'Landroid/webkit/WebSettings;',
     methods: {
-      '<init>()V': (vm2, thr, o) => { o._ua = 'Mozilla/5.0 (Linux; U; Android 4.0.3; en-us) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30'; },
-      'getUserAgentString()Ljava/lang/String;': (vm2, thr, o) => vm2.newString(o._ua),
+      '<init>()V': (vm2, thr, o) => { o._ua = 'Mozilla/5.0 (Linux; U; Android 2.3.4; en-us) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1'; },
+      /* <init> may never run when the object came from WebView.<init> (host-side
+       * alloc) — always fall back to the stock UA like Android does */
+      'getUserAgentString()Ljava/lang/String;': (vm2, thr, o) => vm2.newString(o._ua || 'Mozilla/5.0 (Linux; U; Android 2.3.4; en-us) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1'),
       'setUserAgentString(Ljava/lang/String;)V': (vm2, thr, o, [ua]) => { o._ua = ua ? ua.js : o._ua; },
       'setJavaScriptEnabled(Z)V': () => { },
     },

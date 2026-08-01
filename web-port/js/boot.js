@@ -111,14 +111,16 @@
     installCoreNatives(vm);
 
     const q = new URLSearchParams(location.search);
-    host = new AndroidHost(vm, {
+    const hostOpts = {
       appInfo: packet.appJson,
       resources: packet.resJson,
       canvasElement: $('screen'),
-      width: q.get('w') ? parseInt(q.get('w'), 10) : 800,
-      height: q.get('h') ? parseInt(q.get('h'), 10) : 480,
-      density: q.get('density') ? parseFloat(q.get('density')) : 1.5,
-    });
+    };
+    /* geometry defaults live in host.js (480x320 native); ?w=&h=&density= override */
+    if (q.get('w')) hostOpts.width = parseInt(q.get('w'), 10);
+    if (q.get('h')) hostOpts.height = parseInt(q.get('h'), 10);
+    if (q.get('density')) hostOpts.density = parseFloat(q.get('density'));
+    host = new AndroidHost(vm, hostOpts);
     host.apkTree = packet.apkTree;
     host.fsLoad();
     vm.hostReadResource = (name) => host.hostReadResource(name);
@@ -162,6 +164,8 @@
     $('loading').classList.add('hidden');
     setTimeout(() => $('loading').remove(), 600);
     booted = true;
+    /* debug/test handle (also handy from devtools) */
+    window.__eas = { vm, host, get booted() { return booted; }, stats: vm.stats };
     pushLog('vm', ['boot ok — activity onCreate did ' + vm.stats.insns + ' insns']);
   }
 
@@ -222,7 +226,10 @@
     }
 
     try {
-      vm.pump(3000000);
+      /* ~one game tick of work per rAF (measured 50-400K insns + pacing slack);
+       * a bigger budget just burns the frame-pacing spin on the main thread.
+       * The game clock is wall time, so pacing stays correct across slow tabs. */
+      vm.pump(500000);
       host.pumpLoopers();
     } catch (e) {
       pushLog('err', ['pump error', e && e.stack || e]);

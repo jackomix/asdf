@@ -82,11 +82,12 @@ does not use JetPlayer for audible content on shipping devices either).</li>
 (<code>com.android.vending.licensing.*</code>, present inside the dex) cannot
 reach a Play Store process on the web. The <code>transact()</code> for
 <code>ILicensingService.checkLicense</code> is answered locally with a correctly
-shaped LICENSED binder transaction
-(<code>0|&lt;nonce&gt;|&lt;pkg&gt;|&lt;versionCode&gt;</code>, signature verified
-through the game's own embedded RSA key path which trivially validates), so the
+shaped LICENSED binder transaction — old LVL v1 protocol:
+<code>0|&lt;nonce&gt;|&lt;pkg&gt;|&lt;versionCode&gt;|&lt;userId&gt;|&lt;timestamp&gt;</code>,
+which the game's own <code>LicenseValidator</code> parses and field-checks —
+and <code>java.security.Signature.verify()</code> is satisfied locally, so the
 game's own policy logic runs to its licensed conclusion unmodified. See
-<code>host.binderTransact</code> and the AI docs "roadmap" below.</li>
+<code>host.binderTransact</code>.</li>
 <li><strong>Networking (<code>kairopark</code> URLs):</strong> contacts
 <code>kairopark.jp</code>, dead since ~2014; those code paths degrade like they
 do on a device without network.</li>

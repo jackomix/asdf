@@ -402,7 +402,7 @@ async function main() {
         }
       } catch (e) { console.log('[text] err', e.message); }
     }
-    if (frames % 20 === 0) {
+    if (frames % 20 === 0 && process.env.PROBE === '1') {
       try {
         const lCls = vm.requireClass('Lkairo/android/ui/l;');
         const lObj = lCls.statics[lCls.sfields.find((f) => f.name === 'b').slot];
@@ -433,6 +433,14 @@ async function main() {
     }
   }
   console.log('== budget reached ==');
+  if (process.env.SAVEDUMP === '1') {
+    try { host.fsPersist(); } catch (e) { console.log('fsPersist err: ' + e.message); }
+    console.log('localStorage keys: ' + [...localStorage._m.keys()].join(', '));
+    for (const k of localStorage._m.keys()) console.log(`  ${k}: ${localStorage._m.get(k).length} chars`);
+    console.log('vfs files: ' + [...host.vfs.keys()].join(', '));
+    const sp = [...localStorage._m.entries()].find(([k]) => k.startsWith('eas.prefs.'));
+    if (sp) console.log('first prefs blob: ' + sp[0] + ' = ' + sp[1].slice(0, 400));
+  }
   console.log(`insns=${vm.stats.insns} nativeInvokes=${vm.stats.nativeInvokes} objects=${vm.stats.objects}`);
   const cls = [...vm.classesByName.values()].filter((c) => !c.pending);
   console.log('linked classes:', cls.length);

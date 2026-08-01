@@ -304,12 +304,12 @@ function installCoreNatives(vm) {
         if (sp < 0 || dp < 0 || len < 0 || sp + len > src.n || dp + len > dst.n) {
           vm.throwNew(thr, 'Ljava/lang/ArrayIndexOutOfBoundsException;', 'src.length=' + src.n + '; dest.length=' + dst.n + '; len=' + len);
         }
-        const sw = isWideDesc(src.et), dw = isWideDesc(dst.et);
+        const sw = ncIsWideDesc(src.et), dw = ncIsWideDesc(dst.et);
         // overlap-safe copy (use temp when same array & ranges overlap)
         const tmp = new Array(len);
         if (sw) {
           for (let i = 0; i < len; i++) tmp[i] = src.a[(sp + i) * 2];
-          for (let i = 0; i < len; i++) { dst.a[(dp + i) * 2] = tmp[i]; dst.a[(dp + i) * 2 + 1] = WIDE2; }
+          for (let i = 0; i < len; i++) { dst.a[(dp + i) * 2] = tmp[i]; dst.a[(dp + i) * 2 + 1] = NC_WIDE2; }
         } else {
           for (let i = 0; i < len; i++) tmp[i] = src.a[sp + i];
           for (let i = 0; i < len; i++) dst.a[dp + i] = tmp[i];
@@ -1422,8 +1422,8 @@ function installCoreNatives(vm) {
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
-function isWideDesc(d) { return d === 'J' || d === 'D'; }
-const WIDE2 = { _w: 1 };
+function ncIsWideDesc(d) { return d === "J" || d === "D"; }
+const NC_WIDE2 = { _w: 1 };
 
 function utf8Decode(bytes) {
   let s = '';
