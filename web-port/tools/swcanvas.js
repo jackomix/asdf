@@ -216,18 +216,22 @@ class SWContext2D {
   fillText(t, x, y) {
     // block-glyph rendering so text presence is visible in dumps
     t = String(t);
-    const size = parseInt(((String(this.font)).match(/(\d+(?:\.\d+)?)px/) || [0, 12])[1], 10) || 12;
+    const m = this._m;
+    // matrix-aware: transform the baseline origin, scale glyph box by column norms
+    const sx = Math.hypot(m[0], m[1]) || 1, sy = Math.hypot(m[2], m[3]) || 1;
+    const size = (parseInt(((String(this.font)).match(/(\d+(?:\.\d+)?)px/) || [0, 12])[1], 10) || 12) * sy;
     const cw = size * 0.6, ch = size;
-    let start = x;
+    let tx = m[0] * x + m[2] * y + m[4];
+    const ty = m[1] * x + m[3] * y + m[5];
     const w = cw * t.length;
-    if (this.textAlign === 'center') start = x - w / 2;
-    else if (this.textAlign === 'right') start = x - w;
+    if (this.textAlign === 'center') tx -= w / 2;
+    else if (this.textAlign === 'right') tx -= w;
     const col = parseColor(this.fillStyle);
     for (let i = 0; i < t.length; i++) {
       const chCode = t.charCodeAt(i);
       if (chCode === 32) continue;
       // light inner notch so glyphs read as noise-text, not solid bar
-      this._fillChar(start + i * cw, y - ch * 0.8, cw * 0.85, ch * 0.9, col, chCode);
+      this._fillChar(tx + i * cw, ty - ch * 0.8, cw * 0.85, ch * 0.9, col, chCode);
     }
   }
   _fillChar(x, y, w, h, rgba, seed) {

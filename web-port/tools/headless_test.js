@@ -56,7 +56,7 @@ const _draftEl = (id) => {
     addEventListener: noop, removeEventListener: noop,
     appendChild: noop, removeChild: noop, remove: noop,
     textContent: '', innerHTML: '', offsetWidth: 800, clientWidth: 1280, clientHeight: 720,
-    getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 480 }),
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: parseInt(process.env.W || '480', 10), height: parseInt(process.env.H || '320', 10) }),
     click: noop, focus: noop,
   };
   return el;
@@ -151,7 +151,8 @@ async function main() {
     appInfo: appJson,
     resources: resJson,
     canvasElement: document.getElementById('screen'),
-    width: 800, height: 480, density: 1.5,
+    width: parseInt(process.env.W || '480', 10), height: parseInt(process.env.H || '320', 10),
+    density: parseFloat(process.env.DENSITY || '1.0'),
   });
   host.apkTree = apkTree;
   host.fsLoad();
@@ -208,7 +209,40 @@ async function main() {
     }
   }
 
-  /* per-method dispatch counters for the render path (env MCOUNTS=1; adds overhead) */
+  /* log drawn strings at a frame: env TEXTAT=frame -> wraps canvasDrawText */
+  if (process.env.TEXTAT) {
+    const at = parseInt(process.env.TEXTAT, 10);
+    const origCdt = host.canvasDrawText.bind(host);
+    host.canvasDrawText = (c, s, x, y, p) => {
+      if (frames >= at && frames < at + 3 && !host._tdSeen) host._tdSeen = new Set();
+      if (frames >= at && frames < at + 3) {
+        const isScreen = c.bitmap === host._screenBitmapNative;
+        const ctx = host._ctx(c.bitmap);
+        const m = ctx ? ctx._m : [1, 0, 0, 1, 0, 0];
+        const tx = Math.round(m[0] * x + m[2] * y + m[4]), ty = Math.round(m[1] * x + m[3] * y + m[5]);
+        const key = s + '@' + tx + ',' + ty + (isScreen ? 'S' : 'B');
+        if (!host._tdSeen.has(key)) {
+          host._tdSeen.add(key);
+          console.log(`  [drawtext f${frames}] "${s}" bmp=${c.bitmap.w}x${c.bitmap.h}${isScreen ? '=SCREEN' : ''} raw=${Math.round(x)},${Math.round(y)} mtx=${tx},${ty}`);
+        }
+      }
+      return origCdt(c, s, x, y, p);
+    };
+    /* also log composition of offscreen bitmaps onto the screen bitmap */
+    for (const mth of ['canvasDrawBitmap', 'canvasDrawBitmapMatrix']) {
+      const orig = host[mth].bind(host);
+      host[mth] = (o, bmp, ...rest) => {
+        if (frames >= at && frames < at + 3 && o.bitmap === host._screenBitmapNative && bmp !== host._screenBitmapNative) {
+          let desc = '';
+          if (mth === 'canvasDrawBitmap') desc = `src=${rest[0]},${rest[1]} ${rest[2]}x${rest[3]} dst=${rest[4]},${rest[5]} ${rest[6]}x${rest[7]}`;
+          else { const mm = rest[0]; desc = 'mtx=' + (Array.isArray(mm) ? mm.map((v) => Math.round(v * 100) / 100).join(',') : '?'); }
+          const key = 'comp@' + desc;
+          if (!host._tdSeen.has(key)) { host._tdSeen.add(key); console.log(`  [compose f${frames}] bmp ${bmp.w}x${bmp.h} ${desc}`); }
+        }
+        return orig(o, bmp, ...rest);
+      };
+    }
+  }
   const mcounts = new Map();
   if (process.env.MCOUNTS === '1') {
     const origResolve = VM.prototype._resolveInvoke;
@@ -349,6 +383,24 @@ async function main() {
         const top = t91.frames.slice(-3).map((f) => f.m.fullName() + '@' + (f.pc | 0).toString(16)).join(' <- ');
         console.log(`  [tos f${frames}] ${top} | blocked=${t91.blockedUntil > vm.now()}`);
       }
+    }
+    /* dump the in-memory text tables (kairo/android/c/i statics a,b) once */
+    if (process.env.TEXTDUMP && frames === parseInt(process.env.TEXTDUMP, 10)) {
+      try {
+        const ci = vm.requireClass('Lkairo/android/c/i;');
+        for (const f of ci.sfields) {
+          const tbl = ci.statics[f.slot];
+          if (!tbl || !tbl.a) continue;
+          console.log(`[text] c/i.${f.name} rows=${tbl.n}`);
+          for (let i = 0; i < tbl.n; i++) {
+            const row = tbl.a[i];
+            if (!row || !row.a) continue;
+            const cells = [];
+            for (let j = 0; j < row.n; j++) cells.push(row.a[j] ? row.a[j].js : '·');
+            console.log(`  [${f.name} ${i}] ${cells.join(' | ')}`);
+          }
+        }
+      } catch (e) { console.log('[text] err', e.message); }
     }
     if (frames % 20 === 0) {
       try {

@@ -18,11 +18,15 @@ class AndroidHost {
     this.appInfo = opts.appInfo || { package: 'net.kairosoft.android.frontier_en', versionCode: 2, versionName: '1.0.1', mainActivity: 'net.kairosoft.android.frontier_en.Main' };
     this.resources = opts.resources || { raw: {}, string: {}, values: {} };
 
-    /* ---------- display geometry ---------- */
+    /* ---------- display geometry ----------
+     * The engine renders 1:1 pixels: on a 480x320 surface (this title's native
+     * HVGA resolution) its sprite offsets and canvas-text coordinates line up
+     * exactly as on the original device. Larger sizes work too via ?w=&h= but
+     * letterbox the 480-wide content. */
     const q = new URLSearchParams(location.search);
-    this.displayWidth = parseInt(q.get('w') || opts.width || 800, 10);
-    this.displayHeight = parseInt(q.get('h') || opts.height || 480, 10);
-    this.density = parseFloat(q.get('density') || opts.density || 1.5);
+    this.displayWidth = parseInt(q.get('w') || opts.width || 480, 10);
+    this.displayHeight = parseInt(q.get('h') || opts.height || 320, 10);
+    this.density = parseFloat(q.get('density') || opts.density || 1.0);
     this.orientation = this.displayWidth >= this.displayHeight ? 2 : 1; // landscape default
     this.requestedOrientation = 0;
 
