@@ -1,0 +1,42 @@
+{
+ "assets": [
+  "battle.dat",
+  "battle_body.dat",
+  "battlefield.dat",
+  "chip.dat",
+  "com.dat",
+  "event.dat",
+  "game.dat",
+  "head.dat",
+  "lineup.dat",
+  "load.dat",
+  "map.dat",
+  "normal_body.dat",
+  "planet.dat",
+  "system.dat",
+  "title.dat",
+  "training.dat",
+  "vehicle.dat",
+  "weapon.dat",
+  "xls.dat"
+ ],
+ "raw": [
+  "battle.ogg",
+  "damage.ogg",
+  "death.ogg",
+  "happy.ogg",
+  "lose.ogg",
+  "main1.ogg",
+  "main2.ogg",
+  "main3.ogg",
+  "manzokudo_up.ogg",
+  "money_nyuukin.ogg",
+  "money_shukkin.ogg",
+  "sad.ogg",
+  "secchi.ogg",
+  "snd.inf",
+  "tekkyo.ogg",
+  "title.ogg",
+  "win.ogg"
+ ]
+}
