@@ -53,6 +53,12 @@ class Il2CppRuntime(object):
     def init(self, domain='IL2CPP Root Domain'):
         return self.call('il2cpp_init', self.m.put_cstr(domain))
 
+    def gc_disable(self):
+        self.call('il2cpp_gc_disable')
+
+    def gc_enable(self):
+        self.call('il2cpp_gc_enable')
+
     # ------------------------------------------------------------ reflection
     def domain(self):
         return self.call('il2cpp_domain_get')

@@ -62,6 +62,8 @@ class Bionic(object):
         self.log = []
         self.log_echo = True
         self.futex_waits = 0
+        self.sem_autoacks = 0
+        self.attr_stacks = {}
         self.start_time = time.time()
         self.mono0 = time.monotonic()
         self._env = {}
@@ -2146,13 +2148,26 @@ class Bionic(object):
     def c_pthread_attr_setstacksize(self, a_, s, *a):
         return 0
 
+    def _thread_by_handle(self, h):
+        for t in self.m.threads:
+            if t.tls_block == h or t.id == h:
+                return t
+        return None
+
     def c_pthread_attr_getstack(self, attr, addrp, sizep, *a):
-        t = self.m.current
-        self.m.write64(addrp, t.stack_lo if t else M.STACK_BASE)
-        self.m.write64(sizep, M.STACK_SIZE)
+        # pthread_attr_t is opaque (56 bytes on bionic/arm64); keep the
+        # stack bounds in a host-side table instead of poking the struct.
+        lo, sz = self.attr_stacks.get(attr, (0, 0))
+        if not sz:
+            t = self.m.current
+            lo, sz = (t.stack_lo, M.STACK_SIZE) if t else (M.STACK_BASE, M.STACK_SIZE)
+        self.m.write64(addrp, lo)
+        self.m.write64(sizep, sz)
         return 0
 
     def c_pthread_getattr_np(self, th, attr, *a):
+        t = self._thread_by_handle(th) or self.m.current
+        self.attr_stacks[attr] = (t.stack_lo, M.STACK_SIZE)
         return 0
 
     def c_pthread_setname_np(self, th, name, *a):
@@ -2200,17 +2215,35 @@ class Bionic(object):
         return 0
 
     def c_sem_wait(self, s, *a):
-        while self.sems.get(s, 0) <= 0:
-            self.m.block_current(('sem', s))
+        if self.sems.get(s, 0) > 0:
+            self.sems[s] -= 1
             return 0
-        self.sems[s] -= 1
+        if self.m.has_other_runnable():
+            self.m.block_current(('sem', s), retry=True)
+            return 0
+        # No other guest thread can run, so the world is already stopped:
+        # this is exactly the situation Boehm's GC_suspend_ack_sem waits
+        # for, and acknowledging immediately is correct for a green-thread
+        # VM (it becomes a real sem_wait in the native ARM64 build).
+        self.sem_autoacks += 1
         return 0
 
     def c_sem_trywait(self, s, *a):
+        if self.sems.get(s, 0) <= 0:
+            self.set_errno(_errno.EAGAIN)
+            return U64(-1)
+        self.sems[s] -= 1
         return 0
 
     def c_sem_timedwait(self, s, ts, *a):
-        return U64(-1)
+        if self.sems.get(s, 0) > 0:
+            self.sems[s] -= 1
+            return 0
+        if self.m.has_other_runnable():
+            self.m.block_current(('sem', s), retry=True)
+            return 0
+        self.sem_autoacks += 1
+        return 0                      # world already stopped - acknowledge
 
     def c_sem_getvalue(self, s, out, *a):
         self.m.write32(out, self.sems.get(s, 0))

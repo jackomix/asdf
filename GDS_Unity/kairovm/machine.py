@@ -140,6 +140,7 @@ class Machine(object):
         self.slice_insns = 50 * 1000 * 1000
         self.watch = True
         self._yield_flag = False
+        self._retry_call = False
         self._sched_lock = threading.RLock()
         self._spurious = 0
 
@@ -335,10 +336,10 @@ class Machine(object):
             uc.reg_write(A64.UC_ARM64_REG_D0, ret)
         else:
             uc.reg_write(A64.UC_ARM64_REG_X0, ret & 0xFFFFFFFFFFFFFFFF)
-        if self._switch_request is not None:
-            # Blocking call: unwind out of emu_start so the scheduler runs.
-            uc.reg_write(A64.UC_ARM64_REG_PC, uc.reg_read(A64.UC_ARM64_REG_LR))
-            uc.emu_stop()
+        if self._retry_call:
+            # Re-run this very call once the thread is scheduled again.
+            self._retry_call = False
+            uc.reg_write(A64.UC_ARM64_REG_PC, address)
             return
         uc.reg_write(A64.UC_ARM64_REG_PC, uc.reg_read(A64.UC_ARM64_REG_LR))
 
@@ -592,14 +593,20 @@ class Machine(object):
         self._hand_off()
 
     # ------------------------------------------------------------ blocking
-    def block_current(self, obj, note=''):
-        """Mark the running thread blocked on `obj` and yield."""
+    def block_current(self, obj, note='', retry=False):
+        """Mark the running thread blocked on `obj` and yield.
+
+        With retry=True the guest re-executes the blocking call after it is
+        woken, which gives correct semaphore/futex semantics without having
+        to resume execution in the middle of a host function.
+        """
         t = self.current
         t.state = 'blocked'
         t.blocked_on = obj
         if self.verbose > 1:
             print('[vm] tid %d blocks on %r %s' % (t.id, obj, note), file=sys.stderr)
         self._yield_flag = True
+        self._retry_call = retry
         self.uc.emu_stop()
 
     def yield_current(self):
@@ -617,6 +624,15 @@ class Machine(object):
                 if not all_ and woke >= n:
                     break
         return woke
+
+    def has_other_runnable(self):
+        cur = self.current
+        return any(t.state == 'ready' for t in self.threads if t is not cur)
+
+    def thread_report(self):
+        return ', '.join('#%d %s%s' % (t.id, t.state,
+                                       (' on %r' % (t.blocked_on,)) if t.blocked_on else '')
+                         for t in self.threads)
 
     def _pick_next(self):
         cur = self.current
@@ -644,10 +660,12 @@ class Machine(object):
         nxt = self._pick_next()
         if nxt is None or nxt is me:
             self._spurious += 1
-            if self._spurious > 500000:
-                raise GuestError('all guest threads deadlocked')
+            if self._spurious > 20000:
+                raise GuestError('all guest threads deadlocked [%s]'
+                                 % self.thread_report())
             me.state = 'running'
             return
+        self._spurious = 0
         me.ctx = self.uc.context_save()
         self._resume(nxt)
         me.ev.wait()
