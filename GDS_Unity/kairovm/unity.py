@@ -132,6 +132,11 @@ class UnityHost(object):
         self.fixed_dt = 1.0 / 50.0
         self.target_fps = 60
         self.platform = 11               # RuntimePlatform.Android
+        self.locale = ('en', 'US')
+        self.density = 1.0
+        self.dialogs = []                # modal dialogs the game asked for
+        self.datadir = None
+        self.jvm = None                  # lazily built by kairovm.androidjni
 
         self.prefs = {}
         self.prefs_path = None
@@ -173,7 +178,10 @@ class UnityHost(object):
         self.new_components = []
         self.pending_types = set()
         self.types = {}                  # managed System.Type -> Il2CppClass*
+        self.by_il2cpp_type = {}         # Il2CppType* -> Il2CppClass*
         self.cur_material = None
+        self.active_rt = None
+        self.render_passes = []
 
     # --------------------------------------------------------- small utils
     def prop_id(self, name):
@@ -198,14 +206,63 @@ class UnityHost(object):
         return self._shader.managed
 
     def type_class(self, type_obj):
-        """Il2CppClass* behind a managed System.Type (resolved between frames)."""
+        """Il2CppClass* behind a managed System.Type.
+
+        Handlers run inside a Unicorn hook and cannot re-enter the emulator,
+        so `il2cpp_class_from_system_type` is off limits here.  Instead the
+        Il2CppType* is read straight out of the reflection object
+        (Il2CppReflectionType::type, right after the object header) and looked
+        up in the table built by prebind_types().
+        """
         if not type_obj:
             return 0
         k = self.types.get(type_obj)
-        if k is None:
-            self.pending_types.add(type_obj)
-            return 0
-        return k
+        if k is not None:
+            return k
+        try:
+            tp = self.m.read64(type_obj + 0x10)
+        except Exception:
+            tp = 0
+        k = self.by_il2cpp_type.get(tp)
+        if k:
+            self.types[type_obj] = k
+            return k
+        self.pending_types.add(type_obj)
+        return 0
+
+    def prebind_types(self, images=None):
+        """Map every Il2CppType* of the engine + game classes to its class.
+
+        One pass at start-up buys `type_class()` a lock-free answer later,
+        which is what AddComponent/GetComponent need while the guest is
+        suspended inside an internal call.
+        """
+        rt = self.rt
+        if images is None:
+            images = [n for n in self.s.images
+                      if n.startswith('UnityEngine.')
+                      or n in ('Assembly-CSharp.dll', 'KairoLibrary.dll')]
+        t0 = time.time()
+        n = 0
+        for name in images:
+            img = self.s.images.get(name)
+            if not img:
+                continue
+            try:
+                cnt = rt.call('il2cpp_image_get_class_count', img)
+            except Exception:
+                continue
+            for i in range(cnt):
+                k = rt.call('il2cpp_image_get_class', img, i)
+                if not k:
+                    continue
+                tp = rt.call('il2cpp_class_get_type', k)
+                if tp:
+                    self.by_il2cpp_type[tp] = k
+                    n += 1
+        if self.verbose:
+            print('[unity] %d types pre-bound in %.0fs' % (n, time.time() - t0))
+        return n
 
     def resolve_pending(self):
         """Called from the driver (outside the hook) - guest calls are legal."""
@@ -239,16 +296,35 @@ class UnityHost(object):
         ue = self.s.images.get('UnityEngine.CoreModule.dll')
         for n in ('Object', 'GameObject', 'Transform', 'Camera', 'Component',
                   'Texture2D', 'Mesh', 'Material', 'Shader', 'MonoBehaviour',
-                  'Behaviour', 'Color', 'Vector3', 'RenderTexture'):
+                  'Behaviour', 'Color', 'Vector3', 'RenderTexture',
+                  'TextAsset', 'Sprite', 'Coroutine', 'Texture'):
             k = rt.class_from_name(ue, 'UnityEngine', n)
             if k:
                 self.klass['UnityEngine.' + n] = k
+        for img, names in (('UnityEngine.TextRenderingModule.dll', ('Font',)),
+                           ('UnityEngine.AudioModule.dll', ('AudioClip',)),
+                           ('UnityEngine.IMGUIModule.dll',
+                            ('GUIStyle', 'GUISkin'))):
+            im = self.s.images.get(img)
+            if not im:
+                continue
+            for n in names:
+                k = rt.class_from_name(im, 'UnityEngine', n)
+                if k:
+                    self.klass['UnityEngine.' + n] = k
 
         # instance-size field offset inside Il2CppClass (version independent:
         # locate it by matching the value the API reports)
         self.size_off = self._find_size_offset()
         self.arr_byte = rt.call('il2cpp_array_class_get', self.klass['Byte'], 1)
         self.arr_int = rt.call('il2cpp_array_class_get', self.klass['Int32'], 1)
+        ip = rt.class_from_name(cor, 'System', 'IntPtr')
+        self.arr_intptr = (rt.call('il2cpp_array_class_get', ip, 1) if ip
+                           else self.arr_int)
+        self.arr_object = rt.call('il2cpp_array_class_get',
+                                  self.klass['Object'], 1)
+        self.arr_string = rt.call('il2cpp_array_class_get',
+                                  self.klass['String'], 1)
         col = self.klass.get('UnityEngine.Color')
         self.arr_color = rt.call('il2cpp_array_class_get', col, 1) if col else 0
         self.f_cached_ptr = 0x10          # UnityEngine.Object.m_CachedPtr
@@ -268,12 +344,102 @@ class UnityHost(object):
         self.main_camera.data['orthographicSize'] = self.height / 2.0
         self.named = {'Main Camera': self.main_camera_go}
 
+        self.prebind_types()
+        self.open_data_dir()
         self.prefs_path = os.path.join(self.s.rootfs, 'playerprefs.json')
         if os.path.exists(self.prefs_path):
             try:
                 self.prefs = json.load(open(self.prefs_path))
             except Exception:
                 self.prefs = {}
+
+    # ------------------------------------------------------------ resources
+    def open_data_dir(self):
+        """Mount assets/bin/Data so Resources.Load finds the shipped assets.
+
+        Unity's own loader is in libunity.so; the serialized files it reads
+        are right there in the APK, so we read them ourselves and hand the
+        game the very same TextAsset / Texture2D objects it shipped with.
+        """
+        self.datadir = None
+        here = os.path.dirname(os.path.abspath(__file__))
+        tools = os.path.join(here, '..', 'tools')
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        try:
+            from unityfs import DataDir
+            self.datadir = DataDir(os.path.join(self.s.apk, 'assets/bin/Data'))
+            if self.verbose:
+                print('[unity] assets/bin/Data mounted: %d container entries'
+                      % len(self.datadir.container))
+        except Exception as e:
+            print('[unity] no asset container (%r)' % (e,))
+
+    def load_resource(self, path):
+        """Resources.Load: managed object for a container path, or 0."""
+        if not path:
+            return 0
+        key = path.strip('/').lower()
+        if key in self.resources:
+            return self.resources[key]
+        self.resource_requests.append(path)
+        got = 0
+        if self.datadir is not None and key in self.datadir.container:
+            try:
+                got = self._build_asset(key)
+            except Exception as e:
+                print('[unity] asset %s failed: %r' % (key, e))
+                got = 0
+        if self.verbose > 1 and not got:
+            print('[unity] Resources.Load("%s") -> null' % path)
+        self.resources[key] = got
+        return got
+
+    def _build_asset(self, key):
+        ent = self.datadir.load(key)
+        if ent is None:
+            return 0
+        cid, parsed = ent
+        name = key.rsplit('/', 1)[-1]
+        if cid == 49:                                     # TextAsset
+            data = parsed.get('bytes') or b''
+            k = self.klass.get('UnityEngine.TextAsset')
+            managed = self.alloc_object(k) if k else 0
+            o = UObj(self, 'TextAsset', managed, parsed.get('name') or name)
+            o.data['bytes'] = data
+            if managed:
+                self.bind(o, managed)
+            if self.verbose:
+                print('[unity] asset %-28s TextAsset %d bytes' % (key, len(data)))
+            return managed
+        if cid == 28:                                     # Texture2D
+            w = parsed.get('width', 0)
+            hgt = parsed.get('height', 0)
+            k = self.klass.get('UnityEngine.Texture2D')
+            managed = self.alloc_object(k) if k else 0
+            t = Texture(self, managed, w, hgt, parsed.get('format', 4),
+                        parsed.get('name') or name)
+            t.data['raw'] = parsed.get('data') or b''
+            if managed:
+                self.bind(t, managed)
+            if self.verbose:
+                print('[unity] asset %-28s Texture2D %dx%d' % (key, w, hgt))
+            return managed
+        if cid == 83:                                     # AudioClip
+            k = self.klass.get('UnityEngine.AudioClip')
+            managed = self.alloc_object(k) if k else 0
+            o = UObj(self, 'AudioClip', managed, parsed.get('name') or name)
+            o.data.update(parsed or {})
+            if managed:
+                self.bind(o, managed)
+            return managed
+        if cid == 48:                                     # Shader
+            return self.default_shader(name)
+        return 0
+
+    def managed_bytes(self, data):
+        """byte[] in the managed heap holding `data`."""
+        return self.new_array(self.arr_byte, len(data), 1, data)
 
     def _find_size_offset(self):
         """Byte offset of Il2CppClass::instance_size (differs per version)."""
@@ -471,6 +637,8 @@ class UnityHost(object):
                   sum(self.unknown.values()))]
         for k, v in self.unknown.most_common(top):
             out.append('   MISSING %-70s %d' % (k, v))
+        if self.jvm is not None:
+            out.append(self.jvm.report(top))
         return '\n'.join(out)
 
 
@@ -1632,14 +1800,25 @@ def _findshader(h, this, a):
 # =============================================================== Resources
 @icall('UnityEngine.ResourcesAPIInternal::Load(System.String,System.Type)')
 def _resload(h, this, a):
-    path = h.read_string(a[0])
-    h.resource_requests.append(path)
-    obj = h.resources.get(path)
-    if obj is not None:
-        return obj
-    if h.verbose > 1:
-        print('[unity] Resources.Load("%s") -> null' % path)
-    return 0
+    return h.load_resource(h.read_string(a[0]))
+
+
+@icall('UnityEngine.TextAsset::get_bytes()')
+def _textasset_bytes(h, this, a):
+    # Unity hands out a *fresh copy* of the asset every time.  The game
+    # decrypts in place (AssetReader.GetData -> Encrypter.Decode), so handing
+    # back a shared array would decrypt the same buffer twice.
+    o = h.obj(this)
+    data = o.data.get('bytes', b'') if o is not None else b''
+    return h.managed_bytes(data)
+
+
+@icall('UnityEngine.TextAsset::Internal_CreateInstance(UnityEngine.TextAsset,System.String)')
+def _textasset_create(h, this, a):
+    o = UObj(h, 'TextAsset', a[0], 'TextAsset')
+    o.data['bytes'] = (h.read_string(a[1]) or '').encode('utf-8')
+    h.bind(o, a[0])
+    return None
 
 
 @icall('UnityEngine.ResourcesAPIInternal::UnloadAsset(UnityEngine.Object)',
@@ -1839,21 +2018,322 @@ def _addcomponent(h, this, a):
     return managed
 
 
-# ================================================================= Android
-@icall('UnityEngine.AndroidJNI::FindClass(System.String)',
-       'UnityEngine.AndroidJNISafe::FindClass(System.String)')
-def _jnifindclass(h, this, a):
+# ==========================================================================
+#  Android JNI - the game's Java layer still calls into it off Android too.
+#  Implemented by kairovm/androidjni.py (imported at the bottom of this file).
+# ==========================================================================
+
+
+# =========================================================================
+#  Late additions: everything the first full boot asked for and missed.
+# =========================================================================
+@icall('UnityEngine.SystemInfo::SupportsTextureFormatNative(UnityEngine.TextureFormat)',
+       'UnityEngine.SystemInfo::SupportsRenderTextureFormatNative(UnityEngine.RenderTextureFormat)',
+       'UnityEngine.SystemInfo::SupportsBlendingOnRenderTextureFormatNative(UnityEngine.RenderTextureFormat)',
+       'UnityEngine.SystemInfo::IsFormatSupported(UnityEngine.Experimental.Rendering.GraphicsFormat,UnityEngine.Experimental.Rendering.GraphicsFormatUsage)')
+def _supportsformat(h, this, a):
+    return 1
+
+
+@icall('UnityEngine.Experimental.Rendering.GraphicsFormatUtility::IsCompressedFormat_Native_TextureFormat(UnityEngine.TextureFormat)',
+       'UnityEngine.Experimental.Rendering.GraphicsFormatUtility::IsCompressedFormat_Native_GraphicsFormat(UnityEngine.Experimental.Rendering.GraphicsFormat)',
+       'UnityEngine.Experimental.Rendering.GraphicsFormatUtility::CanDecompressFormat(UnityEngine.Experimental.Rendering.GraphicsFormat,System.Boolean)')
+def _iscompressed(h, this, a):
     return 0
 
 
-@icall('UnityEngine.AndroidJNI::AttachCurrentThread()',
-       'UnityEngine.AndroidJNI::DetachCurrentThread()',
-       'UnityEngine.AndroidJNI::PushLocalFrame(System.Int32)',
-       'UnityEngine.AndroidJNI::PopLocalFrame(System.IntPtr)')
-def _jninop(h, this, a):
+@icall('UnityEngine.QualitySettings::get_antiAliasing()',
+       'UnityEngine.QualitySettings::get_vSyncCount()',
+       'UnityEngine.QualitySettings::get_masterTextureLimit()',
+       'UnityEngine.QualitySettings::get_anisotropicFiltering()')
+def _qualityget(h, this, a):
     return 0
 
 
-@icall('UnityEngine.AndroidJNI::ExceptionOccurred()')
-def _jniexc(h, this, a):
+@icall('UnityEngine.QualitySettings::set_vSyncCount(System.Int32)',
+       'UnityEngine.QualitySettings::set_antiAliasing(System.Int32)',
+       'UnityEngine.QualitySettings::set_masterTextureLimit(System.Int32)',
+       'UnityEngine.Screen::set_fullScreen(System.Boolean)',
+       'UnityEngine.Screen::SetResolution(System.Int32,System.Int32,UnityEngine.FullScreenMode,UnityEngine.RefreshRate)',
+       'UnityEngine.Screen::set_sleepTimeout(System.Int32)')
+def _screenset(h, this, a):
+    return None
+
+
+@icall('UnityEngine.Screen::get_fullScreen()')
+def _fullscreen(h, this, a):
+    return 1
+
+
+@icall('UnityEngine.PlayerPrefs::TrySetSetString(System.String,System.String)')
+def _prefstryset(h, this, a):
+    h.prefs[h.read_string(a[0])] = h.read_string(a[1])
+    return 1
+
+
+@icall('UnityEngine.PlayerPrefs::TrySetInt(System.String,System.Int32)',
+       'UnityEngine.PlayerPrefs::TrySetFloat(System.String,System.Single)')
+def _prefstrysetnum(h, this, a):
+    h.prefs[h.read_string(a[0])] = a[1]
+    return 1
+
+
+@icall('UnityEngine.Internal.InputUnsafeUtility::GetAxis(System.String)',
+       'UnityEngine.Internal.InputUnsafeUtility::GetAxisRaw(System.String)')
+def _getaxis(h, this, a):
+    name = (h.read_string(a[0]) or '').lower()
+    x = 0.0
+    if 'horizontal' in name:
+        x = (1.0 if 'right' in h.keys else 0.0) - (1.0 if 'left' in h.keys else 0.0)
+    elif 'vertical' in name:
+        x = (1.0 if 'up' in h.keys else 0.0) - (1.0 if 'down' in h.keys else 0.0)
+    return f32(x)
+
+
+@icall('UnityEngine.Internal.InputUnsafeUtility::GetButton(System.String)',
+       'UnityEngine.Internal.InputUnsafeUtility::GetButtonDown(System.String)',
+       'UnityEngine.Internal.InputUnsafeUtility::GetButtonUp(System.String)')
+def _getbutton(h, this, a):
     return 0
+
+
+@icall('UnityEngine.AudioSource::set_playOnAwake(System.Boolean)',
+       'UnityEngine.AudioSource::set_loop(System.Boolean)',
+       'UnityEngine.AudioSource::set_volume(System.Single)',
+       'UnityEngine.AudioSource::set_pitch(System.Single)',
+       'UnityEngine.AudioSource::set_clip(UnityEngine.AudioClip)',
+       'UnityEngine.AudioSource::set_mute(System.Boolean)',
+       'UnityEngine.AudioSource::set_time(System.Single)',
+       'UnityEngine.AudioSource::Play(System.UInt64)',
+       'UnityEngine.AudioSource::PlayOneShotHelper(UnityEngine.AudioSource,UnityEngine.AudioClip,System.Single)',
+       'UnityEngine.AudioSource::Stop(System.Boolean)',
+       'UnityEngine.AudioSource::Pause()',
+       'UnityEngine.AudioSource::UnPause()',
+       'UnityEngine.AudioListener::set_volume(System.Single)',
+       'UnityEngine.AudioListener::set_pause(System.Boolean)')
+def _audionop(h, this, a):
+    return None
+
+
+@icall('UnityEngine.AudioSource::get_isPlaying()',
+       'UnityEngine.AudioSource::get_loop()',
+       'UnityEngine.AudioSource::get_mute()')
+def _audiofalse(h, this, a):
+    return 0
+
+
+@icall('UnityEngine.AudioSource::get_volume()',
+       'UnityEngine.AudioSource::get_time()',
+       'UnityEngine.AudioSource::get_pitch()',
+       'UnityEngine.AudioListener::get_volume()')
+def _audiozero(h, this, a):
+    return f32(1.0)
+
+
+@icall('UnityEngine.AudioClip::get_length()',
+       'UnityEngine.AudioClip::get_samples()',
+       'UnityEngine.AudioClip::get_channels()',
+       'UnityEngine.AudioClip::get_frequency()',
+       'UnityEngine.AudioClip::get_loadState()')
+def _clipinfo(h, this, a):
+    return 0
+
+
+# GUIStyleState colours travel through a by-ref Color; keep them per object.
+@icall('UnityEngine.GUIStyleState::set_textColor_Injected(UnityEngine.Color&)')
+def _stylestate_set(h, this, a):
+    h.guistyles[('textColor', this)] = h.read_color(a[0])
+    return None
+
+
+@icall('UnityEngine.GUIStyleState::get_textColor_Injected(UnityEngine.Color&)')
+def _stylestate_get(h, this, a):
+    c = h.guistyles.get(('textColor', this), (1.0, 1.0, 1.0, 1.0))
+    h.m.write(a[0], struct.pack('<ffff', *c))
+    return None
+
+
+
+
+@icall('UnityEngine.Experimental.Rendering.GraphicsFormatUtility::GetGraphicsFormat_Native_TextureFormat(UnityEngine.TextureFormat,System.Boolean)')
+def _gfxformat(h, this, a):
+    # TextureFormat -> GraphicsFormat, for the handful the game builds.
+    srgb = bool(a[1])
+    return {3: 24 if srgb else 23,      # RGB24
+            4: 8 if srgb else 7,        # RGBA32
+            5: 10 if srgb else 9,       # ARGB32
+            1: 1,                       # Alpha8
+            }.get(a[0], 8 if srgb else 7)
+
+
+@icall('UnityEngine.Experimental.Rendering.GraphicsFormatUtility::IsCrunchFormat(UnityEngine.TextureFormat)',
+       'UnityEngine.Experimental.Rendering.GraphicsFormatUtility::IsSRGBFormat(UnityEngine.Experimental.Rendering.GraphicsFormat)')
+def _iscrunch(h, this, a):
+    return 0
+
+
+@icall('UnityEngine.QualitySettings::GetQualityLevel()')
+def _qualitylevel(h, this, a):
+    return 0
+
+
+@icall('UnityEngine.QualitySettings::get_names()')
+def _qualitynames(h, this, a):
+    return h.new_array(h.arr_string, 1, 8,
+                       struct.pack('<Q', h.new_string('Medium')))
+
+
+
+
+# =========================================================================
+#  Prefabs, cloning and off-screen rendering.
+#
+#  kairo.unity.graphics.Offscreen instantiates Prefabs/Offscreen (a
+#  GameObject carrying a Camera), points a RenderTexture at it and reads the
+#  pixels back.  The prefab really is in the shipped container, so it is
+#  rebuilt here from the serialized file rather than invented.
+# =========================================================================
+@icall('UnityEngine.Object::Internal_CloneSingle(UnityEngine.Object)',
+       'UnityEngine.Object::Internal_CloneSingleWithParent(UnityEngine.Object,UnityEngine.Transform,System.Boolean)')
+def _clone(h, this, a):
+    src = h.obj(a[0])
+    if src is None:
+        return 0
+    klass = h.m.read64(a[0])
+    managed = h.alloc_object(klass)
+    h.m.write(managed, h.m.read(a[0], max(0x18, h.instance_size(klass))))
+    o = UObj(h, src.kind, managed, src.name + '(Clone)')
+    h.bind(o, managed)
+    o.data = dict(src.data)
+    o.pos, o.scale, o.rot = list(src.pos), list(src.scale), list(src.rot)
+    if src.kind == 'GameObject':
+        tf = h.make_object('Transform', o.name)
+        tf.gameobject = o
+        o.transform = tf
+        for c in src.components:
+            ck = h.m.read64(c.managed) if c.managed else 0
+            cm = h.alloc_object(ck) if ck else 0
+            if cm:
+                h.m.write(cm, h.m.read(c.managed,
+                                       max(0x18, h.instance_size(ck))))
+            nc = UObj(h, c.kind, cm, c.name)
+            if cm:
+                h.bind(nc, cm)
+            nc.data = dict(c.data)
+            nc.gameobject = o
+            nc.transform = tf
+            o.components.append(nc)
+    return managed
+
+
+# ------------------------------------------------------------ RenderTexture
+@icall('UnityEngine.RenderTexture::Internal_Create(UnityEngine.RenderTexture)')
+def _rt_create(h, this, a):
+    t = Texture(h, a[0], 0, 0, 4, 'RenderTexture')
+    t.kind = 'RenderTexture'
+    h.bind(t, a[0])
+    return None
+
+
+@icall('UnityEngine.RenderTexture::set_width(System.Int32)')
+def _rt_setw(h, this, a):
+    t = h.obj_or_make(this, 'RenderTexture')
+    t.w = a[0]
+    return None
+
+
+@icall('UnityEngine.RenderTexture::set_height(System.Int32)')
+def _rt_seth(h, this, a):
+    t = h.obj_or_make(this, 'RenderTexture')
+    t.h = a[0]
+    return None
+
+
+@icall('UnityEngine.RenderTexture::get_width()')
+def _rt_getw(h, this, a):
+    t = h.obj(this)
+    return getattr(t, 'w', 0) if t else 0
+
+
+@icall('UnityEngine.RenderTexture::get_height()')
+def _rt_geth(h, this, a):
+    t = h.obj(this)
+    return getattr(t, 'h', 0) if t else 0
+
+
+@icall('UnityEngine.RenderTexture::SetActive(UnityEngine.RenderTexture)')
+def _rt_setactive(h, this, a):
+    h.active_rt = h.obj(a[0])
+    return None
+
+
+@icall('UnityEngine.RenderTexture::GetActive()')
+def _rt_getactive(h, this, a):
+    rt = getattr(h, 'active_rt', None)
+    return rt.managed if rt else 0
+
+
+@icall('UnityEngine.RenderTexture::set_enableRandomWrite(System.Boolean)',
+       'UnityEngine.RenderTexture::set_depthStencilFormat(UnityEngine.Experimental.Rendering.GraphicsFormat)',
+       'UnityEngine.RenderTexture::SetColorFormat(UnityEngine.Experimental.Rendering.GraphicsFormat)',
+       'UnityEngine.RenderTexture::SetMipMapCount(System.Int32)',
+       'UnityEngine.RenderTexture::SetSRGBReadWrite(System.Boolean)',
+       'UnityEngine.RenderTexture::Release()',
+       'UnityEngine.RenderTexture::ReleaseTemporary(UnityEngine.RenderTexture)',
+       'UnityEngine.Graphics::Internal_SetNullRT()')
+def _rt_nop(h, this, a):
+    return None
+
+
+@icall('UnityEngine.RenderTexture::GetColorFormat(System.Boolean)')
+def _rt_colorformat(h, this, a):
+    return 8
+
+
+@icall('UnityEngine.RenderTexture::SupportsStencil(UnityEngine.RenderTexture)')
+def _rt_stencil(h, this, a):
+    return 1
+
+
+@icall('UnityEngine.Camera::Render()')
+def _camera_render(h, this, a):
+    """A camera pass: hand the batch list to the front end and start a new one."""
+    h.render_passes.append(h.gl)
+    h.gl = []
+    h.draw_calls += 1
+    return None
+
+
+@icall('UnityEngine.Texture2D::ReadPixelsImpl_Injected(UnityEngine.Rect&,System.Int32,System.Int32,System.Boolean)')
+def _readpixels(h, this, a):
+    t = h.obj(this)
+    if t is not None and getattr(t, 'w', 0) and getattr(t, 'h', 0):
+        need = t.w * t.h * 4
+        if len(t.pixels) < need:
+            t.pixels = bytearray(need)
+    return None
+
+
+@icall('UnityEngine.Component::GetComponentFastPath(System.Type,System.IntPtr)',
+       'UnityEngine.GameObject::GetComponentFastPath(System.Type,System.IntPtr)',
+       'UnityEngine.GameObject::TryGetComponentFastPath(System.Type,System.IntPtr)')
+def _getcomponentfast(h, this, a):
+    """Unity writes the result through the IntPtr out-parameter."""
+    o = h.obj(this)
+    if o is None:
+        return None
+    go = o if o.kind == 'GameObject' else (o.gameobject or o)
+    klass = h.type_class(a[0])
+    found = 0
+    for c in ([go.transform] if go.transform else []) + list(go.components):
+        if not c or not c.managed:
+            continue
+        if not klass or h.m.read64(c.managed) == klass:
+            found = c.managed
+            break
+    if a[1]:
+        h.m.write64(a[1], found)
+    return None
+
+
+from . import androidjni                                          # noqa: E402,F401

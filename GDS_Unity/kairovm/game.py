@@ -25,7 +25,7 @@ class Game(object):
     APP_NS, APP_NAME = 'main', 'Main'
 
     def __init__(self, apk='out/apk', width=640, height=480, verbose=1,
-                 log_all=False, install=True, platform=11):
+                 log_all=False, install=True, platform=11, watch=()):
         self.apk = apk
         self.verbose = verbose
         self.s = Session(apk, verbose=verbose)
@@ -37,7 +37,7 @@ class Game(object):
         self.h.prepare()
         if install:
             self.h.install(apk, self.s.meta)
-        self.m.enable_method_trace()
+        self.m.enable_method_trace(watch=watch or ())
         self.app = 0                 # managed main.Main
         self.app_class = 0
         self.behaviours = []         # (native, managed, class) started

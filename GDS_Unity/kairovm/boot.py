@@ -232,7 +232,7 @@ def build(apk_root, pkg=DEFAULT_PKG, verbose=0, echo_log=True, trace=False):
     files_dir = os.path.join(rootfs, 'data/data', pkg, 'files')
     os.makedirs(files_dir, exist_ok=True)
 
-    host = Bionic(m, rootfs, cwd='/data/data/%s' % pkg)
+    host = Bionic(m, rootfs, cwd='/')          # Android starts a process at /
     host.log_echo = echo_log
     host._env.update({
         'LANG': 'en_US.UTF-8',

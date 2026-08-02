@@ -402,7 +402,8 @@ class Machine(object):
 
     # ------------------------------------------------------- method tracing
     def enable_method_trace(self, assemblies=('Assembly-CSharp.dll',
-                                              'KairoLibrary.dll'), depth=8192):
+                                              'KairoLibrary.dll'), depth=8192,
+                            watch=()):
         """Record every managed method of the game's own assemblies as it is
         entered.  Restricted to their address range so the hook costs nothing
         while the runtime or corlib is running."""
@@ -420,16 +421,53 @@ class Machine(object):
         self.trace_names = {a + li.bias: n for a, n in want.items()}
         names = self.trace_names
         trace = self.method_trace
+        self.trace_watch = list(watch)
+        watching = {}
+        if watch:
+            for a, n in names.items():
+                if any(w in n for w in watch):
+                    watching[a] = n
+            print('[vm] watching %d methods' % len(watching))
+        self.trace_seq = [0]
+        seq = self.trace_seq
+        logging = {}
+        for a, n in names.items():
+            if n.startswith('kairo.unity.util.Log::') and n.split('::')[1] in (
+                    'Info', 'Error', 'Warn', 'Debug', 'Verbose'):
+                logging[a] = n.split('::')[1]
+        gstr = self.guest_string
+        reg0 = A64.UC_ARM64_REG_X0
+        reg1 = A64.UC_ARM64_REG_X1
 
         def cb(uc, address, size, ud):
             n = names.get(address)
             if n is not None:
                 trace.append(n)
+                seq[0] += 1
+                if address in watching:
+                    print('[watch] %6d  %s' % (seq[0], n))
+                lvl = logging.get(address)
+                if lvl is not None:
+                    s = gstr(uc.reg_read(reg0)) or gstr(uc.reg_read(reg1))
+                    if s:
+                        print('[game.%s] %s' % (lvl.lower(), s))
         self.uc.hook_add(UC_HOOK_BLOCK, cb, begin=lo, end=hi)
         if self.verbose:
             print('[vm] method trace armed over %#x..%#x (%d methods)'
                   % (lo, hi, len(want)))
         return True
+
+    def guest_string(self, p):
+        """Decode an Il2CppString* if `p` plausibly is one, else None."""
+        if not p or p & 1:
+            return None
+        try:
+            n = self.read32(p + 0x10)
+            if n <= 0 or n > 4096:
+                return None
+            return self.read(p + 0x14, n * 2).decode('utf-16-le', 'replace')
+        except Exception:
+            return None
 
     def recent_methods(self, n=40):
         t = getattr(self, 'method_trace', None)

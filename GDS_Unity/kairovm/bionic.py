@@ -42,7 +42,7 @@ class VFile(object):
 class Bionic(object):
     """Host implementation of the Android C runtime for the guest."""
 
-    def __init__(self, machine, rootfs, cwd='/data/data/net.kairosoft.android.gamedev3en'):
+    def __init__(self, machine, rootfs, cwd='/'):
         self.m = machine
         machine.host = self
         self.rootfs = os.path.abspath(rootfs)
