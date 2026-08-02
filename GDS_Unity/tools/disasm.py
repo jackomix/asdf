@@ -174,6 +174,12 @@ def main():
     mode = 'dis'
     if ap[0].startswith('--'):
         mode = ap[0][2:]; ap = ap[1:]
+    if mode == 'at':
+        va = int(ap[0], 0)
+        n = int(ap[1], 0) if len(ap) > 1 else c.extent(va)
+        print('\n;;; %s  @ %#x  (%d bytes)' % (c.name(va), va, n))
+        c.disasm(va, n)
+        return
     spec = ap[0]
     hits = c.resolve(spec)
     if mode == 'find':

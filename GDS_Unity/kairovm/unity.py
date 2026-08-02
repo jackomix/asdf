@@ -185,6 +185,8 @@ class UnityHost(object):
         self.pending_types = set()
         self.types = {}                  # managed System.Type -> Il2CppClass*
         self.by_il2cpp_type = {}         # Il2CppType* -> Il2CppClass*
+        self.parents = {}                # Il2CppClass* -> base Il2CppClass*
+        self._isa = {}                   # (class, base) -> bool
         self.cur_material = None
         self.active_rt = None
         self.render_passes = []
@@ -266,9 +268,38 @@ class UnityHost(object):
                 if tp:
                     self.by_il2cpp_type[tp] = k
                     n += 1
+                if k not in self.parents:
+                    self.parents[k] = rt.call('il2cpp_class_get_parent', k)
         if self.verbose:
             print('[unity] %d types pre-bound in %.0fs' % (n, time.time() - t0))
         return n
+
+    def class_isa(self, klass, base):
+        """`klass` is `base` or derives from it - answered without the VM.
+
+        GetComponent<T>() has to accept a subclass of T, and the handlers run
+        inside a Unicorn hook where il2cpp_class_is_assignable_from() cannot
+        be called, so the parent chain recorded by prebind_types() is walked
+        instead.
+        """
+        if not klass or not base:
+            return False
+        if klass == base:
+            return True
+        key = (klass, base)
+        hit = self._isa.get(key)
+        if hit is not None:
+            return hit
+        k, r = klass, False
+        for _ in range(24):
+            k = self.parents.get(k)
+            if not k:
+                break
+            if k == base:
+                r = True
+                break
+        self._isa[key] = r
+        return r
 
     def resolve_pending(self):
         """Called from the driver (outside the hook) - guest calls are legal."""
@@ -1069,8 +1100,10 @@ def _gosetlayer(h, this, a):
 def _gogetcomp(h, this, a):
     o = h.obj_or_make(this, 'GameObject')
     want = h.type_class(a[0])
-    for c in o.components:
-        if not want or h.m.read64(c.managed) == want:
+    for c in ([o.transform] if o.transform else []) + list(o.components):
+        if not c or not c.managed:
+            continue
+        if not want or h.class_isa(h.m.read64(c.managed), want):
             return c.managed
     return 0
 
@@ -1265,6 +1298,43 @@ def _camsetdepth(h, this, a):
        'UnityEngine.Camera::get_rect_Injected(UnityEngine.Rect&)')
 def _campixelrect(h, this, a):
     h.m.write(a[0], struct.pack('<ffff', 0.0, 0.0, float(h.width), float(h.height)))
+
+
+@icall('UnityEngine.Camera::set_clearFlags(UnityEngine.CameraClearFlags)')
+def _camsetclear(h, this, a):
+    h.obj_or_make(this, 'Camera').data['clearFlags'] = a[0]
+
+
+@icall('UnityEngine.Camera::get_clearFlags()')
+def _camclear(h, this, a):
+    return h.obj_or_make(this, 'Camera').data.get('clearFlags', 1)
+
+
+@icall('UnityEngine.Camera::set_backgroundColor_Injected(UnityEngine.Color&)')
+def _camsetbg(h, this, a):
+    h.obj_or_make(this, 'Camera').data['backgroundColor'] = h.read_color(a[0])
+
+
+@icall('UnityEngine.Camera::get_backgroundColor_Injected(UnityEngine.Color&)')
+def _cambg(h, this, a):
+    c = h.obj_or_make(this, 'Camera').data.get('backgroundColor',
+                                               (0.0, 0.0, 0.0, 0.0))
+    h.m.write(a[0], struct.pack('<ffff', *c))
+
+
+@icall('UnityEngine.Camera::set_targetTexture(UnityEngine.RenderTexture)')
+def _camsettarget(h, this, a):
+    """Point a camera at a RenderTexture: Offscreen renders the UI this way."""
+    cam = h.obj_or_make(this, 'Camera')
+    rt = h.obj(a[0]) if a[0] else None
+    cam.data['targetTexture'] = a[0]
+    cam.target = rt
+    return None
+
+
+@icall('UnityEngine.Camera::get_targetTexture()')
+def _camtarget(h, this, a):
+    return h.obj_or_make(this, 'Camera').data.get('targetTexture', 0)
 
 
 # =================================================================== Input
@@ -2160,7 +2230,8 @@ def _addcomponent(h, this, a):
 @icall('UnityEngine.SystemInfo::SupportsTextureFormatNative(UnityEngine.TextureFormat)',
        'UnityEngine.SystemInfo::SupportsRenderTextureFormatNative(UnityEngine.RenderTextureFormat)',
        'UnityEngine.SystemInfo::SupportsBlendingOnRenderTextureFormatNative(UnityEngine.RenderTextureFormat)',
-       'UnityEngine.SystemInfo::IsFormatSupported(UnityEngine.Experimental.Rendering.GraphicsFormat,UnityEngine.Experimental.Rendering.GraphicsFormatUsage)')
+       'UnityEngine.SystemInfo::IsFormatSupported(UnityEngine.Experimental.Rendering.GraphicsFormat,UnityEngine.Experimental.Rendering.GraphicsFormatUsage)',
+       'UnityEngine.SystemInfo::IsFormatSupported(UnityEngine.Experimental.Rendering.GraphicsFormat,UnityEngine.Experimental.Rendering.FormatUsage)')
 def _supportsformat(h, this, a):
     return 1
 
@@ -2185,6 +2256,7 @@ def _qualityget(h, this, a):
        'UnityEngine.QualitySettings::set_masterTextureLimit(System.Int32)',
        'UnityEngine.Screen::set_fullScreen(System.Boolean)',
        'UnityEngine.Screen::SetResolution(System.Int32,System.Int32,UnityEngine.FullScreenMode,UnityEngine.RefreshRate)',
+       'UnityEngine.Screen::RequestOrientation(UnityEngine.ScreenOrientation)',
        'UnityEngine.Screen::set_sleepTimeout(System.Int32)')
 def _screenset(h, this, a):
     return None
@@ -2294,6 +2366,35 @@ def _gfxformat(h, this, a):
             5: 10 if srgb else 9,       # ARGB32
             1: 1,                       # Alpha8
             }.get(a[0], 8 if srgb else 7)
+
+
+@icall('UnityEngine.Experimental.Rendering.GraphicsFormatUtility::GetGraphicsFormat_Native_RenderTextureFormat(UnityEngine.RenderTextureFormat,System.Boolean)')
+def _gfxformat_rt(h, this, a):
+    """RenderTextureFormat -> GraphicsFormat; the Offscreen RT is 32-bit RGBA."""
+    return 4 if a[1] else 8              # R8G8B8A8_SRGB / R8G8B8A8_UNorm
+
+
+@icall('UnityEngine.SystemInfo::GetCompatibleFormat(UnityEngine.Experimental.Rendering.GraphicsFormat,UnityEngine.Experimental.Rendering.FormatUsage)',
+       'UnityEngine.SystemInfo::GetCompatibleFormat(UnityEngine.Experimental.Rendering.GraphicsFormat,UnityEngine.Experimental.Rendering.GraphicsFormatUsage)')
+def _compatformat(h, this, a):
+    return a[0]                          # everything the game asks for is fine
+
+
+@icall('UnityEngine.Experimental.Rendering.GraphicsFormatUtility::GetDepthStencilFormatFromBitsLegacy_Native(System.Int32)')
+def _depthformat(h, this, a):
+    bits = a[0]
+    if bits <= 0:
+        return 0                         # GraphicsFormat.None
+    if bits <= 16:
+        return 90                        # D16_UNorm
+    if bits <= 24:
+        return 92                        # D24_UNorm_S8_UInt
+    return 94                            # D32_SFloat_S8_UInt
+
+
+@icall('UnityEngine.QualitySettings::get_activeColorSpace()')
+def _colorspace(h, this, a):
+    return 0                             # ColorSpace.Gamma
 
 
 @icall('UnityEngine.Experimental.Rendering.GraphicsFormatUtility::IsCrunchFormat(UnityEngine.TextureFormat)',
@@ -2454,22 +2555,28 @@ def _readpixels(h, this, a):
        'UnityEngine.GameObject::GetComponentFastPath(System.Type,System.IntPtr)',
        'UnityEngine.GameObject::TryGetComponentFastPath(System.Type,System.IntPtr)')
 def _getcomponentfast(h, this, a):
-    """Unity writes the result through the IntPtr out-parameter."""
+    """GetComponent<T>()'s fast path: the result goes *before* the pointer.
+
+    The generic method allocates `CastHelper<T> { T t; IntPtr oneFurther; }`
+    on the stack and hands Unity the address of `oneFurther`, expecting the
+    object to be stored one pointer lower, in `t`.  The shipped code says so
+    itself: `add x2, sp, #8` on the way in, `ldr x0, [sp]` on the way out.
+    """
     o = h.obj(this)
     if o is None:
-        return None
+        return 0
     go = o if o.kind == 'GameObject' else (o.gameobject or o)
     klass = h.type_class(a[0])
     found = 0
     for c in ([go.transform] if go.transform else []) + list(go.components):
         if not c or not c.managed:
             continue
-        if not klass or h.m.read64(c.managed) == klass:
+        if not klass or h.class_isa(h.m.read64(c.managed), klass):
             found = c.managed
             break
     if a[1]:
-        h.m.write64(a[1], found)
-    return None
+        h.m.write64(a[1] - 8, found)
+    return 1 if found else 0
 
 
 from . import androidjni                                          # noqa: E402,F401
