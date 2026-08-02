@@ -63,6 +63,27 @@ class GuestError(Exception):
     pass
 
 
+class TailCall(object):
+    """Host stub result: continue execution at `addr` keeping the caller's LR.
+
+    Lets a host implementation hand control to real guest code (for example
+    il2cpp_string_new) without re-entering the emulator, which Unicorn does
+    not allow from inside a hook.
+    """
+    __slots__ = ('addr',)
+
+    def __init__(self, addr):
+        self.addr = addr
+
+
+class _Skip(object):
+    """Host stub result: the handler has already set the return registers."""
+    __repr__ = lambda self: '<SKIP>'
+
+
+SKIP = _Skip()
+
+
 class Thread(object):
     _next_id = 1
 
@@ -329,6 +350,12 @@ class Machine(object):
             return
         if ret is None:
             ret = 0
+        if ret is SKIP:
+            uc.reg_write(A64.UC_ARM64_REG_PC, uc.reg_read(A64.UC_ARM64_REG_LR))
+            return
+        if isinstance(ret, TailCall):
+            uc.reg_write(A64.UC_ARM64_REG_PC, ret.addr)
+            return
         if isinstance(ret, tuple):
             for i, v in enumerate(ret):
                 uc.reg_write(ARG_REGS[i], v & 0xFFFFFFFFFFFFFFFF)
@@ -372,6 +399,48 @@ class Machine(object):
 
     def _on_block(self, uc, address, size, ud):
         self.blocks.append(address)
+
+    # ------------------------------------------------------- method tracing
+    def enable_method_trace(self, assemblies=('Assembly-CSharp.dll',
+                                              'KairoLibrary.dll'), depth=8192):
+        """Record every managed method of the game's own assemblies as it is
+        entered.  Restricted to their address range so the hook costs nothing
+        while the runtime or corlib is running."""
+        if self.symbols is None:
+            return False
+        want = {}
+        for a, rec in self.symbols.by_addr.items():
+            if rec['asm'] in assemblies:
+                want[a] = rec['full']
+        if not want:
+            return False
+        li = self.images[0]
+        lo, hi = min(want) + li.bias, max(want) + li.bias
+        self.method_trace = collections.deque(maxlen=depth)
+        self.trace_names = {a + li.bias: n for a, n in want.items()}
+        names = self.trace_names
+        trace = self.method_trace
+
+        def cb(uc, address, size, ud):
+            n = names.get(address)
+            if n is not None:
+                trace.append(n)
+        self.uc.hook_add(UC_HOOK_BLOCK, cb, begin=lo, end=hi)
+        if self.verbose:
+            print('[vm] method trace armed over %#x..%#x (%d methods)'
+                  % (lo, hi, len(want)))
+        return True
+
+    def recent_methods(self, n=40):
+        t = getattr(self, 'method_trace', None)
+        if not t:
+            return []
+        out, last = [], None
+        for x in list(t)[-n * 4:]:
+            if x != last:
+                out.append(x)
+                last = x
+        return out[-n:]
 
     def backtrace(self, limit=32):
         """Walk the AArch64 frame-pointer chain."""

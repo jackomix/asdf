@@ -154,14 +154,50 @@ class Il2CppRuntime(object):
             raise GuestError('managed exception: %s' % self.describe_exception(e))
         return r
 
-    def describe_exception(self, exc):
+    def format_exception(self, exc):
+        buf = self.m.env.alloc(8192)
+        self.call('il2cpp_format_exception', exc, buf, 8192)
+        v = self.m.cstr(buf)
+        return v.decode('utf-8', 'replace') if v else ''
+
+    def format_stack_trace(self, exc):
+        buf = self.m.env.alloc(16384)
+        self.call('il2cpp_format_stack_trace', exc, buf, 16384)
+        v = self.m.cstr(buf)
+        return v.decode('utf-8', 'replace') if v else ''
+
+    def exception_field(self, exc, name):
+        """Read a field of System.Exception by name (layout independent)."""
+        k = self.m.read64(exc)
+        while k:
+            f = self.call('il2cpp_class_get_field_from_name', k,
+                          self.m.put_cstr(name))
+            if f:
+                return self.m.read64(exc + self.field_offset(f))
+            k = self.call('il2cpp_class_get_parent', k)
+        return 0
+
+    def describe_exception(self, exc, depth=0):
         try:
             k = self.m.read64(exc)
             name = self.class_name(k)
-            msg = self.m.read64(exc + 0x18)
-            return '%s: %s' % (name, self.string(msg) if msg else '')
-        except Exception:
-            return '<exception @%#x>' % exc
+            msg = self.exception_field(exc, '_message')
+            out = '%s: %s' % (name, self.string(msg) if msg else '')
+            inner = self.exception_field(exc, '_innerException')
+            if inner and depth < 4:
+                out += '\n      ---> %s' % self.describe_exception(inner, depth + 1)
+            trace = self.exception_field(exc, '_stackTraceString')
+            if not trace:
+                trace = self.exception_field(exc, '_remoteStackTraceString')
+            if trace:
+                out += '\n' + self.string(trace)
+            else:
+                t = self.format_stack_trace(exc)
+                if t:
+                    out += '\n' + t
+            return out
+        except Exception as e:
+            return '<exception @%#x %r>' % (exc, e)
 
     def string_new(self, s):
         return self.call('il2cpp_string_new', self.m.put_cstr(s))
@@ -207,6 +243,7 @@ def build(apk_root, pkg=DEFAULT_PKG, verbose=0, echo_log=True, trace=False):
     })
 
     li = m.load(lib)
+    host.publish_phdrs(li)
     m.bootstrap_main_thread()
     return m, host, li
 

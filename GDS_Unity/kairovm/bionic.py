@@ -74,6 +74,21 @@ class Bionic(object):
         self._build_thunks()
         self.register_all()
 
+    # ------------------------------------------------------ dl_phdr_info
+    def publish_phdrs(self, li):
+        """Describe a loaded image to the guest's unwinder."""
+        m = self.m
+        img = li.img
+        raw = img.data[img.e_phoff:img.e_phoff + img.e_phnum * img.e_phentsize]
+        ph = m.env.alloc(len(raw))
+        m.write(ph, raw)
+        name = m.put_cstr(li.name)
+        info = m.env.alloc(64)
+        m.write(info, struct.pack('<QQQH6xQQQQ', li.bias, name, ph,
+                                  img.e_phnum, 1, 0, 0, 0))
+        m.write64(self.dl_info_slot, info)
+        return info
+
     # --------------------------------------------------------------- paths
     def host_path(self, guest_path):
         if guest_path is None:
@@ -111,6 +126,33 @@ class Bionic(object):
         Implementing these as real ARM64 machine code avoids re-entering the
         emulator from inside a hook, which Unicorn does not support.
         """
+        # dl_iterate_phdr(callback, data): the C++ unwinder walks the loaded
+        # images through this to find .eh_frame_hdr.  Without it every managed
+        # exception turns into std::terminate() instead of being caught.
+        self.dl_info_slot = self.m.env.alloc(8)
+        self.m.write64(self.dl_info_slot, 0)
+        a = self.dl_info_slot
+        self._thunk('dl_iterate_phdr', """
+            stp   x29, x30, [sp, #-32]!
+            movz  x9, #%d
+            movk  x9, #%d, lsl #16
+            movk  x9, #%d, lsl #32
+            movk  x9, #%d, lsl #48
+            ldr   x8, [x9]
+            cbz   x8, dip_none
+            mov   x3, x0
+            mov   x2, x1
+            mov   x0, x8
+            mov   x1, #64
+            blr   x3
+            ldp   x29, x30, [sp], #32
+            ret
+        dip_none:
+            mov   x0, #0
+            ldp   x29, x30, [sp], #32
+            ret
+        """ % (a & 0xFFFF, (a >> 16) & 0xFFFF, (a >> 32) & 0xFFFF, (a >> 48) & 0xFFFF))
+
         # pthread_once(once_control*, void(*init)(void))
         self._thunk('pthread_once', """
             ldr   w2, [x0]

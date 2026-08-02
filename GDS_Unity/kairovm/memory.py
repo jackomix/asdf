@@ -36,6 +36,11 @@ HEAP_SIZE = 0x100000000          # 4 GiB of address space, mapped lazily
 MMAP_BASE = 0x200000000
 MMAP_SIZE = 0x200000000
 
+# host-built managed objects (strings/arrays the platform layer hands to the
+# game).  Kept above the mmap arena so the two can never collide.
+UNITY_BASE = 0x400000000
+UNITY_SIZE = 0x040000000
+
 PAGE = 0x1000
 
 PROT_READ = 1
