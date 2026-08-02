@@ -258,7 +258,7 @@ class AndroidHost {
     this._applyState(o, cxw);
     if (paint) {
       cxw.globalAlpha = (paint._alpha !== undefined ? paint._alpha : 255) / 255;
-      cxw.imageSmoothingEnabled = paint._filter !== false;
+      cxw.imageSmoothingEnabled = paint._filter === true;
       if (paint._shadow) {
         const s = paint._shadow;
         cxw.shadowColor = cssColor(s.c);
@@ -436,7 +436,10 @@ class AndroidHost {
     o._color = src ? src._color : 0xff000000 | 0;
     o._alpha = src ? src._alpha : 255;
     o._aa = src ? src._aa : false;
-    o._filter = src ? src._filter : true;
+    /* Android default Paint has filterBitmap=false: scaled bitmap draws
+     * sample nearest unless the app opts into filtering. Defaulting true
+     * blurred every scaled sprite in real browsers (SWCanvas ignored it). */
+    o._filter = src ? src._filter : false;
     o._style = src ? src._style : 0;
     o._strokeWidth = src ? src._strokeWidth : 0;
     o._textSize = src ? src._textSize : 12;

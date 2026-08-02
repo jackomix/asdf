@@ -656,7 +656,14 @@ class VM {
     for (let i = 0; i < n && remaining > 0; i++) {
       this.schedCursor = (this.schedCursor + 1) % this.threads.length;
       const thr = this.threads[this.schedCursor];
-      if (thr === this.mainThread || thr.dead) continue;
+      if (thr.dead) continue;
+      /* The main thread is normally driven synchronously (uiQueue tasks /
+       * vm.call deliveries) and has no business here — EXCEPT when a callee
+       * on it blocked (Thread.yield/sleep) and _execLoop suspended with the
+       * frame still on the stack. Only this round-robin can resume such a
+       * frame once the block expires. A main thread with empty frames is
+       * skipped as before. */
+      if (thr === this.mainThread && !thr.frames.length) continue;
       if (thr.blockedUntil > nowMs) continue;
       const before = this.stats.insns;
       try {

@@ -86,6 +86,10 @@ tools/
   screen and presents one frame per pump step.
 * `node tools/boot_test.js 900` — boots via the real browser scripts;
   `BOOT E2E OK`, ~1 present/rAF.
+* `node tools/audio_loop_test.js` — boots the real scripts, taps once to
+  unlock audio, waits for the title BGM MediaPlayer, simulates track end and
+  asserts the game's own `onCompletion` restarts it
+  (prints `AUDIO LOOP E2E OK`).
 * With `TOUCH="500:240,218;800:240,200"` theses drive the title
   (`Start` → slot screen → new game); `FRAMEDUMP=/tmp/frames` records PNGs;
   `SAVEDUMP=1` shows persisted save files.
@@ -102,9 +106,19 @@ tools/
   with no coverage.
 * **Fonts:** Droid Sans ⇒ browser sans-serif; engine-drawn bitmap text is
   pixel-exact (it comes from the original sprite packs).
-* **Sound:** `.ogg` music/SFX through `HTMLAudioElement`, volumes/looping
-  routed 1:1; `snd.inf` selects them. The vestigial JetPlayer channel is
-  stubbed silent (this title uses MediaPlayer for all audible content).
+* **Sound:** `.ogg` music/SFX through `HTMLAudioElement`, volumes routed 1:1;
+  `snd.inf` selects them. The game never calls `MediaPlayer.setLooping` —
+  its audio wrapper (`kairo/android/ui/a`) loops BGM by registering itself as
+  `OnCompletionListener` and doing `seekTo(0)`+`start()` in `onCompletion()`
+  (verified by dex disassembly), so the host maps HTMLAudio `ended` to a
+  real `onCompletion` dispatch into the VM, and the game's own unmodified
+  restart code runs. The vestigial JetPlayer channel is stubbed silent.
+* **Rendering:** Android's default `Paint.filterBitmap=false` is honored, so
+  scaled sprite draws sample nearest (a real-browser-only bug had them
+  bilinear-smoothed — the software canvas used in tests ignores smoothing).
+  The page CSS deliberately uses only `image-rendering: pixelated` on the
+  game canvas: Chrome/Safari implement `crisp-edges` as smooth scaling,
+  which would silently re-blur the upscale if listed after `pixelated`.
 
 ## Provenance / rights
 

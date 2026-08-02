@@ -27,8 +27,10 @@ html, body {
   background: #000;
   border-radius: 6px;
   box-shadow: 0 30px 90px rgba(0,0,0,.65), 0 0 0 1px rgba(120,140,255,.12);
+  /* NOTE: do NOT add `image-rendering: crisp-edges` after this line —
+   * Chrome/Safari implement crisp-edges as smooth scaling, which silently
+   * overrides pixelated and bilinear-blurs the whole game canvas. */
   image-rendering: pixelated;
-  image-rendering: crisp-edges;
   max-width: 100vw;
   max-height: 100vh;
 }

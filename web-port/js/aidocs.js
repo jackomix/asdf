@@ -75,9 +75,31 @@ original game is a diff against the <em>framework behavior</em>, not game code.<
 <li><strong>Assets:</strong> 100 % original bytes (<code>.dat</code> packs are
 decoded by the game's own bytecode at runtime; the web runtime only ships raw
 bytes + a synchronous PNG decoder which reproduces Android-era decoding exactly).</li>
-<li><strong>Sound:</strong> original .ogg played via HTMLAudio; volume/loop calls
-routed 1:1. JET-midi channel (<code>snd.inf</code>) is stubbed silent (this title
-does not use JetPlayer for audible content on shipping devices either).</li>
+<li><strong>Sound:</strong> original .ogg played via HTMLAudio; volume calls
+routed 1:1. BGM looping is done by the game itself: <code>kairo/android/ui/a</code>
+never calls <code>setLooping</code> — it registers itself as
+<code>OnCompletionListener</code> and its <code>onCompletion()</code> does
+<code>seekTo(0)</code> + <code>start()</code> (with a deliberate, internally
+caught <code>IllegalStateException</code> as retry control flow). The host maps
+the audio element's <code>ended</code> event to a real onCompletion dispatch on
+the UI queue. JET-midi channel (<code>snd.inf</code>) is stubbed silent (this
+title does not use JetPlayer for audible content on shipping devices either).</li>
+<li><strong>Cooperative-thread caveat (learned the hard way):</strong> natives
+that block a thread (<code>Thread.sleep/yield</code>, <code>Object.wait</code>)
+suspend <em>mid-call</em> by leaving the frame on the VM stack. The game runs
+audio restart code on the <em>main</em> thread, which the round-robin scheduler
+normally skips — leaving a permanent zombie frame (music never looped).
+Fix: the scheduler resumes any thread — including main — that actually has
+suspended frames (<code>vm.pump</code>). Any future "callback ran halfway"
+symptom should check for a blocking native on the main thread first.</li>
+<li><strong>2D semantics:</strong> Android <code>Paint.filterBitmap</code>
+defaults to <em>false</em> — scaled bitmap draws must sample nearest unless the
+app opts in. Earlier the host defaulted it true, which bilinear-blurred all
+scaled sprites in real browsers (the software test canvas ignores smoothing, so
+headless PNGs never showed it). Similarly, page CSS must keep
+<code>image-rendering: pixelated</code> last on <code>#screen</code>:
+Chrome/Safari treat <code>crisp-edges</code> as smooth scaling and it silently
+overrides <code>pixelated</code> when declared after it.</li>
 <li><strong>Licensing:</strong> Google Play License Verification Library
 (<code>com.android.vending.licensing.*</code>, present inside the dex) cannot
 reach a Play Store process on the web. The <code>transact()</code> for

@@ -86,11 +86,19 @@ function installDomStubs(ROOT) {
     setItem(k, v) { this._m.set(k, String(v)); },
     removeItem(k) { this._m.delete(k); },
   };
+  global.__audioEls = [];
   global.Audio = class {
-    constructor(url) { this.url = url; this.paused = true; this.loop = false; this.volume = 1; this.currentTime = 0; this.duration = 60; this.readyState = 4; this._listeners = {}; }
+    constructor(url) {
+      this.url = url; this.paused = true; this.loop = false; this.volume = 1;
+      this.currentTime = 0; this.duration = 60; this.readyState = 4;
+      this._listeners = {}; this.playCount = 0; this.pauseCount = 0; this.preload = '';
+      global.__audioEls.push(this);
+    }
     addEventListener(t, f) { this._listeners[t] = f; }
-    play() { this.paused = false; return Promise.resolve(); }
-    pause() { this.paused = true; }
+    play() { this.paused = false; this.playCount++; return Promise.resolve(); }
+    pause() { this.paused = true; this.pauseCount++; }
+    /* test helper: simulate the track playing to its natural end */
+    simulateEnded() { const f = this._listeners['ended']; if (f) f(); }
     cloneNode() { const a = new global.Audio(this.url); return a; }
   };
   global.ImageData = class {
