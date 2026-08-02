@@ -18,6 +18,7 @@ form.GameForm, ...) executes as shipped ARM64 machine code on top of it.
 The same contract is mirrored by native/kairo_unity.c for the ARM64 handheld
 build, so the two hosts stay interchangeable.
 """
+import base64
 import json
 import os
 import struct
@@ -138,8 +139,13 @@ class UnityHost(object):
         self.datadir = None
         self.jvm = None                  # lazily built by kairovm.androidjni
 
-        self.prefs = {}
+        self.prefs = {}                  # UnityEngine.PlayerPrefs
         self.prefs_path = None
+        # android.content.SharedPreferences("Main"): the record store lives
+        # here, values are raw byte[] exactly as kairo.android.plugin.io
+        # .Preference stores them (base64 on disk, like the real thing).
+        self.sharedprefs = {}
+        self.shared_path = None
 
         # immediate-mode drawing capture
         self.gl = []                     # finished primitive batches
@@ -327,6 +333,17 @@ class UnityHost(object):
                                   self.klass['String'], 1)
         col = self.klass.get('UnityEngine.Color')
         self.arr_color = rt.call('il2cpp_array_class_get', col, 1) if col else 0
+        # JNI primitive arrays: descriptor -> (array class, elem size, format)
+        self.arrays = {}
+        for key, nm, sz, fmt in (('Z', 'Boolean', 1, '<B'), ('B', 'Byte', 1, '<B'),
+                                 ('SB', 'SByte', 1, '<b'), ('C', 'Char', 2, '<H'),
+                                 ('S', 'Int16', 2, '<h'), ('I', 'Int32', 4, '<i'),
+                                 ('J', 'Int64', 8, '<q'), ('F', 'Single', 4, '<f'),
+                                 ('D', 'Double', 8, '<d')):
+            k = rt.class_from_name(cor, 'System', nm)
+            if k:
+                self.arrays[key] = (rt.call('il2cpp_array_class_get', k, 1),
+                                    sz, fmt)
         self.f_cached_ptr = 0x10          # UnityEngine.Object.m_CachedPtr
 
         # singletons the engine expects to exist
@@ -352,6 +369,14 @@ class UnityHost(object):
                 self.prefs = json.load(open(self.prefs_path))
             except Exception:
                 self.prefs = {}
+        self.shared_path = os.path.join(self.s.rootfs, 'sharedprefs.json')
+        if os.path.exists(self.shared_path):
+            try:
+                raw = json.load(open(self.shared_path))
+                self.sharedprefs = {k: base64.b64decode(v)
+                                    for k, v in raw.items()}
+            except Exception:
+                self.sharedprefs = {}
 
     # ------------------------------------------------------------ resources
     def open_data_dir(self):
@@ -435,7 +460,78 @@ class UnityHost(object):
             return managed
         if cid == 48:                                     # Shader
             return self.default_shader(name)
+        if cid == 1:                                      # prefab GameObject
+            return self._build_prefab(key, parsed)
+        if self.verbose:
+            print('[unity] asset %-28s class %d not buildable' % (key, cid))
         return 0
+
+    def _build_prefab(self, key, go):
+        """Rebuild a shipped prefab (class 1) as live managed objects.
+
+        The component list, the transform and the camera all come straight
+        out of the serialized file the game shipped - nothing is invented,
+        so Instantiate()/GetComponent<T>() see the authored hierarchy.
+        """
+        from unityfs import CLASS_NAMES
+        if not go:
+            return 0
+        ent = self.datadir.where(key)
+        if ent is None:
+            return 0
+        fname = ent[0]
+        name = go.get('name') or key.rsplit('/', 1)[-1]
+        root = self.make_object('GameObject', name, 'UnityEngine.GameObject')
+        root.active = bool(go.get('active', 1))
+        root.data['layer'] = go.get('layer', 0)
+        root.data['tag'] = go.get('tag', 0)
+        kinds = []
+        for file_id, path_id in go.get('components', ()):
+            if file_id:                       # cross-file component: skip
+                continue
+            got = self.datadir.load_at(fname, path_id)
+            if got is None:
+                continue
+            ccid, cdata = got
+            cname = CLASS_NAMES.get(ccid)
+            if cname in ('Transform', 'RectTransform'):
+                tf = self.make_object(cname, name, 'UnityEngine.' + cname)
+                if tf.managed == 0:           # RectTransform may not be linked
+                    tf = self.make_object('Transform', name,
+                                          'UnityEngine.Transform')
+                tf.gameobject = root
+                root.transform = tf
+                if cdata:
+                    tf.pos = list(cdata.get('position') or tf.pos)
+                    tf.rot = list(cdata.get('rotation') or tf.rot)
+                    tf.scale = list(cdata.get('scale') or tf.scale)
+                kinds.append(cname)
+                continue
+            klass = self.klass.get('UnityEngine.' + cname) if cname else None
+            if not klass:
+                if self.verbose:
+                    print('[unity] prefab %s: component class %d (%s) skipped'
+                          % (key, ccid, cname))
+                continue
+            c = self.make_object(cname, name, 'UnityEngine.' + cname)
+            c.gameobject = root
+            if cdata:
+                c.data.update(cdata)
+                if 'enabled' in cdata:
+                    c.enabled = bool(cdata['enabled'])
+            root.components.append(c)
+            kinds.append(cname)
+        if root.transform is None:
+            tf = self.make_object('Transform', name, 'UnityEngine.Transform')
+            tf.gameobject = root
+            root.transform = tf
+        for c in root.components:
+            c.transform = root.transform
+        self.named.setdefault(name, root)
+        if self.verbose:
+            print('[unity] asset %-28s prefab "%s" [%s]'
+                  % (key, name, ', '.join(kinds)))
+        return root.managed
 
     def managed_bytes(self, data):
         """byte[] in the managed heap holding `data`."""
@@ -630,6 +726,40 @@ class UnityHost(object):
                 json.dump(self.prefs, open(self.prefs_path, 'w'))
             except Exception:
                 pass
+
+    def save_shared(self):
+        """Commit the Java SharedPreferences("Main") map, base64 like Android."""
+        if not self.shared_path:
+            return
+        try:
+            json.dump({k: base64.b64encode(bytes(v)).decode('ascii')
+                       for k, v in self.sharedprefs.items()},
+                      open(self.shared_path, 'w'), indent=1, sort_keys=True)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------- managed arrays
+    def managed_prim_array(self, kind, values):
+        """Build a managed primitive array ('B','I','F', ...)."""
+        ent = self.arrays.get(kind)
+        if ent is None:
+            ent = self.arrays['B']
+        klass, size, fmt = ent
+        if kind in ('B', 'SB') and isinstance(values, (bytes, bytearray)):
+            data = bytes(values)
+        else:
+            data = b''.join(struct.pack(fmt, v) for v in values)
+        return self.new_array(klass, len(data) // size, size, data)
+
+    def read_managed_array(self, p, size=1, fmt=None):
+        """Raw bytes (or unpacked values) of a managed array."""
+        if not p:
+            return b'' if fmt is None else []
+        n = self.array_len(p)
+        raw = self.m.read(p + 0x20, n * size)
+        if fmt is None:
+            return raw
+        return [struct.unpack_from(fmt, raw, i * size)[0] for i in range(n)]
 
     def report(self, top=40):
         out = ['[unity] %d icalls made, %d distinct; %d unimplemented hits'
@@ -2207,9 +2337,15 @@ def _clone(h, this, a):
     o.data = dict(src.data)
     o.pos, o.scale, o.rot = list(src.pos), list(src.scale), list(src.rot)
     if src.kind == 'GameObject':
+        stf = src.transform
         tf = h.make_object('Transform', o.name)
         tf.gameobject = o
         o.transform = tf
+        if stf is not None:
+            tf.pos, tf.scale, tf.rot = (list(stf.pos), list(stf.scale),
+                                        list(stf.rot))
+            tf.data = dict(stf.data)
+        o.active = src.active
         for c in src.components:
             ck = h.m.read64(c.managed) if c.managed else 0
             cm = h.alloc_object(ck) if ck else 0

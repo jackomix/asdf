@@ -21,6 +21,8 @@ def main():
     ap.add_argument('--log-all', action='store_true')
     ap.add_argument('--platform', type=int, default=11,
                     help='RuntimePlatform: 2=Windows 11=Android 13=Linux')
+    ap.add_argument('--throws', action='count', default=0,
+                    help='log every managed exception the runtime raises')
     ap.add_argument('--watch', default='',
                     help='comma-separated method substrings to log on entry')
     ap.add_argument('-v', '--verbose', action='count', default=1)
@@ -29,7 +31,8 @@ def main():
     t0 = time.time()
     g = Game(args.apk, args.width, args.height, verbose=args.verbose,
              log_all=args.log_all, platform=args.platform,
-             watch=[w for w in args.watch.split(',') if w])
+             watch=[w for w in args.watch.split(',') if w],
+             throws=args.throws)
     g.create_app()
     print('[run] type chain: %s' % g.hierarchy())
 

@@ -24,6 +24,7 @@ import struct
 import time
 from collections import Counter
 
+from . import unity as U
 from .unity import icall
 
 # --------------------------------------------------------------- registries
@@ -123,6 +124,7 @@ class JVM(object):
         self.max_trace = 400
         self.thread = None
         self.log = getattr(host, 'verbose', 1) > 1
+        self.list_calls = getattr(host, 'verbose', 1) > 1
 
     # ------------------------------------------------------------- handles
     def _new(self, cls, value=None, fields=None):
@@ -329,6 +331,9 @@ class JVM(object):
                   sum(self.unknown.values()))]
         for k, v in self.unknown.most_common(top):
             out.append('   java?  %-64s %d' % (k, v))
+        if self.list_calls:
+            for k, v in sorted(self.calls.items()):
+                out.append('   java   %-64s %d' % (k, v))
         return '\n'.join(out)
 
 
@@ -1033,32 +1038,221 @@ def _fromobjarray(h, this, a):
     return arr
 
 
-@icall('UnityEngine.AndroidJNI::ToByteArray(System.Byte[])',
-       'UnityEngine.AndroidJNI::ToSByteArray(System.SByte*,System.Int32)',
-       'UnityEngine.AndroidJNI::ToIntArray(System.Int32*,System.Int32)',
-       'UnityEngine.AndroidJNI::ToCharArray(System.Char*,System.Int32)',
-       'UnityEngine.AndroidJNI::ToFloatArray(System.Single*,System.Int32)',
-       'UnityEngine.AndroidJNI::ToDoubleArray(System.Double*,System.Int32)',
-       'UnityEngine.AndroidJNI::ToLongArray(System.Int64*,System.Int32)',
-       'UnityEngine.AndroidJNI::ToShortArray(System.Int16*,System.Int32)',
-       'UnityEngine.AndroidJNI::ConvertToBooleanArray(System.Boolean[])',
-       'UnityEngine.AndroidJNI::NewBooleanArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewByteArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewSByteArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewCharArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewShortArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewIntArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewLongArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewFloatArray(System.Int32)',
-       'UnityEngine.AndroidJNI::NewDoubleArray(System.Int32)')
-def _toprimarray(h, this, a):
-    return vm(h).array('B', []).handle
+# --------------------------------------------------------- primitive arrays
+#  Java arrays live in the handle table as python lists (bytes for byte[]);
+#  these are the four shapes Unity's AndroidJNI exposes for them.
+PRIM = {'Z': ('Z', 1, '<B'), 'B': ('B', 1, '<B'), 'SB': ('SB', 1, '<b'),
+        'C': ('C', 2, '<H'), 'S': ('S', 2, '<h'), 'I': ('I', 4, '<i'),
+        'J': ('J', 8, '<q'), 'F': ('F', 4, '<f'), 'D': ('D', 8, '<d')}
 
 
-@icall('UnityEngine.AndroidJNI::FromByteArray(System.IntPtr)',
-       'UnityEngine.AndroidJNI::FromSByteArray(System.IntPtr)')
+def _jarray_items(j, handle):
+    r = j.ref(handle)
+    if r is None:
+        return None
+    v = r.value
+    if isinstance(v, (bytes, bytearray)):
+        return list(v)
+    return list(v) if isinstance(v, list) else None
+
+
+@icall('UnityEngine.AndroidJNI::ToByteArray(System.Byte[])')
+def _tobytearray(h, this, a):
+    return vm(h).array('B', h.read_managed_array(a[0], 1)).handle
+
+
+@icall('UnityEngine.AndroidJNI::ConvertToBooleanArray(System.Boolean[])')
+def _toboolarray(h, this, a):
+    return vm(h).array('Z', h.read_managed_array(a[0], 1, '<B')).handle
+
+
+def _ptr_array(h, kind, ptr, count):
+    _, size, fmt = PRIM[kind]
+    raw = h.m.read(ptr, count * size) if (ptr and count > 0) else b''
+    items = [struct.unpack_from(fmt, raw, i * size)[0] for i in range(count)]
+    return vm(h).array(kind, items).handle
+
+
+@icall('UnityEngine.AndroidJNI::ToSByteArray(System.SByte*,System.Int32)')
+def _tosbytearray(h, this, a):
+    return _ptr_array(h, 'SB', a[0], a[1])
+
+
+@icall('UnityEngine.AndroidJNI::ToCharArray(System.Char*,System.Int32)')
+def _tochararray(h, this, a):
+    return _ptr_array(h, 'C', a[0], a[1])
+
+
+@icall('UnityEngine.AndroidJNI::ToShortArray(System.Int16*,System.Int32)')
+def _toshortarray(h, this, a):
+    return _ptr_array(h, 'S', a[0], a[1])
+
+
+@icall('UnityEngine.AndroidJNI::ToIntArray(System.Int32*,System.Int32)')
+def _tointarray(h, this, a):
+    return _ptr_array(h, 'I', a[0], a[1])
+
+
+@icall('UnityEngine.AndroidJNI::ToLongArray(System.Int64*,System.Int32)')
+def _tolongarray(h, this, a):
+    return _ptr_array(h, 'J', a[0], a[1])
+
+
+@icall('UnityEngine.AndroidJNI::ToFloatArray(System.Single*,System.Int32)')
+def _tofloatarray(h, this, a):
+    return _ptr_array(h, 'F', a[0], a[1])
+
+
+@icall('UnityEngine.AndroidJNI::ToDoubleArray(System.Double*,System.Int32)')
+def _todoublearray(h, this, a):
+    return _ptr_array(h, 'D', a[0], a[1])
+
+
+def _new_jarray(h, kind, n):
+    n = max(0, n)
+    zero = 0.0 if kind in ('F', 'D') else 0
+    return vm(h).array(kind, [zero] * n).handle
+
+
+@icall('UnityEngine.AndroidJNI::NewBooleanArray(System.Int32)')
+def _newboolarray(h, this, a):
+    return _new_jarray(h, 'Z', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewSByteArray(System.Int32)')
+def _newsbytearray(h, this, a):
+    return _new_jarray(h, 'SB', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewCharArray(System.Int32)')
+def _newchararray(h, this, a):
+    return _new_jarray(h, 'C', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewShortArray(System.Int32)')
+def _newshortarray(h, this, a):
+    return _new_jarray(h, 'S', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewIntArray(System.Int32)')
+def _newintarray(h, this, a):
+    return _new_jarray(h, 'I', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewLongArray(System.Int32)')
+def _newlongarray(h, this, a):
+    return _new_jarray(h, 'J', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewFloatArray(System.Int32)')
+def _newfloatarray(h, this, a):
+    return _new_jarray(h, 'F', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::NewDoubleArray(System.Int32)')
+def _newdoublearray(h, this, a):
+    return _new_jarray(h, 'D', a[0])
+
+
+def _from_jarray(h, kind, handle):
+    items = _jarray_items(vm(h), handle)
+    if items is None:
+        return 0
+    return h.managed_prim_array(kind, items)
+
+
+@icall('UnityEngine.AndroidJNI::FromByteArray(System.IntPtr)')
 def _frombytearray(h, this, a):
-    return h.new_array(h.arr_byte, 0, 1)
+    return _from_jarray(h, 'B', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromSByteArray(System.IntPtr)')
+def _fromsbytearray(h, this, a):
+    return _from_jarray(h, 'SB', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromBooleanArray(System.IntPtr)')
+def _fromboolarray(h, this, a):
+    return _from_jarray(h, 'Z', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromCharArray(System.IntPtr)')
+def _fromchararray(h, this, a):
+    return _from_jarray(h, 'C', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromShortArray(System.IntPtr)')
+def _fromshortarray(h, this, a):
+    return _from_jarray(h, 'S', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromIntArray(System.IntPtr)')
+def _fromintarray(h, this, a):
+    return _from_jarray(h, 'I', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromLongArray(System.IntPtr)')
+def _fromlongarray(h, this, a):
+    return _from_jarray(h, 'J', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromFloatArray(System.IntPtr)')
+def _fromfloatarray(h, this, a):
+    return _from_jarray(h, 'F', a[0])
+
+
+@icall('UnityEngine.AndroidJNI::FromDoubleArray(System.IntPtr)')
+def _fromdoublearray(h, this, a):
+    return _from_jarray(h, 'D', a[0])
+
+
+def _elem_get(h, handle, index):
+    items = _jarray_items(vm(h), handle)
+    if items is None or not (0 <= index < len(items)):
+        return None
+    return items[index]
+
+
+@icall('UnityEngine.AndroidJNI::GetBooleanArrayElement(System.IntPtr,System.Int32)',
+       'UnityEngine.AndroidJNI::GetSByteArrayElement(System.IntPtr,System.Int32)',
+       'UnityEngine.AndroidJNI::GetCharArrayElement(System.IntPtr,System.Int32)',
+       'UnityEngine.AndroidJNI::GetShortArrayElement(System.IntPtr,System.Int32)',
+       'UnityEngine.AndroidJNI::GetIntArrayElement(System.IntPtr,System.Int32)',
+       'UnityEngine.AndroidJNI::GetLongArrayElement(System.IntPtr,System.Int32)')
+def _getintelem(h, this, a):
+    v = _elem_get(h, a[0], a[1])
+    return int(v) if v is not None else 0
+
+
+@icall('UnityEngine.AndroidJNI::GetFloatArrayElement(System.IntPtr,System.Int32)')
+def _getfloatelem(h, this, a):
+    v = _elem_get(h, a[0], a[1])
+    return U.f32(float(v) if v is not None else 0.0)
+
+
+@icall('UnityEngine.AndroidJNI::GetDoubleArrayElement(System.IntPtr,System.Int32)')
+def _getdoubleelem(h, this, a):
+    v = _elem_get(h, a[0], a[1])
+    return U.f64(float(v) if v is not None else 0.0)
+
+
+@icall('UnityEngine.AndroidJNI::SetBooleanArrayElement(System.IntPtr,System.Int32,System.Boolean)',
+       'UnityEngine.AndroidJNI::SetSByteArrayElement(System.IntPtr,System.Int32,System.SByte)',
+       'UnityEngine.AndroidJNI::SetCharArrayElement(System.IntPtr,System.Int32,System.Char)',
+       'UnityEngine.AndroidJNI::SetShortArrayElement(System.IntPtr,System.Int32,System.Int16)',
+       'UnityEngine.AndroidJNI::SetIntArrayElement(System.IntPtr,System.Int32,System.Int32)',
+       'UnityEngine.AndroidJNI::SetLongArrayElement(System.IntPtr,System.Int32,System.Int64)',
+       'UnityEngine.AndroidJNI::SetFloatArrayElement(System.IntPtr,System.Int32,System.Single)',
+       'UnityEngine.AndroidJNI::SetDoubleArrayElement(System.IntPtr,System.Int32,System.Double)')
+def _setelem(h, this, a):
+    r = vm(h).ref(a[0])
+    if r is None:
+        return None
+    if isinstance(r.value, (bytes, bytearray)):
+        r.value = list(r.value)
+    if isinstance(r.value, list) and 0 <= a[1] < len(r.value):
+        r.value[a[1]] = a[2]
+    return None
 
 
 # ------------------------------------------------------------------- refs
@@ -1175,13 +1369,13 @@ def _kutil_dialog(j, this, a, sig):
     j.h.dialogs.append([x for x in text if x])
     if j.h.verbose:
         print('[jni] showDialog %r' % (j.h.dialogs[-1],))
-        for line in j.h.m.recent_methods(140):
+        for line in j.h.m.recent_methods(400):
             print('    at %s' % line)
     return 0
 
 
 @jmethod('kairo/android/plugin/Utility', 'setParam', 'fullscreen',
-         'cancelNotifications', 'setNotificationBackground',
+         'cancelNotifications',
          'setNotification', 'vibrate', 'openUrl', 'share',
          'setKeepScreenOn', 'showInterstitial', 'hideAd', 'showAd',
          'setImmersiveMode', 'requestPermission')
@@ -1199,50 +1393,187 @@ def _kutil_getparam(j, this, a, sig):
 #  kairo.unity.io.RecordStore keeps every save slot as a preference entry, so
 #  these four calls are the whole persistence layer of the port.
 # --------------------------------------------------------------------------
+# kairo.android.plugin.util.StringUtil.ESCAPES, verified against the string
+# literal the shipped C# port of the same helper indexes into.
+ESCAPES = ',&@\\'
+
+
+def _escape(s):
+    """kairo.android.plugin.util.StringUtil.escape(), 1:1 with the dex."""
+    if s is None:
+        return ''
+    out = []
+    for ch in s:
+        if ch in ESCAPES:
+            out.append('\\')
+        out.append(ch)
+    return '"' + ''.join(out) + '"'
+
+
+def _pref_bytes(j, handle):
+    """A jbyteArray handle -> python bytes (None for a null reference)."""
+    if not handle:
+        return None
+    r = j.ref(handle)
+    if r is None:
+        return None
+    v = r.value
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v)
+    if isinstance(v, list):
+        return bytes(x & 0xFF for x in v)
+    if isinstance(v, str):
+        return v.encode('utf-8')
+    return None
+
+
 @jmethod('kairo/android/plugin/Utility', 'putPreference', 'setPreference')
 def _pref_put(j, this, a, sig):
+    """Utility.putPreference(String,byte[]) -> Preference.put(...)."""
     key = j.text(a[0]) if a else None
     if key is None:
         return None
-    val = j.text(a[1]) if len(a) > 1 else ''
-    j.h.prefs[key] = val
-    j.h.save_prefs()
+    data = _pref_bytes(j, a[1]) if len(a) > 1 else b''
+    j.h.sharedprefs[key] = b'' if data is None else data
+    j.h.save_shared()
     return None
 
 
 @jmethod('kairo/android/plugin/Utility', 'getPreference')
 def _pref_get(j, this, a, sig):
+    """Utility.getPreference(String) -> byte[]; null when absent."""
     key = j.text(a[0]) if a else None
-    default = j.text(a[1]) if len(a) > 1 else ''
-    v = j.h.prefs.get(key)
-    return default if v is None else v
+    v = j.h.sharedprefs.get(key)
+    if v is None:
+        return None
+    return j.array('B', bytes(v))
+
+
+@jmethod('kairo/android/plugin/Utility', 'existPreference')
+def _pref_exist(j, this, a, sig):
+    key = j.text(a[0]) if a else None
+    return 1 if key in j.h.sharedprefs else 0
 
 
 @jmethod('kairo/android/plugin/Utility', 'removePreference')
 def _pref_remove(j, this, a, sig):
     key = j.text(a[0]) if a else None
-    if key in j.h.prefs:
-        del j.h.prefs[key]
-        j.h.save_prefs()
+    if key in j.h.sharedprefs:
+        del j.h.sharedprefs[key]
+        j.h.save_shared()
     return None
 
 
 @jmethod('kairo/android/plugin/Utility', 'getPreferenceKeys')
 def _pref_keys(j, this, a, sig):
-    # kairo.unity.native.util.StringUtil.GetStrArray splits on ',' and
-    # unescapes each element.
-    return ','.join(str(k).replace('\\', '\\\\').replace(',', '\\,')
-                    for k in sorted(j.h.prefs))
+    """Preference.getAllKeys() joined by StringUtil.getString(String[]).
+
+    Note the shipped C# reader (kairo.unity.native.util.StringUtil.Unescape)
+    maps the empty string to null and the caller then feeds that null to
+    Enumerable.Contains, so a genuinely empty store throws inside the engine.
+    On a device it never is empty: Utility.setNotificationBackground() and
+    friends below write their `_plugin_*` keys during start-up, which is
+    exactly why they must be real here instead of no-ops.
+    """
+    return ','.join(_escape(k) for k in sorted(j.h.sharedprefs))
+
+
+# ---- the `_plugin_*` preferences kairo.android.plugin.Utility keeps ------
+#      (keys, encodings and defaults read straight out of classes.dex)
+def _pref_write(j, key, text):
+    j.h.sharedprefs[key] = str(text).encode('utf-8')
+    j.h.save_shared()
+
+
+def _pref_read_text(j, key):
+    v = j.h.sharedprefs.get(key)
+    return None if v is None else bytes(v).decode('utf-8', 'replace')
+
+
+def _pref_read_int(j, key, default):
+    s = _pref_read_text(j, key)
+    if s is None:
+        return default
+    try:
+        return int(s.strip())
+    except ValueError:                       # Java: NumberFormatException
+        return default
+
+
+@jmethod('kairo/android/plugin/Utility', 'setDebug')
+def _kutil_setdebug(j, this, a, sig):
+    _pref_write(j, '_plugin_debug', 1 if a and a[0] else 0)
+
+
+@jmethod('kairo/android/plugin/Utility', 'isDebug')
+def _kutil_isdebug(j, this, a, sig):
+    return 1 if _pref_read_int(j, '_plugin_debug', 0) == 1 else 0
+
+
+@jmethod('kairo/android/plugin/Utility', 'setLanguage')
+def _kutil_setlang(j, this, a, sig):
+    _pref_write(j, '_plugin_language', j.as_int(a[0]) if a else 0)
+
+
+@jmethod('kairo/android/plugin/Utility', 'getLanguage')
+def _kutil_getlang(j, this, a, sig):
+    return _pref_read_int(j, '_plugin_language', 0)
+
+
+@jmethod('kairo/android/plugin/Utility', 'setNotificationFilter')
+def _kutil_setnotiflevel(j, this, a, sig):
+    _pref_write(j, '_plugin_notification_level', j.as_int(a[0]) if a else 0)
 
 
 @jmethod('kairo/android/plugin/Utility', 'getNotificationFilter')
 def _kutil_notiffilter(j, this, a, sig):
-    return 0
+    return _pref_read_int(j, '_plugin_notification_level', 3)
+
+
+@jmethod('kairo/android/plugin/Utility', 'setNotificationBackground')
+def _kutil_setnotifbg(j, this, a, sig):
+    _pref_write(j, '_plugin_notification_background', 1 if a and a[0] else 0)
+
+
+@jmethod('kairo/android/plugin/Utility', 'getNotificationBackground')
+def _kutil_notifbg(j, this, a, sig):
+    return 1 if _pref_read_int(j, '_plugin_notification_background', 0) == 1 else 0
+
+
+@jmethod('kairo/android/plugin/Utility', 'setGCMRegistrationId')
+def _kutil_setgcm(j, this, a, sig):
+    _pref_write(j, '_registration_id', j.as_text(a[0]) if a else '')
+
+
+@jmethod('kairo/android/plugin/Utility', 'getGCMRegistrationId')
+def _kutil_getgcm(j, this, a, sig):
+    return _pref_read_text(j, '_registration_id')
+
+
+@jmethod('kairo/android/plugin/Utility', 'addNotificationData')
+def _kutil_addnotifdata(j, this, a, sig):
+    key = '_plugin_notification_data'
+    cur = _pref_read_text(j, key) or ''
+    if len(cur):
+        cur += '\n'
+    add = (j.as_text(a[-1]) or '') if a else ''
+    _pref_write(j, key, cur + add.replace('\n', ''))
+
+
+@jmethod('kairo/android/plugin/Utility', 'removeNotificationData')
+def _kutil_rmnotifdata(j, this, a, sig):
+    if j.h.sharedprefs.pop('_plugin_notification_data', None) is not None:
+        j.h.save_shared()
 
 
 @jmethod('kairo/android/plugin/Utility', 'getNotificationData')
 def _kutil_notifdata(j, this, a, sig):
-    return j.array('Ljava/lang/String;', [])
+    raw = _pref_read_text(j, '_plugin_notification_data')
+    if raw is None:
+        return j.array('Ljava/lang/String;', [])
+    items = [s.strip() for s in raw.split('\n')]
+    return j.array('Ljava/lang/String;',
+                   [j.string(s) for s in items if s])
 
 
 @jmethod('kairo/android/plugin/Utility', 'isConnected', 'hasPermission')

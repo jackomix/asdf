@@ -457,6 +457,51 @@ class Machine(object):
                   % (lo, hi, len(want)))
         return True
 
+    # --------------------------------------------------- exception tracing
+    def enable_exception_trace(self, quiet=False, depth=14, native=0):
+        """Log every managed exception the shipped runtime throws.
+
+        IL2CPP raises managed exceptions as C++ exceptions carrying an
+        Il2CppExceptionWrapper, so a single hook on __cxa_throw sees them all,
+        including the ones a `catch` swallows a few instructions later - which
+        is exactly the class of bug that is invisible from the outside.
+        """
+        addr = None
+        for li in self.images:
+            a = li.resolve('__cxa_throw')
+            if a is not None:
+                addr = a
+                break
+        if addr is None:
+            return False
+        self.exceptions = []
+        self.exception_quiet = quiet
+        self.exception_native = native
+        reg0 = A64.UC_ARM64_REG_X0
+        reg30 = A64.UC_ARM64_REG_LR
+
+        def cb(uc, address, size, ud):
+            try:
+                ex = self.read64(uc.reg_read(reg0))
+                cls = self.probe_object(ex) or ('%#x' % ex)
+                msg = self.guest_string(self.read64(ex + 0x18))
+            except Exception:
+                cls, msg = '?', None
+            site = self.describe(uc.reg_read(reg30))
+            rec = (cls, msg, site, self.recent_methods(depth))
+            self.exceptions.append(rec)
+            if not self.exception_quiet:
+                print('[throw] %s: %s   from %s' % (cls, msg, site))
+                if self.exception_native:
+                    for line in self.backtrace(self.exception_native)[2:]:
+                        print('        %s' % line.strip())
+                for line in rec[3]:
+                    print('        at %s' % line)
+        self.uc.hook_add(UC_HOOK_CODE, cb, begin=addr, end=addr + 3)
+        if self.verbose:
+            print('[vm] exception trace armed at __cxa_throw %#x' % addr)
+        return True
+
     def guest_string(self, p):
         """Decode an Il2CppString* if `p` plausibly is one, else None."""
         if not p or p & 1:

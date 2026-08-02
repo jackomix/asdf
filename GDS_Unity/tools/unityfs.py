@@ -267,15 +267,108 @@ def read_texture2d(sf, obj):
                                                         stream_off, stream_size)}
 
 
-READERS = {49: read_text_asset, 83: read_audio_clip, 28: read_texture2d,
+# ----------------------------------------------------------------- class 1
+def read_game_object(sf, obj):
+    """GameObject: m_Component = vector<PPtr<Component>>, layer, name, tag."""
+    r = sf.reader(obj)
+    n = r.i32()
+    comps = []
+    for _ in range(n):
+        file_id = r.i32()
+        path_id = r.i64()
+        comps.append((file_id, path_id))
+    layer = r.i32()
+    name = r.astr()
+    tag = r.u16()
+    active = r.u8()
+    return {'name': name, 'components': comps, 'layer': layer, 'tag': tag,
+            'active': active}
+
+
+# ----------------------------------------------------------------- class 4
+def read_transform(sf, obj):
+    r = sf.reader(obj)
+    go_file = r.i32()
+    go_path = r.i64()
+    rot = [r.f32() for _ in range(4)]
+    pos = [r.f32() for _ in range(3)]
+    scale = [r.f32() for _ in range(3)]
+    children = []
+    try:
+        n = r.i32()
+        for _ in range(n):
+            children.append((r.i32(), r.i64()))
+        father = (r.i32(), r.i64())
+    except Exception:
+        father = (0, 0)
+    return {'gameObject': (go_file, go_path), 'rotation': rot,
+            'position': pos, 'scale': scale, 'children': children,
+            'father': father}
+
+
+# ---------------------------------------------------------------- class 20
+def read_camera(sf, obj):
+    """Camera.  Field order verified byte-exactly against the shipped prefab."""
+    r = sf.reader(obj)
+    go = (r.i32(), r.i64())
+    enabled = r.u8()
+    r.align(4)
+    clear_flags = r.i32()
+    background = [r.f32() for _ in range(4)]
+    projection_mode = r.i32()
+    gate_fit = r.i32()
+    iso = r.i32()
+    shutter = r.f32()
+    aperture = r.f32()
+    focus_distance = r.f32()
+    focal_length = r.f32()
+    blade_count = r.i32()
+    curvature = [r.f32(), r.f32()]
+    barrel_clipping = r.f32()
+    anamorphism = r.f32()
+    sensor_size = [r.f32(), r.f32()]
+    lens_shift = [r.f32(), r.f32()]
+    viewport = [r.f32() for _ in range(4)]
+    near = r.f32()
+    far = r.f32()
+    fov = r.f32()
+    ortho = r.u8()
+    r.align(4)
+    ortho_size = r.f32()
+    depth = r.f32()
+    culling_mask = r.u32()
+    rendering_path = r.i32()
+    target_texture = (r.i32(), r.i64())
+    target_display = r.i32()
+    target_eye = r.i32()
+    return {'enabled': enabled, 'clearFlags': clear_flags,
+            'backgroundColor': background, 'gameObject': go,
+            'projectionMatrixMode': projection_mode, 'gateFitMode': gate_fit,
+            'iso': iso, 'shutterSpeed': shutter, 'aperture': aperture,
+            'focusDistance': focus_distance, 'focalLength': focal_length,
+            'bladeCount': blade_count, 'curvature': curvature,
+            'barrelClipping': barrel_clipping, 'anamorphism': anamorphism,
+            'sensorSize': sensor_size, 'lensShift': lens_shift,
+            'rect': viewport, 'nearClipPlane': near, 'farClipPlane': far,
+            'fieldOfView': fov, 'orthographic': ortho,
+            'orthographicSize': ortho_size, 'depth': depth,
+            'cullingMask': culling_mask, 'renderingPath': rendering_path,
+            'targetTexture': target_texture, 'targetDisplay': target_display,
+            'targetEye': target_eye}
+
+
+READERS = {1: read_game_object, 4: read_transform, 20: read_camera,
+           49: read_text_asset, 83: read_audio_clip, 28: read_texture2d,
            147: read_resource_manager}
 
-CLASS_NAMES = {1: 'GameObject', 4: 'Transform', 21: 'Material', 23: 'MeshRenderer',
-               28: 'Texture2D', 33: 'MeshFilter', 43: 'Mesh', 48: 'Shader',
-               49: 'TextAsset', 83: 'AudioClip', 89: 'Cubemap', 114: 'MonoBehaviour',
+CLASS_NAMES = {1: 'GameObject', 4: 'Transform', 20: 'Camera', 21: 'Material',
+               23: 'MeshRenderer', 25: 'Renderer', 28: 'Texture2D',
+               33: 'MeshFilter', 43: 'Mesh', 48: 'Shader', 49: 'TextAsset',
+               81: 'AudioListener', 82: 'AudioSource', 83: 'AudioClip',
+               89: 'Cubemap', 108: 'Light', 114: 'MonoBehaviour',
                115: 'MonoScript', 128: 'Font', 142: 'AssetBundle',
                147: 'ResourceManager', 150: 'BuildSettings', 213: 'Sprite',
-               687078895: 'SpriteAtlas'}
+               224: 'RectTransform', 687078895: 'SpriteAtlas'}
 
 
 class DataDir(object):
@@ -323,12 +416,8 @@ class DataDir(object):
                     fname = ext.split('/')[-1]
                 self.container[path.lower()] = (fname, path_id)
 
-    def load(self, path):
-        """Resources.Load: returns (class_id, parsed object) or None."""
-        ent = self.container.get(path.lower())
-        if ent is None:
-            return None
-        fname, path_id = ent
+    def load_at(self, fname, path_id):
+        """Read one object out of a named serialized file by path id."""
         try:
             sf = self.serialized(fname)
         except IOError:
@@ -339,7 +428,21 @@ class DataDir(object):
         fn = READERS.get(obj.class_id)
         if fn is None:
             return (obj.class_id, None)
-        return (obj.class_id, fn(sf, obj))
+        try:
+            return (obj.class_id, fn(sf, obj))
+        except Exception:
+            return (obj.class_id, None)
+
+    def where(self, path):
+        """(serialized file, path id) backing a container path, or None."""
+        return self.container.get(path.lower())
+
+    def load(self, path):
+        """Resources.Load: returns (class_id, parsed object) or None."""
+        ent = self.container.get(path.lower())
+        if ent is None:
+            return None
+        return self.load_at(ent[0], ent[1])
 
     def resource_blob(self, name):
         return self.read_file(name.split('/')[-1])
