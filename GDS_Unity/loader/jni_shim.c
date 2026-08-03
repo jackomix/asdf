@@ -207,15 +207,114 @@ static jobject kv_GetObjectArrayElement(JNIEnv env, jobjectArray a, jint i) { (v
 static void kv_SetObjectArrayElement(JNIEnv env, jobjectArray a, jint i, jobject o) { (void)env;(void)a;(void)i;(void)o; }
 static jint kv_GetArrayLength(JNIEnv env, jarray a) { (void)env;(void)a; return 0; }
 static jobjectArray kv_NewObjectArray(JNIEnv env, jint n, jclass c, jobject i) { (void)env;(void)n;(void)c;(void)i; return (jobjectArray)(uintptr_t)0x7000; }
+
+/* ---- real byte array + asset stream read (Unity reads assets via these) ---- */
+#define KV_MAX_BARR 128
+struct kv_barr { unsigned char *buf; int len; };
+static struct kv_barr kv_barr[KV_MAX_BARR];
+static int kv_barr_n = 0;
+static void *kv_barr_new(int len) {
+    int i = kv_barr_n++ % KV_MAX_BARR;
+    if (kv_barr[i].buf) free(kv_barr[i].buf);
+    kv_barr[i].buf = (unsigned char *)malloc(len > 0 ? len : 1);
+    kv_barr[i].len = len;
+    return &kv_barr[i];
+}
+static struct kv_barr *kv_barr_find(void *h) {
+    if ((char *)h >= (char *)kv_barr && (char *)h < (char *)(kv_barr + KV_MAX_BARR))
+        return (struct kv_barr *)h;
+    return 0;
+}
+static jbyteArray kv_NewByteArray(JNIEnv env, jint len) { (void)env; return (jbyteArray)kv_barr_new(len); }
+static jint kv_GetArrayLengthReal(JNIEnv env, jarray a) { (void)env; struct kv_barr *b = kv_barr_find(a); return b ? b->len : 0; }
+static jbyte *kv_GetByteArrayElements(JNIEnv env, jbyteArray a, jboolean *ic) { (void)env; if (ic) *ic = 0; struct kv_barr *b = kv_barr_find(a); return b ? (jbyte *)b->buf : 0; }
+static void kv_GetByteArrayRegion(JNIEnv env, jbyteArray a, jint start, jint len, jbyte *buf) {
+    (void)env; struct kv_barr *b = kv_barr_find(a);
+    if (b && start >= 0 && len >= 0 && start + len <= b->len) memcpy(buf, b->buf + start, len);
+}
+static void kv_SetByteArrayRegion(JNIEnv env, jbyteArray a, jint start, jint len, const jbyte *buf) {
+    (void)env; struct kv_barr *b = kv_barr_find(a);
+    if (b && start >= 0 && len >= 0 && start + len <= b->len) memcpy(b->buf + start, buf, len);
+}
+/* InputStream.read(byte[],off,len) -> fill from asset stream.
+   Defined after struct kv_asset (see AssetManager bridge below). */
+
+
 static jint kv_GetJavaVM(JNIEnv env, JavaVM **vm) { (void)env; if (vm) *vm = kv_jni_java_vm(); return 0; }
 
-/* ---- CallObjectMethodV dispatch: return real values for the methods Unity
- *      calls, modeled on terraria-nextos.  Without getAssets returning a valid
- *      AssetManager (and open() returning a stream), Unity's asset load hits
- *      a null deref -> crash at addr 0 right after initJni. ---- */
+/* ---- AssetManager bridge: read real files from the game's data dir ----
+ * Unity's initJni reads boot.config / ScriptingAssemblies.json / version data
+ * through AssetManager.open + InputStream.read.  If these return empty, Unity
+ * gets no build-guid and crashes with a null write.  So open() must read the
+ * actual file from data/ into a buffer and the read functions must serve the
+ * real bytes. */
+#define KV_MAX_ASSET 64
+struct kv_asset { unsigned char *buf; unsigned long len; unsigned long pos; int open; };
+static struct kv_asset kv_assets[KV_MAX_ASSET];
+static int kv_nasset = 0;
+static char kv_asset_dir[512] = "data";
+
+/* called by the loader with the path to the game's Data dir */
+void kv_set_asset_dir(const char *dir) {
+    if (dir) { strncpy(kv_asset_dir, dir, sizeof kv_asset_dir - 1); kv_asset_dir[sizeof kv_asset_dir - 1] = 0; }
+}
+static void *kv_asset_open(const char *path) {
+    if (!path) return 0;
+    const char *p = path;
+    /* strip Android path prefixes Unity passes: assets/bin/Data/, bin/Data/ */
+    if (!strncmp(p, "assets/bin/Data/", 16)) p += 16;
+    else if (!strncmp(p, "bin/Data/", 9)) p += 9;
+    else if (!strncmp(p, "assets/", 7)) p += 7;
+    char full[640];
+    /* build <asset_dir>/<p> */
+    unsigned i = 0, j = 0;
+    for (; kv_asset_dir[j] && i < 600; i++, j++) full[i] = kv_asset_dir[j];
+    if (i && full[i-1] != '/') full[i++] = '/';
+    for (; *p && i < 638; i++, p++) full[i] = *p;
+    full[i] = 0;
+    /* read the file */
+    int fd = open(full, O_RDONLY);
+    if (fd < 0) return 0;
+    long sz = lseek(fd, 0, SEEK_END); lseek(fd, 0, SEEK_SET);
+    if (sz < 0) sz = 0;
+    int idx = kv_nasset++ % KV_MAX_ASSET;
+    if (kv_assets[idx].buf) free(kv_assets[idx].buf);
+    kv_assets[idx].buf = malloc(sz ? (unsigned long)sz : 1);
+    long got = 0;
+    while (got < sz) { long r = read(fd, kv_assets[idx].buf + got, sz - got); if (r <= 0) break; got += r; }
+    close(fd);
+    kv_assets[idx].len = (unsigned long)got;
+    kv_assets[idx].pos = 0;
+    kv_assets[idx].open = 1;
+    return &kv_assets[idx];
+}
+static struct kv_asset *kv_asset_find(void *h) {
+    if ((char *)h >= (char *)kv_assets && (char *)h < (char *)(kv_assets + KV_MAX_ASSET))
+        return (struct kv_asset *)h;
+    return 0;
+}
+
+/* InputStream.read(byte[],off,len) -> fill from asset stream */
+static jint kv_InputStreamRead(JNIEnv env, jobject stream, jobject arr, jint off, jint len) {
+    (void)env;
+    struct kv_asset *as = kv_asset_find(stream);
+    struct kv_barr *b = kv_barr_find(arr);
+    if (!as || !b || !as->open) return 0;
+    long avail = (long)(as->len - as->pos);
+    if (avail <= 0) return -1;                 /* EOF */
+    int n = avail < (long)len ? (int)avail : len;
+    if (off >= 0 && off + n <= b->len) memcpy(b->buf + off, as->buf + as->pos, n);
+    as->pos += n;
+    return n;
+}
+static jint kv_InputStreamRead_1(JNIEnv env, jobject stream) {
+    (void)env; struct kv_asset *as = kv_asset_find(stream);
+    if (!as || !as->open || as->pos >= as->len) return -1;
+    return as->buf[as->pos++];
+}
+
 static jobject kv_fake_obj = (jobject)(uintptr_t)0x6000;
 static jobject kv_assetmgr = (jobject)(uintptr_t)0x6100;   /* fake AssetManager */
-static jobject kv_asset_stream = (jobject)(uintptr_t)0x6200;/* fake InputStream */
 
 static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void *ap) {
     (void)env;
@@ -223,9 +322,12 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
     if (!nm) return kv_fake_obj;
     if (strcmp(nm, "getAssets") == 0) return kv_assetmgr;
     if (strcmp(nm, "open") == 0 || strcmp(nm, "openNonAsset") == 0) {
-        /* read the asset path; we don't serve content (no GPU) but must not
-         * return null or Unity crashes.  Return the fake stream. */
-        return kv_asset_stream;
+        /* read the actual asset file from data/ and return a real stream */
+        void *pathobj = ap ? ((void **)ap)[0] : 0;
+        const char *path = pathobj ? kv_resolve_jstring((jstring)pathobj) : 0;
+        void *stream = kv_asset_open(path);
+        if (stream) return stream;
+        return kv_fake_obj;   /* file missing: non-null so Unity doesn't crash */
     }
     if (strcmp(nm, "getFilesDir") == 0 || strcmp(nm, "getExternalFilesDir") == 0 ||
         strcmp(nm, "getCacheDir") == 0 || strcmp(nm, "getDataDir") == 0 ||
@@ -255,8 +357,37 @@ static jobject kv_CallObjectMethodA(JNIEnv env, jobject obj, jmethodID mid, cons
 static jobject kv_CallObj(JNIEnv env, jobject o, jmethodID m, ...) {
     return kv_CallObjectMethodV(env, o, m, 0);
 }
-static jboolean kv_CallBool(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
-static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
+static jboolean kv_CallBool(JNIEnv env, jobject o, jmethodID m, ...) {
+    (void)env; (void)o;
+    const char *nm = kv_method_name(m);
+    if (!nm) return 0;
+    if (strcmp(nm, "containsKey") == 0) return 0;   /* Bundle: no extras */
+    if (strcmp(nm, "hasNext") == 0) return 0;        /* Scanner: no more tokens */
+    if (strcmp(nm, "isFinishing") == 0) return 0;
+    if (strcmp(nm, "isDestroyed") == 0) return 0;
+    return 0;
+}
+static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) {
+    (void)env;
+    const char *nm = kv_method_name(m);
+    if (!nm) return 0;
+    if (strcmp(nm, "read") == 0) {
+        /* InputStream.read(byte[],off,len) */
+        va_list ap; va_start(ap, m);
+        jobject arr = va_arg(ap, jobject);
+        jint off = va_arg(ap, jint);
+        jint len = va_arg(ap, jint);
+        va_end(ap);
+        return kv_InputStreamRead(env, o, arr, off, len);
+    }
+    if (strcmp(nm, "useDelimiter") == 0) return 1;
+    if (strcmp(nm, "hasNext") == 0) return 0;
+    if (strcmp(nm, "nextInt") == 0) return 0;
+    if (strcmp(nm, "getDeviceId") == 0) return 0;
+    if (strcmp(nm, "getOrientation") == 0) return 0;
+    if (strcmp(nm, "getRotation") == 0) return 0;
+    return 0;
+}
 static jlong kv_CallLong(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
 static void kv_CallVoid(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; }
 static jfloat kv_CallFloat(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
@@ -594,12 +725,12 @@ const struct JNINativeInterface_ kv_jni_table = {
     kv_unsupported,
     kv_NewString, kv_GetStringLength, kv_unsupported, kv_unsupported,
     kv_NewStringUTF, kv_GetStringUTFLength, kv_GetStringUTFChars, kv_ReleaseStringUTFChars,
-    kv_GetArrayLength, kv_NewObjectArray, kv_GetObjectArrayElement, kv_SetObjectArrayElement,
-    kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported,
+    kv_GetArrayLengthReal, kv_NewObjectArray, kv_GetObjectArrayElement, kv_SetObjectArrayElement,
+    kv_unsupported, kv_NewByteArray, kv_unsupported, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported,
-    kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported,
+    kv_unsupported, kv_GetByteArrayElements, kv_unsupported, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported,
-    kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported,
+    kv_GetByteArrayRegion, kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported,

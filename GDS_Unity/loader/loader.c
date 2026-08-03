@@ -26,6 +26,7 @@
 void *kv_jni_java_vm(void);
 void *kv_jni_env(void);
 void *kv_jni_find_native(const char *name);
+void kv_set_asset_dir(const char *dir);
 int kv_log_open(const char *path);
 void kv_install_crash_handler(void);
 
@@ -473,6 +474,7 @@ int real_main(int argc, char **argv) {
      * test always produces a diagnostic log even if the shell can't capture it.
      */
     kv_log_open(kv_abspath(argv0, "loader.log"));
+    kv_set_asset_dir(kv_abspath(argv0, "data"));
     printf("[loader] === Game Dev Story native loader ===\n");
     const char *libs[3];
     int libc = 0;
