@@ -75,7 +75,17 @@ for attempt in 1 2 3; do
 done
 
 if [ "$alive" != "1" ]; then
+  # Give an immediate reason: ping to see if it's a route issue vs. port issue
+  PINGREASON=""
+  if command -v ping >/dev/null 2>&1; then
+    if ping -c 1 -W 2 "$HC_HOST" >/dev/null 2>&1; then
+      PINGREASON="device ANSWERS ping (so it's reachable, but SSH/port 22 isn't open or is filtered)"
+    else
+      PINGREASON="device does NOT answer ping (no route / different subnet / device off)"
+    fi
+  fi
   fail "Cannot reach $HC_HOST:22 (SSH)."
+  [ -n "$PINGREASON" ] && echo "  ${C_DIM}Diagnostic: $PINGREASON${C_RST}"
   echo
   echo "  ${C_YEL}This usually means the R36S is asleep / off / Wi-Fi dropped,${C_RST}"
   echo "  ${C_YEL}or it needs a restart because the Wi-Fi went flaky.${C_RST}"
@@ -84,9 +94,16 @@ if [ "$alive" != "1" ]; then
   echo "    • If the Wi-Fi dropped, restart the R36S and re-run this script"
   echo "    • Make sure SSH is enabled in ArkOS settings"
   echo
-  echo "  To test connectivity directly from your PC:"
-  echo "    ping $HC_HOST      # basic reachability"
-  echo "    ssh ${HOST} 'echo hi'   # tests SSH login"
+  echo "  Diagnostics (run these from your PC to pinpoint it):"
+  if command -v ping >/dev/null 2>&1; then
+    echo "    ping -c 3 $HC_HOST      # can we reach it at all?"
+  fi
+  echo "    nc -vz $HC_HOST 22   # is SSH (port 22) open? (or: nc -vz $HC_HOST 22)"
+  echo "    ssh ${HOST} 'echo hi'      # does SSH login itself work?"
+  echo
+  echo "  Common gotcha: if ping fails but the R36S is on, the two devices are"
+  echo "  probably on DIFFERENT networks/subnets. Check the R36S IP under"
+  echo "  ArkOS Settings -> Network, and make sure your Mac is on the same LAN."
   echo
   exit 1
 fi
