@@ -357,37 +357,43 @@ static void kv_il_run_entry(void) {
  * uninitialized globals. */
 static void kv_unity_boot(void) {
     void *env = kv_jni_env();
-    long thiz = 0xA1;
+    /* Give Unity real, zeroed thiz/ctx/surf objects instead of tiny fake
+     * addresses.  nativeRecreateGfxState does things like
+     *   x0 = [thiz+0x148]; strb 1,[x0]
+     * so thiz must be a writable buffer and [thiz+0x148] must be a valid
+     * pointer (here: 0).  A zeroed 0x200-byte buffer keeps those reads safe. */
+    static unsigned char thiz[0x200];
+    static unsigned char ctx[0x200], surf[0x200];
+    void *thizp = thiz;
     unsigned char (*render)(void *, void *) = (unsigned char (*)(void *, void *))kv_jni_find_native("nativeRender");
     if (!render) { printf("[unity] no nativeRender registered - cannot drive player loop\n"); return; }
     void *fn;
     if ((fn = kv_jni_find_native("initJni"))) {
         printf("[unity] initJni...\n");
-        ((void (*)(void *, void *, void *))fn)(env, &thiz, &thiz);
+        ((void (*)(void *, void *, void *))fn)(env, thizp, ctx);
         printf("[unity] initJni OK\n");
     }
     /* Surface lifecycle: nativeRecreateGfxState installs the GL surface that
      * nativeRender draws into; without it Unity hits a null surface.  Called
      * twice (surfaceCreated + surfaceChanged), then surface-changed event. */
-    void *surf = (void *)0x5F, *ctx = (void *)0xC0;
     if ((fn = kv_jni_find_native("nativeRecreateGfxState"))) {
         printf("[unity] nativeRecreateGfxState...\n");
-        ((void (*)(void *, void *, int, void *))fn)(env, &thiz, 0, &surf);
-        ((void (*)(void *, void *, int, void *))fn)(env, &thiz, 0, &surf);
+        ((void (*)(void *, void *, int, void *))fn)(env, thizp, 0, surf);
+        ((void (*)(void *, void *, int, void *))fn)(env, thizp, 0, surf);
         printf("[unity] nativeRecreateGfxState OK\n");
     }
     if ((fn = kv_jni_find_native("nativeSendSurfaceChangedEvent"))) {
-        ((void (*)(void *, void *))fn)(env, &thiz);
+        ((void (*)(void *, void *))fn)(env, thizp);
     }
     if ((fn = kv_jni_find_native("nativeResume"))) {
-        ((void (*)(void *, void *))fn)(env, &thiz);
+        ((void (*)(void *, void *))fn)(env, thizp);
     }
     if ((fn = kv_jni_find_native("nativeFocusChanged"))) {
-        ((void (*)(void *, void *, int))fn)(env, &thiz, 1);
+        ((void (*)(void *, void *, int))fn)(env, thizp, 1);
     }
     printf("[unity] nativeRender loop...\n");
     for (int f = 0; f < 1000000; f++) {
-        unsigned char keep = render(env, &thiz);
+        unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
     }
     printf("[unity] player loop ended\n");
