@@ -38,6 +38,7 @@ typedef struct Module {
     Elf64_Dyn     *dynamic;
     Elf64_Sym     *symtab;
     const char    *strtab;
+    size_t         strsz;
     Elf64_Rela    *rela;
     size_t         rela_count;
     Elf64_Rela    *jmprel;
@@ -95,19 +96,21 @@ static Module *module_new(const char *name) {
 /* Look up a DEFINED dynamic symbol (e.g. an export) in module `m` and return
  * its runtime address, or 0.  Used to find entry points like JNI_OnLoad. */
 static void *module_export(Module *m, const char *wanted) {
-    if (!m->symtab || !m->strtab) return 0;
-    for (size_t i = 0; i < 200000; i++) {
+    if (!m->symtab || !m->strtab || !m->strsz) return 0;
+    uintptr_t s0 = (uintptr_t)m->strtab;
+    uintptr_t s1 = s0 + m->strsz;
+    for (size_t i = 0; i < 1000000; i++) {
         Elf64_Sym *sym = &m->symtab[i];
         const char *nm = m->strtab + sym->st_name;
-        /* stop when we run off into garbage; dynamic symtab ends where st_name
-         * is huge - guard with a cheap check */
-        if (sym->st_name > 0xffffffffULL || (uintptr_t)nm < (uintptr_t)m->strtab) break;
+        /* the dynamic symtab ends at a null (st_name=0, st_shndx=0, st_value=0)
+         * entry - stop there; also stop if the name points outside the strtab */
+        if (sym->st_name == 0 && sym->st_shndx == 0 && sym->st_value == 0 &&
+            sym->st_size == 0 && i > 4) break;
+        if ((uintptr_t)nm < s0 || (uintptr_t)nm >= s1) break;
         if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0 &&
             strcmp(nm, wanted) == 0) {
             return (void *)(m->bias + sym->st_value);
         }
-        if (sym->st_name == 0 && sym->st_shndx == 0 && sym->st_value == 0 &&
-            sym->st_size == 0 && i > 8) break; /* hit the null entry */
     }
     return 0;
 }
@@ -184,6 +187,7 @@ static Module *load_object(const char *path) {
         switch (d->d_tag) {
         case DT_SYMTAB: m->symtab = (Elf64_Sym *)(m->bias + d->d_un.d_ptr); break;
         case DT_STRTAB: m->strtab = (const char *)(m->bias + d->d_un.d_ptr); break;
+        case DT_STRSZ:  m->strsz = d->d_un.d_val; break;
         case DT_RELA:   m->rela    = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
         case DT_RELASZ: m->rela_count = d->d_un.d_val / sizeof(Elf64_Rela); break;
         case DT_JMPREL: m->jmprel  = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
