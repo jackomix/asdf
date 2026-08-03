@@ -4,3 +4,4 @@ __pycache__/
 apks/*.apk
 out/
 *.apk
+*.so

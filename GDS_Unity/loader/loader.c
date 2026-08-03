@@ -34,6 +34,8 @@ typedef struct Module {
     const char    *strtab;
     Elf64_Rela    *rela;
     size_t         rela_count;
+    Elf64_Rela    *jmprel;
+    size_t         jmprel_count;
     uint8_t       *init_array;
     size_t         init_array_sz;
     void (*init)(void);
@@ -78,6 +80,18 @@ static Module *module_new(const char *name) {
 
 static void *resolve(const char *sym) {
     return dlsym(0, sym);
+}
+
+/* Resolve relocation symbol `symidx` in module `m`.  Prefer the module's own
+ * dynamic symbol table (a GLOB_DAT/JUMP_SLOT may reference a symbol that is
+ * DEFINED in this same .so - e.g. kairo_marker), else fall back to the host
+ * symbol table (libc/libm/bionic shims) for genuinely imported symbols. */
+static void *resolve_sym(Module *m, uint64_t symidx, const char *name) {
+    Elf64_Sym *sym = &m->symtab[symidx];
+    if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0) {
+        return (void *)(m->bias + sym->st_value);
+    }
+    return resolve(name);
 }
 
 static Module *load_object(const char *path) {
@@ -127,29 +141,37 @@ static Module *load_object(const char *path) {
         case DT_STRTAB: m->strtab = (const char *)(m->bias + d->d_un.d_ptr); break;
         case DT_RELA:   m->rela    = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
         case DT_RELASZ: m->rela_count = d->d_un.d_val / sizeof(Elf64_Rela); break;
+        case DT_JMPREL: m->jmprel  = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+        case DT_PLTRELSZ: m->jmprel_count = d->d_un.d_val / sizeof(Elf64_Rela); break;
         case DT_INIT:   m->init = (void (*)(void))(m->bias + d->d_un.d_ptr); break;
         case DT_INIT_ARRAY: m->init_array = (uint8_t *)(m->bias + d->d_un.d_ptr); break;
         case DT_INIT_ARRAYSZ: m->init_array_sz = d->d_un.d_val; break;
         }
     }
 
-    /* Relocations. RELATIVE first, then symbol-bearing types. */
+    /* Relocations.  Apply .rela.dyn (DT_RELA) then .rela.plt (DT_JMPREL). */
     int unresolved = 0;
-    for (size_t i = 0; i < m->rela_count; i++) {
-        Elf64_Rela *r = &m->rela[i];
-        uint32_t type = r->r_info & 0xffffffffULL;
-        uint64_t symidx = r->r_info >> 32;
-        uint64_t *slot = (uint64_t *)(m->bias + r->r_offset);
-        if (type == R_AARCH64_RELATIVE) {
-            *slot = m->bias + r->r_addend;
-        } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT ||
-                   type == R_AARCH64_ABS64 || type == R_AARCH64_ABS32) {
-            const char *name = m->strtab + m->symtab[symidx].st_name;
-            void *p = resolve(name);
-            if (!p) { if (unresolved++ < 12) printf( "[loader]   unresolved %s\n", name); *slot = 0; }
-            else *slot = (uint64_t)p;
-        } else if (type == R_AARCH64_COPY) {
-            /* handled by host linker; skip */
+    const Elf64_Rela *rela_sets[2] = { m->rela, m->jmprel };
+    const size_t rela_lens[2] = { m->rela_count, m->jmprel_count };
+    for (int set = 0; set < 2; set++) {
+        for (size_t i = 0; i < rela_lens[set]; i++) {
+            Elf64_Rela *r = (Elf64_Rela *)rela_sets[set] + i;
+            uint32_t type = r->r_info & 0xffffffffULL;
+            uint64_t symidx = r->r_info >> 32;
+            uint64_t *slot = (uint64_t *)(m->bias + r->r_offset);
+            if (type == R_AARCH64_RELATIVE) {
+                *slot = m->bias + r->r_addend;
+            } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT ||
+                       type == R_AARCH64_ABS64 || type == R_AARCH64_ABS32) {
+                const char *name = m->strtab + m->symtab[symidx].st_name;
+                void *p = resolve_sym(m, symidx, name);
+                if (!p) { if (unresolved++ < 12) printf( "[loader]   unresolved %s\n", name); *slot = 0; }
+                else *slot = (uint64_t)p;
+            } else if (type == R_AARCH64_COPY) {
+                /* handled by host linker; skip */
+            }
+            /* other types (IRELATIVE, TLS_*) are skipped - not needed to boot
+             * init_array in stage 1. */
         }
     }
     if (unresolved) printf( "[loader] %d unresolved symbols in %s\n", unresolved, m->name);
@@ -160,26 +182,40 @@ static Module *load_object(const char *path) {
     if (m->init_array) {
         size_t n = m->init_array_sz / sizeof(uint64_t);
         for (size_t i = 0; i < n; i++) {
-            uint64_t off = ((uint64_t *)m->init_array)[i];
-            if (off) ((void (*)(void))(m->bias + off))();
+            uint64_t fn = ((uint64_t *)m->init_array)[i];
+            /* Each entry was RELATIVE-relocated to an absolute address above;
+             * call it directly (adding m->bias again would double-shift). */
+            if (fn) ((void (*)(void))fn)();
         }
         printf("[loader] %s init_array ran (%zu ctors)\n", m->name, n);
     }
     return m;
 }
 
-/* We can reach into the loaded il2cpp runtime. il2cpp_runtime_invoke needs a
- * MethodInfo*; we don't have one yet, so just confirm the symbol resolves and
- * is callable via a harmless probe (il2cpp runtime version string etc. is done
- * in stage 2). For stage 1, report success. */
-int real_main(int argc, char **argv) __attribute__((noreturn));
+/* aarch64 Linux passes argc/argv in x0/x1 at the entry point (this is true both
+ * under the real kernel and under run_aarch64.py, which now sets them).  So the
+ * same binary takes the .so path from the command line, e.g.
+ *   python3 tools/run_aarch64.py loader/loader2 /abs/path/libil2cpp.so
+ */
+static void sys_exit0(void) {
+    register long x8 __asm__("x8") = 93;   /* exit */
+    register long x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    for (;;) {}
+}
+
+int real_main(int argc, char **argv);
 
 void _start(void) {
-    for (;;) {
-        int argc = 1;
-        char *argv[2] = { (char *)"loader", 0 };
-        real_main(argc, argv);
-    }
+    /* Read the aarch64 Linux entry registers before anything can clobber x0/x1.
+     * (register-asm locals get spilled to the stack at -O0, so we read x0/x1
+     * directly via `mov` and pass the values as plain C locals.) */
+    long argc;
+    char **argv;
+    __asm__ volatile("mov %0, x0" : "=r"(argc));
+    __asm__ volatile("mov %0, x1" : "=r"(argv));
+    real_main((int)argc, argv);
+    sys_exit0();   /* stage-1 success path: return cleanly with exit code 0 */
 }
 
 int real_main(int argc, char **argv) {

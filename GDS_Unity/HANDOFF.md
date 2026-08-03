@@ -33,23 +33,46 @@ emulator (the slow, hard half) and does not reuse the native win.
 - Proven end-to-end: `loader/tiny` (freestanding aarch64 calling write/exit and
   an init_array ctor) compiles, loads under the bench, prints its message, exits
   0.
+- **The loader's `.so`-loading path is now verified end-to-end** — with a small
+  synthetic shared object, since the 33 MB game asset is absent:
+  `python3 -m ziglang cc -target aarch64-linux-gnu -shared -fPIC -ffreestanding
+  -nostdlib -fno-sanitize=undefined loader/so_probe.c -o /tmp/so_probe.so`, then
+  `python3 tools/run_aarch64.py loader/loader2 /tmp/so_probe.so`.  The loader
+  now maps PT_LOAD, applies RELATIVE, resolves **GLOB_DAT symbols defined in the
+  module itself** (`kairo_marker` -> `bias+st_value`, not host dlsym), resolves
+  JUMP_SLOT imports through `.rela.plt` (`DT_JMPREL`) against the host symbol
+  table (`strlen` -> `kv_strlen`), and runs DT_INIT_ARRAY.  Verified output:
+  `[so_probe] ctor ran; strlen("probe")=5 marker=1234abcd marker_addr=200030808`,
+  exit 0.
 - The loader's ELF machinery is written (`loader/loader.c`): maps PT_LOAD
   segments, applies RELATIVE + GLOB_DAT/JUMP_SLOT/ABS relocs, runs DT_INIT_ARRAY,
-  resolves the `.so`'s libc/libm/bionic imports via a host symbol table. It
+  resolves the `.so`'s libc/libm/bionic imports via a host symbol table.  It
   carries its own minimal libc (`freestdlib.c`) and a `host_syms.c` symbol
   provider, so it needs no host libc at load time.
+- The loader now takes the `.so` path from the command line (`_start` reads
+  argc/argv from x0/x1 per the aarch64 Linux entry ABI) and exits 0 on
+  stage-1 success instead of re-looping.
 - The Unicorn-based Unity emulator (`kairovm/`) got GDS past its loading screen
   (virtual-clock thread wake + UI-queue pumping). Useful as a reference and as a
   JNI-call inventory, but slow and not the device path.
 
 ## What is BROKEN / NOT YET DONE
 
-- The loader cannot yet load `libil2cpp.so` in the bench — NOT due to loader
-  bugs, but because **the 33 MB `.so` asset is gitignored and not present in this
-  sandbox instance** (`out/apk/lib/arm64-v8a/libil2cpp.so` is missing). When
-  present, run:
+- The loader cannot yet load the REAL `libil2cpp.so` in the bench — because
+  **the 33 MB `.so` asset is gitignored and not present in this sandbox
+  instance** (`out/apk/lib/arm64-v8a/libil2cpp.so` is missing).  When present,
+  run:
   `python3 tools/run_aarch64.py loader/loader2 /abs/path/libil2cpp.so`
-  The loader itself compiles and runs up to the `open()` of the `.so`.
+  The loader's `.so` machinery itself is verified via `loader/so_probe.c`
+  (see DONE/WORKING); the only unverified step is the real binary, which will
+  also surface TLS/IRELATIVE relocation types the loader currently skips.
+- **Asset mismatch to be aware of:** the only APK in this sandbox is
+  `Epic_Astro_Story-NTU1NTM3.apk`, and it is the OLD Java/Dalvik engine — it
+  contains `classes.dex` + `assets/*.dat` + ogg, **no native `libil2cpp.so` /
+  `libunity.so`** (that APK belongs to `EAS_OldEngine/`, a JS/Dalvik emulator,
+  not the Unity loader).  A Unity/IL2CPP Kairosoft title (e.g. Game Dev Story)
+  is required to exercise the loader against a real `.so`.  That is a
+  user-supplied APK; it is not on disk here.
 - No GPU / JNI / SDL yet. `loader.c` only does the ELF load. Next milestones
   (stage 2+): load BOTH `libil2cpp.so` and `libunity.so`, resolve
   `libunity.so`'s imports against glibc, call Unity's `UnityPluginLoad` /
@@ -88,6 +111,34 @@ emulator (the slow, hard half) and does not reuse the native win.
 8. `run_aarch64.py` resolves relative `.so` paths against the repo root, but if
    the asset is absent it can't run. Use an absolute path to the real `.so`.
 
+9. **aarch64 Linux entry ABI is x0=argc, x1=argv** — `_start` must `mov` them
+   out into plain C locals BEFORE anything else.  Do NOT use
+   `register long x asm("x0")`: at -O0 the compiler spills such locals to the
+   stack and reads garbage (that was the "loader always loads the default path"
+   bug).  Use `__asm__ volatile("mov %0, x0" : "=r"(v))`.
+
+10. **The bench must load a `-fno-pie` ET_EXEC at its OWN link base (minv)**,
+    not relocate it to a made-up base.  PC-relative refs survive an offset, but
+    the binary stores *absolute* link-time pointers in its data (e.g. the
+    `host_syms.c` `tab[]` string table); an offset base makes those point at
+    unmapped memory (`UC_ERR_READ_UNMAPPED` on a 1-byte read).  Fixed by mapping
+    at `minv` in `run_aarch64.py`.
+
+11. **ELF dynamic tags:** `DT_INIT_ARRAY=25`, `DT_FINI_ARRAY=26`,
+    `DT_INIT_ARRAYSZ=27`, `DT_FINI_ARRAYSZ=28`.  It is very easy to swap
+    INIT_ARRAYSZ/FINI_ARRAY (26/27) — if you do, `init_array` never runs
+    ("init_array ran (0 ctors)").  Also parse `DT_JMPREL`/`DT_PLTRELSZ`
+    (`.rela.plt`, tags 23/2) or JUMP_SLOT imports stay unresolved.
+
+12. **GLOB_DAT/JUMP_SLOT relocs may reference symbols defined in the same .so**
+    (e.g. `kairo_marker`).  Resolve against the module's own dynamic symtab
+    first (`bias + st_value` when `st_shndx != SHN_UNDEF`), only then fall back
+    to the host table.  Otherwise you get spurious "unresolved" warnings and a
+    zeroed GOT slot.
+
+13. `freestdlib.c` printf has no float/`%s`-with-width, and (until fixed) printed
+    `%zu`/`%#zx` literally as `zu`/`#zx`.  It now strips `z/l/h/#/+` modifiers.
+
 ## PROJECT LAYOUT
 
 ```
@@ -97,6 +148,8 @@ GDS_Unity/
     loader.c             maps .so, relocs, runs init_array, resolves imports
     freestdlib.c         minimal libc the loader carries (mmap/read/write/printf/mem*)
     host_syms.c          dlsym-style symbol table the .so's imports resolve to
+    so_probe.c           synthetic .so that exercises the loader's .so path
+                         (RELATIVE, self GLOB_DAT, JUMP_SLOT, DT_INIT_ARRAY)
     tiny.c / mini.c / rawtest.c   freestanding aarch64 test programs
     hello.c              (early) hello-world for toolchain smoke test
   tools/
@@ -111,11 +164,20 @@ GDS_Unity/
 
 ## NEXT STEPS (in order)
 
-1. Restore the asset: run `tools/extract_apk.sh <GameDevStory.apk>` so
+0. The loader's `.so` machinery is now verified with a synthetic `.so`
+   (`loader/so_probe.c`, see DONE/WORKING).  To repeat:
+   `python3 -m ziglang cc -target aarch64-linux-gnu -shared -fPIC -ffreestanding
+   -nostdlib -fno-sanitize=undefined loader/so_probe.c -o /tmp/so_probe.so`
+   `python3 tools/run_aarch64.py loader/loader2 /tmp/so_probe.so`
+   Expect the `[so_probe] ctor ran ...` line and `[guest exit 0]`.
+1. Restore the real asset: run `tools/extract_apk.sh <Unity-Kairosoft.apk>` (a
+   Unity/IL2CPP title such as Game Dev Story — NOT the old-engine Epic Astro
+   Story APK present here, which has no native libs) so
    `out/apk/lib/arm64-v8a/libil2cpp.so` exists. Then:
    `python3 tools/run_aarch64.py loader/loader2 $(pwd)/out/apk/lib/arm64-v8a/libil2cpp.so`
    Expect: it loads, runs init_array, prints `[loader] ... init_array ran`,
-   exits 0. (NOT yet seen — asset was missing.)
+   exits 0. First run will likely surface TLS/IRELATIVE reloc types the loader
+   currently skips — add them to the reloc loop.
 2. Load `libunity.so` too and resolve its imports; call its entry. This is the
    bulk of the remaining work and will surface the bionic/glibc ABI gaps.
 3. Add the shim surface modeled on terraria-nextos:

@@ -62,6 +62,8 @@ typedef struct {
 /* Dynamic section entries. */
 #define DT_NULL     0
 #define DT_NEEDED   1
+#define DT_PLTRELSZ 2
+#define DT_PLTGOT   3
 #define DT_HASH     4
 #define DT_STRTAB   5
 #define DT_SYMTAB   6
@@ -72,9 +74,11 @@ typedef struct {
 #define DT_SYMENT   11
 #define DT_INIT     12
 #define DT_FINI     13
+#define DT_PLTREL   20
+#define DT_JMPREL   23
 #define DT_INIT_ARRAY 25
-#define DT_INIT_ARRAYSZ 26
-#define DT_FINI_ARRAY  27
+#define DT_FINI_ARRAY  26
+#define DT_INIT_ARRAYSZ 27
 #define DT_FINI_ARRAYSZ 28
 #define DT_RELACOUNT 0x6ffffff9
 #define DT_FLAGS     30
@@ -82,6 +86,9 @@ typedef struct {
 #define DT_VERSYM   0x6ffffff0
 #define DT_VERNEED  0x6ffffffe
 #define DT_VERNEEDNUM 0x6fffffff
+
+/* symbol table special index: symbol is undefined (imported) */
+#define SHN_UNDEF   0
 
 typedef struct {
     Elf64_Sxword d_tag;

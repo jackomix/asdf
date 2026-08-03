@@ -58,14 +58,19 @@ def load(path, argv):
     minv &= ~(PAGE - 1)
     maxv = align_up(maxv, PAGE)
     span = maxv - minv
-    # Map the whole image contiguous at CODE_BASE with RWX.
-    uc.mem_map(CODE_BASE, span + 2 * PAGE, 7)
+    # Load a -fno-pie ET_EXEC at its OWN link base (minv), not at a made-up
+    # CODE_BASE.  The loader is built -fno-pie, so its data section stores
+    # *absolute* link-time addresses (e.g. the host_syms tab[] string pointers);
+    # those only work if the image is mapped at its natural base.  PC-relative
+    # refs would survive an offset, but absolute stored pointers would not.
+    BASE = minv
+    uc.mem_map(BASE, span + 2 * PAGE, 7)
     for (p_offset, p_vaddr, p_filesz, p_memsz, p_flags) in segs:
-        dst = CODE_BASE + (p_vaddr - minv)
+        dst = BASE + (p_vaddr - minv)  # == p_vaddr since BASE == minv
         if p_filesz:
             uc.mem_write(dst, data[p_offset:p_offset + p_filesz])
         # bss already zero (fresh mapping)
-    entry = CODE_BASE + (e_entry - minv)
+    entry = BASE + (e_entry - minv)    # == e_entry
 
     # Stack
     uc.mem_map(STACK_TOP - STACK_SZ, STACK_SZ + PAGE, 3)
@@ -94,14 +99,19 @@ def load(path, argv):
     ap += 8
     uc.mem_write(ap, struct.pack('<Q', 0))  # envp NULL
     uc.reg_write(UC_ARM64_REG_SP, sp)
+    # aarch64 Linux entry ABI: x0=argc, x1=argv (pointer to the argv array,
+    # which begins right after the argc word we just wrote at `sp`).
+    argv_ptr = sp + 8
+    uc.reg_write(UC_ARM64_REG_X0, len(argv))
+    uc.reg_write(UC_ARM64_REG_X1, argv_ptr)
 
-    return uc, entry, minv, maxv, CODE_BASE, span
+    return uc, entry, minv, maxv, BASE, span, len(argv), argv_ptr
 
 
 def main():
     exe = sys.argv[1] if len(sys.argv) > 1 else 'loader/loader_aarch64'
     argv = sys.argv[1:]
-    uc, entry, minv, maxv, CODE_BASE, span = load(exe, argv)
+    uc, entry, minv, maxv, BASE, span, _argc, _argv_ptr = load(exe, argv)
 
     out = []
 
@@ -280,7 +290,7 @@ def main():
 
     uc.hook_add(unicorn.UC_HOOK_MEM_INVALID, _memerr)
     print('[bench] entry=%#x minv=%#x maxv=%#x mapped %#x..%#x'
-          % (entry, minv, maxv, CODE_BASE, CODE_BASE + span + 2 * PAGE),
+          % (entry, minv, maxv, BASE, BASE + span + 2 * PAGE),
           file=sys.stderr)
 
     try:

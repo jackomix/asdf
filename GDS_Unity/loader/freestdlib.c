@@ -130,10 +130,17 @@ int printf(const char *fmt, ...) {
     for (const char *s = fmt; *s; s++) {
         if (*s != '%') { raw_syscall(SYS_write, 1, (long)s, 1, 0, 0, 0); continue; }
         s++;
+        /* flags + length modifiers (%#x, %zu, %ld, %lx ...): skip them */
+        int alt = 0;
+        while (*s == '#' || *s == '+' || *s == '-' || *s == '0' || *s == ' ' ||
+               *s == 'z' || *s == 'l' || *s == 'h' || *s == 'L') {
+            if (*s == '#') alt = 1;
+            s++;
+        }
         if (*s == 's') { char *t = va_arg(ap, char *); if (!t) t = "(null)"; while (*t) raw_syscall(SYS_write,1,(long)t++,1,0,0,0); }
-        else if (*s == 'd' || *s == 'l') { long v = va_arg(ap, long); putdec(v, v < 0); }
+        else if (*s == 'd' || *s == 'i') { long v = va_arg(ap, long); putdec(v, v < 0); }
         else if (*s == 'p') { void *p = va_arg(ap, void *); puthex((unsigned long)p, 1); }
-        else if (*s == 'x' || *s == 'X') { unsigned long v = va_arg(ap, unsigned long); puthex(v, 0); }
+        else if (*s == 'x' || *s == 'X' || *s == 'u') { unsigned long v = va_arg(ap, unsigned long); puthex(v, alt); }
         else if (*s == 'c') { int c = va_arg(ap, int); raw_syscall(SYS_write,1,(long)&c,1,0,0,0); }
         else if (*s == '%') { raw_syscall(SYS_write,1,(long)"%",1,0,0,0); }
         else { raw_syscall(SYS_write,1,(long)s,1,0,0,0); }
