@@ -126,6 +126,17 @@ void egl_shim_create_window(void) {
   if (g_did_init) return;
   g_did_init = 1;
   if (!sdl_load()) { printf("[egl] SDL2 unavailable: %s\n", S.GetError ? S.GetError() : "?"); return; }
+  /* SDL must be initialized before any window/context call, or SDL_CreateWindow
+   * can't set up the video driver / load the EGL/GL library ("Can't load EGL/GL
+   * library on window creation").  This is why the first on-device run had
+   * "SDL video driver = (null)" and no GL context. */
+  if (S.Init && !S.WasInit(SDL_INIT_VIDEO)) {
+    int r = S.Init(SDL_INIT_VIDEO);
+    printf("[egl] SDL_Init(VIDEO) = %s (%d)\n", r == 0 ? "ok" : "FAILED", r);
+    if (r != 0) printf("[egl] SDL_Init error: %s\n", S.GetError ? S.GetError() : "?");
+    /* audio is optional for the first render milestone */
+    if (S.WasInit) { int ar = S.Init(SDL_INIT_AUDIO); (void)ar; }
+  }
   if (S.GetCurrentVideoDriver)
     printf("[egl] SDL video driver = %s\n", S.GetCurrentVideoDriver());
 

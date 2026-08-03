@@ -39,6 +39,8 @@ void *__memmove_chk(void *d, const void *s, size_t n, size_t dlen) { (void)dlen;
 void *__memset_chk(void *d, int c, size_t n, size_t dlen) { (void)dlen; return memset(d, c, n); }
 size_t __strlen_chk(const char *s, size_t slen) { (void)slen; return strlen(s); }
 void __FD_SET_chk(int fd, void *set) { (void)fd; (void)set; }
+int __FD_ISSET_chk(int fd, void *set) { (void)fd; (void)set; return 0; }
+void __FD_CLR_chk(int fd, void *set) { (void)fd; (void)set; }
 
 /* bionic __errno: glibc provides errno, but the .so calls *__errno().  Return
  * a pointer to the real errno. */
@@ -109,6 +111,11 @@ void _ZTH15gDeferredAction(void) {}
  * so Unity resolves eglGetProcAddress/glGetString to the real driver. --- */
 #include <dlfcn.h>
 void kv_egl_dlopen(void) {
+    /* libz.so: libunity.so needs inflate/inflateInit2_/inflateEnd (its NEEDED
+     * list includes libz.so), and resolve() falls back to dlsym(RTLD_DEFAULT) -
+     * so libz must be loaded globally for those relocations to resolve. */
+    void *z = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!z) z = dlopen("libz.so", RTLD_NOW | RTLD_GLOBAL);
     void *g = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
     if (!g) dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
     void *e = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);

@@ -342,7 +342,34 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.8.0-glibc) - bionic bridge (pthread/signal ABI) + TLS guard pad
+## LATEST STATUS (build 0.9.0-glibc) - game boots player loop; GL context missing -> fix rendering
+
+0.8.0's bionic bridge + TLS guard pad WORKED on-device:
+- libil2cpp init_array ran (24 ctors) — no more "malloc(): invalid size"
+- libunity init_array ran (426 ctors)
+- all 3 JNI_OnLoads fired, initJni OK
+- **`nativeRecreateGfxState OK`** (the old crash site!), then `nativeRender loop...`
+- the game booted deep into Unity (hundreds of JNI FindClass/GetMethodID calls
+  building the scene).  So it runs logic now, but was NOT rendering:
+  `[egl] SDL video driver = (null)` + `Can't load EGL/GL library` on every
+  SDL_CreateWindow -> no GL context.
+
+Three fixes for rendering (0.9.0):
+1. **SDL_Init(SDL_INIT_VIDEO) before SDL_CreateWindow** in egl_shim.c.  The first
+   version resolved SDL_Init but never CALLED it, so SDL had no video driver and
+   couldn't load the EGL/GL library at window creation.
+2. **LD_LIBRARY_PATH in the launcher** (`Game Dev Story.sh`) — same firmware lib
+   dirs Terraria's launcher exports, so dlopen finds libSDL2/libEGL/libGLESv2/
+   libz on ArkOS.
+3. Resolved the 4 previously-unresolved libunity symbols: `inflate`/`inflateInit2_`/
+   `inflateEnd` (now that kv_egl_dlopen dlopens libz RTLD_GLOBAL) and
+   `__FD_ISSET_chk`/`__FD_CLR_chk` (added to glibc_shims.c).
+
+Next on-device test: expect `[egl] SDL video driver = kmsdrm` (or similar),
+`[egl] GL_VENDOR/RENDERER/VERSION` (Mali live), `window ... context ready (ES2)`,
+and then the game should actually present frames.
+
+### Prior: 0.8.0 - bionic bridge (pthread/signal ABI) + TLS guard pad
 
 After 0.7.0 reached graphics init, it died with `malloc(): invalid size
 (unsorted)` during libil2cpp's init_array.  Verified the relocation phase is

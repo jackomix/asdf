@@ -48,11 +48,21 @@ fi
 echo "--- all checks done, launching ---"
 } >> "$LOG" 2>&1
 
+# --- Make the firmware's graphics libs findable ---
+# Terraria's launcher does this: SDL2, libEGL/libGLESv2 (Mali) and libz live in
+# these dirs on ArkOS, and our loader dlopens them at runtime (kv_egl_dlopen +
+# SDL_Init).  Without LD_LIBRARY_PATH, SDL_Init(VIDEO)/SDL_CreateWindow can't
+# find them -> "Can't load EGL/GL library on window creation" -> no GL context.
+firmware_libs="/usr/local/lib/aarch64-linux-gnu:/usr/local/lib:/usr/lib/aarch64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib:/lib"
+export LD_LIBRARY_PATH="$firmware_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TER_GAMEDIR="$GAMEDIR"
+
 # --- Run the game.  loader2 self-logs to loader.log next to itself. ---
 cd "$GAMEDIR" || { echo "cannot cd $GAMEDIR" >> "$LOG"; exit 1; }
 
 {
 echo "=== launching ./loader2 from $(pwd) ==="
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 ./loader2
 echo "=== loader2 exited with code $? ==="
 } >> "$LOG" 2>&1
