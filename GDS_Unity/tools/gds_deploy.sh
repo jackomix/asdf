@@ -16,6 +16,8 @@
 #   GDS_BRANCH      git branch (default: arena/019fc860-asdf)
 #   GDS_ZIP_URL     full URL/path to a gamedevstory.zip
 #   GDS_SSH_TIMEOUT ssh/scp timeout in seconds (default: 25)
+#   GDS_XFER_TIMEOUT upload timeout in seconds (default: 300; 38 MB over slow
+#                     handheld Wi-Fi can take a while)
 #
 set -uo pipefail
 
@@ -23,6 +25,7 @@ HOST="${GDS_R36S_HOST:-${1:-ark@10.1.1.2}}"
 PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fc860-asdf}"
 TIMEOUT="${GDS_SSH_TIMEOUT:-25}"
+XFER_TIMEOUT="${GDS_XFER_TIMEOUT:-300}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 
@@ -142,17 +145,14 @@ ok "zip ready ($SIZE)"
 
 # ---- 3. upload ----
 step "Uploading to $HOST:$PORTS_DIR  (this is the big 38 MB transfer)"
-if command -v pv >/dev/null 2>&1; then
-  # pv shows a real progress bar
-  pv -f -N "scp" "$ZIP" | timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip" 2>/dev/null
-  echo
-else
-  # scp has its own progress bar; run it with a timeout and show a note
-  if ! timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip" 2>/dev/null; then
-    fail "Upload failed/timed out. The R36S may have gone offline."
-    echo "  ${C_YEL}Tip: restart the R36S and re-run.${C_RST}"
-    exit 1
-  fi
+echo "   (be patient - 38 MB over handheld Wi-Fi can take a minute or two;"
+echo "    scp shows a progress bar below. If it stalls past ${XFER_TIMEOUT}s,"
+echo "    the R36S Wi-Fi may have dropped and a device restart helps.)"
+# scp's own progress bar goes to stderr; keep stderr attached so you SEE it.
+if ! timeout "$XFER_TIMEOUT" scp -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip"; then
+  fail "Upload failed/timed out. The R36S may have gone offline."
+  echo "  ${C_YEL}Tip: restart the R36S and re-run.${C_RST}"
+  exit 1
 fi
 ok "uploaded"
 
