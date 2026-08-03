@@ -91,8 +91,24 @@ mkdir -p "$LOGDIR"
 
 echo
 echo "=== Logs saved to $LOGDIR/ ==="
+{
 for f in "$LOGDIR"/*.log; do
   [ -f "$f" ] && echo "----- $(basename "$f") -----" && cat "$f" && echo
 done
-rm -f "$ASKPASS"
-echo "Done. Send the loader.log output to the developer."
+} > /tmp/gds_logs_dump.txt
+cat /tmp/gds_logs_dump.txt
+# Copy the log text to the clipboard automatically (macOS pbcopy, Linux xclip)
+if command -v pbcopy >/dev/null 2>&1; then
+  cat /tmp/gds_logs_dump.txt | pbcopy
+  echo "   → Logs copied to clipboard. Just paste them to send them!"
+elif command -v xclip >/dev/null 2>&1; then
+  cat /tmp/gds_logs_dump.txt | xclip -selection clipboard
+  echo "   → Logs copied to clipboard. Just paste them to send them!"
+elif command -v wl-copy >/dev/null 2>&1; then
+  cat /tmp/gds_logs_dump.txt | wl-copy
+  echo "   → Logs copied to clipboard. Just paste them to send them!"
+else
+  echo "   (no clipboard tool found; copy the text above manually)"
+fi
+rm -f "$ASKPASS" /tmp/gds_logs_dump.txt
+echo "Done."
