@@ -334,21 +334,51 @@ void _start(void) {
     sys_exit0();   /* stage-1 success path: return cleanly with exit code 0 */
 }
 
+/* Resolve `path` against the directory of argv[0] (the loader executable), so
+ * the game can be dropped in a folder next to the loader without cwd magic.
+ * Returns the joined path in a static buffer. */
+static const char *kv_abspath(const char *argv0, const char *path) {
+    static char buf[3][512];   /* one per slot so the three calls don't clobber */
+    static int idx = 0;
+    char *dst = buf[idx++ % 3];
+    const char *slash = 0;
+    for (const char *p = argv0; *p; p++) if (*p == '/') slash = p;
+    unsigned i = 0;
+    if (slash) {
+        unsigned n = (unsigned)(slash - argv0) + 1;
+        if (n > 480) n = 480;
+        for (i = 0; i < n; i++) dst[i] = argv0[i];
+    }
+    const char *s = path;
+    while (*s && i < 510) dst[i++] = *s++;
+    dst[i] = 0;
+    return dst;
+}
+
 int real_main(int argc, char **argv) {
-    /* Load every .so given on the command line, in order.  Passing two lets the
-     * engine (libunity.so) and the game (libil2cpp.so) both load+init before
-     * Unity's entry is driven in stage 2:
-     *   python3 tools/run_aarch64.py loader/loader2 libil2cpp.so libunity.so
+    /* Device layout (drop next to the loader on the R36S SD card):
+     *   loader2
+     *   libil2cpp.so   libunity.so   libmain.so
+     *   data/          (the APK's assets/bin/Data, or the whole extracted APK)
+     * Defaults resolve relative to argv[0]; override with explicit args:
+     *   loader2 libil2cpp.so libunity.so libmain.so
      */
-    if (argc < 2) {
-        printf("[loader] usage: loader2 <libil2cpp.so> [libunity.so ...]\n");
-        return 0;
+    const char *argv0 = argc > 0 && argv[0] ? argv[0] : "loader2";
+    const char *libs[3];
+    int libc = 0;
+    if (argc >= 4) {
+        libs[0] = argv[1]; libs[1] = argv[2]; libs[2] = argv[3]; libc = 3;
+    } else {
+        libs[0] = kv_abspath(argv0, "libil2cpp.so");
+        libs[1] = kv_abspath(argv0, "libunity.so");
+        libs[2] = kv_abspath(argv0, "libmain.so");
+        libc = 3;
     }
     int n = 0;
     Module *last = 0;
-    for (int i = 1; i < argc; i++) {
-        printf("[loader] loading %s\n", argv[i]);
-        Module *m = load_object(argv[i]);
+    for (int i = 0; i < libc; i++) {
+        printf("[loader] loading %s\n", libs[i]);
+        Module *m = load_object(libs[i]);
         if (m) { n++; last = m; }
     }
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
@@ -370,7 +400,9 @@ int real_main(int argc, char **argv) {
      * code runs (simulation), not just init_array + JNI_OnLoad.  The data dir
      * is relative to the repo root so the bench resolves it; adjust for device. */
     if (loader_lookup_export("il2cpp_init")) {
-        kv_il_boot("out/apk/assets/bin/Data/Managed");
+        /* device: data/ dir next to the loader; bench: repo-root path. */
+        const char *data = kv_abspath(argv0, "data");
+        kv_il_boot(data);
         kv_il_run_entry();
     }
     return 0;

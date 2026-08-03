@@ -146,9 +146,14 @@ def main():
 
     def sys_openat(uc, dirfd, pathbuf, flags, mode):
         name = uc.mem_read(pathbuf, 4096).split(b'\0')[0].decode('utf-8', 'replace')
-        # resolve relative to the repo root so the loader can be run from loader/
+        # resolve relative to the repo root and to the loader's own directory
         import os
-        cand = [name, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', name)]
+        repo = os.path.dirname(os.path.abspath(__file__)) + '/..'
+        loader_dir = os.path.dirname(os.path.abspath(exe))
+        cand = [name,
+                os.path.join(repo, name),
+                os.path.join(loader_dir, name),
+                os.path.join(loader_dir, name[3:] if name.startswith('data/') else name)]
         for n in cand:
             try:
                 data = open(n, 'rb').read()
