@@ -21,6 +21,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Bump this on every release so gds_deploy.sh can verify the device has the
+ * latest loader (and so we can tell stale zips apart in logs). */
+#define GDS_BUILD_VERSION "0.3.0"
+
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
 void *kv_jni_java_vm(void);
@@ -476,6 +480,7 @@ int real_main(int argc, char **argv) {
     kv_log_open(kv_abspath(argv0, "loader.log"));
     kv_set_asset_dir(kv_abspath(argv0, "data"));
     printf("[loader] === Game Dev Story native loader ===\n");
+    printf("[loader] build: %s\n", GDS_BUILD_VERSION);
     const char *libs[3];
     int libc = 0;
     if (argc >= 4) {
