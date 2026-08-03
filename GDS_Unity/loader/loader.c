@@ -361,6 +361,19 @@ static void kv_unity_boot(void) {
         ((void (*)(void *, void *, void *))fn)(env, &thiz, &thiz);
         printf("[unity] initJni OK\n");
     }
+    /* Surface lifecycle: nativeRecreateGfxState installs the GL surface that
+     * nativeRender draws into; without it Unity hits a null surface.  Called
+     * twice (surfaceCreated + surfaceChanged), then surface-changed event. */
+    void *surf = (void *)0x5F, *ctx = (void *)0xC0;
+    if ((fn = kv_jni_find_native("nativeRecreateGfxState"))) {
+        printf("[unity] nativeRecreateGfxState...\n");
+        ((void (*)(void *, void *, int, void *))fn)(env, &thiz, 0, &surf);
+        ((void (*)(void *, void *, int, void *))fn)(env, &thiz, 0, &surf);
+        printf("[unity] nativeRecreateGfxState OK\n");
+    }
+    if ((fn = kv_jni_find_native("nativeSendSurfaceChangedEvent"))) {
+        ((void (*)(void *, void *))fn)(env, &thiz);
+    }
     if ((fn = kv_jni_find_native("nativeResume"))) {
         ((void (*)(void *, void *))fn)(env, &thiz);
     }

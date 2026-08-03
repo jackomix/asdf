@@ -561,11 +561,13 @@ static void kv_sighandler(int sig, void *info, void *ucontext) {
     unsigned char *p = (unsigned char *)info;
     for (int i = 0; i < 8; i++) addr |= ((unsigned long)p[16 + i]) << (8 * i);
     kv_sig_addr = addr;
-    /* aarch64 ucontext_t: uc_mcontext.pc is at offset 0x130 (glibc).  Read it
-     * to know exactly which instruction faulted. */
+    /* aarch64 glibc ucontext_t: uc_flags@0, uc_link@8, uc_stack@16(40),
+     * uc_sigmask@56(128), uc_mcontext@184=0xB8.  mcontext_t:
+     * fault_address(8) + regs[31](248) + sp(8) + pc(8) -> pc at
+     * 0xB8 + 8+248+8 = 0x1C0. */
     unsigned long pc = 0;
     unsigned char *u = (unsigned char *)ucontext;
-    if (u) for (int i = 0; i < 8; i++) pc |= ((unsigned long)u[0x130 + i]) << (8 * i);
+    if (u) for (int i = 0; i < 8; i++) pc |= ((unsigned long)u[0x1C0 + i]) << (8 * i);
     kv_sig_pc = pc;
     kv_outstr("[loader] CRASH sig=");
     kv_outdec(sig);
