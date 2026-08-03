@@ -279,6 +279,42 @@ python3 tools/run_aarch64.py loader/loader2 \
     $(pwd)/out/apk/lib/arm64-v8a/libunity.so
 ```
 
+## DEVICE TEST (R36S) - READ THIS FIRST if handing off to a live test
+
+The loader is a **standalone AArch64 ET_EXEC with no dynamic dependencies** -
+it runs natively on the R36S (no glibc/pkg install needed).  Build the device
+package with:
+
+```
+cd GDS_Unity
+bash loader/build.sh                    # builds loader/loader2
+rm -rf /tmp/gds_pkg && mkdir -p /tmp/gds_pkg
+cp loader/loader2 loader/dev_run.sh /tmp/gds_pkg/
+cp out/apk/lib/arm64-v8a/libil2cpp.so \
+   out/apk/lib/arm64-v8a/libunity.so \
+   out/apk/lib/arm64-v8a/libmain.so /tmp/gds_pkg/
+cp -r out/apk/assets/bin/Data /tmp/gds_pkg/data
+cd /tmp/gds_pkg && zip -r GameDevStory_R36S.zip .
+```
+
+Copy `GameDevStory_R36S.zip` (or the folder) to the R36S SD card, e.g.
+`/roms/ports/gamedevstory/`, unzip, and run:
+
+```
+cd /roms/ports/gamedevstory
+./dev_run.sh
+```
+
+`dev_run.sh` runs `./loader2` and tees everything to `loader.log`.  **Send back
+`loader.log`** - it shows: which libs loaded, init_array ctor counts, JNI_OnLoad
+result, il2cpp_init result, and any memory fault / abort.  The log is the
+comprehensive diagnostic needed to iterate.
+
+Known bench-only limitation (should NOT happen on the device): under Unicorn the
+IL2CPP GC's deep runtime-internal calls can fault on the artificial stack/heap
+model; on the real R36S with a real kernel/glibc/pthread/filesystem these run
+natively and correctly.
+
 ## COMMIT STATE
 
 - Session branch `arena/019fc860-asdf`.  (Note: the Unity/IL2CPP GDS APKs were
