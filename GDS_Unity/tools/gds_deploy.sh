@@ -45,20 +45,56 @@ spin() {
   printf "\r%*s\r" "$((${#msg}+8))" ""
 }
 
-# ---- 1. device health check (fast) ----
+# ---- 1. device health check (TCP port 22 reachability, no auth needed) ----
+# We deliberately do NOT use `ssh` for the health check: it requires
+# authentication and `-o BatchMode=yes` would block password logins and falsely
+# report "offline".  Instead we just check that the R36S answers on port 22,
+# which works whether you use a password or an SSH key.  Then the real
+# scp/ssh steps below use your normal login.
 step "Checking R36S connectivity: $HOST"
-if ! timeout "$TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" 'echo ok' >/dev/null 2>&1; then
-  fail "Cannot reach $HOST over SSH."
+
+# extract host/ip (strip any user@)
+HC_HOST="${HOST##*@}"
+
+# use /dev/tcp (bash builtin) if possible, else fall back to nc
+tcp_ok() {
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 5 "$HC_HOST" 22 >/dev/null 2>&1
+  else
+    timeout 6 bash -c "exec 3<>/dev/tcp/$HC_HOST/22" >/dev/null 2>&1
+  fi
+}
+
+alive=0
+for attempt in 1 2 3; do
+  if tcp_ok; then alive=1; break; fi
+  if [ "$attempt" -lt 3 ]; then
+    warn "port 22 not answering (attempt $attempt/3) - retrying..."
+    sleep 2
+  fi
+done
+
+if [ "$alive" != "1" ]; then
+  fail "Cannot reach $HC_HOST:22 (SSH)."
   echo
-  echo "  ${C_YEL}This usually means the R36S is asleep / off / Wi-Fi dropped.${C_RST}"
-  echo "  ${C_YEL}On the R36S:${C_RST}"
-  echo "    • Wake it up and make sure it's on the same network"
-  echo "    • If Wi-Fi is flaky, restart the R36S, then re-run this script"
-  echo "    • Confirm SSH is enabled in ArkOS settings"
+  echo "  ${C_YEL}This usually means the R36S is asleep / off / Wi-Fi dropped,${C_RST}"
+  echo "  ${C_YEL}or it needs a restart because the Wi-Fi went flaky.${C_RST}"
+  echo "  On the R36S:"
+  echo "    • Wake it up, confirm it's on the same network as this PC"
+  echo "    • If the Wi-Fi dropped, restart the R36S and re-run this script"
+  echo "    • Make sure SSH is enabled in ArkOS settings"
+  echo
+  echo "  To test connectivity directly from your PC:"
+  echo "    ping $HC_HOST      # basic reachability"
+  echo "    ssh ${HOST} 'echo hi'   # tests SSH login"
   echo
   exit 1
 fi
 ok "Device is online and reachable"
+
+# SSH options used by later steps: NOT BatchMode (so password login works),
+# but tolerant of ArkOS host-key changes.
+SSHOPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5)
 
 # ---- 2. get the port zip ----
 step "Fetching gamedevstory.zip"
@@ -91,11 +127,11 @@ ok "zip ready ($SIZE)"
 step "Uploading to $HOST:$PORTS_DIR  (this is the big 38 MB transfer)"
 if command -v pv >/dev/null 2>&1; then
   # pv shows a real progress bar
-  pv -f -N "scp" "$ZIP" | timeout "$TIMEOUT" scp -o BatchMode=yes "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip" 2>/dev/null
+  pv -f -N "scp" "$ZIP" | timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip" 2>/dev/null
   echo
 else
   # scp has its own progress bar; run it with a timeout and show a note
-  if ! timeout "$TIMEOUT" scp -o BatchMode=yes "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip" 2>/dev/null; then
+  if ! timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip" 2>/dev/null; then
     fail "Upload failed/timed out. The R36S may have gone offline."
     echo "  ${C_YEL}Tip: restart the R36S and re-run.${C_RST}"
     exit 1
@@ -105,7 +141,7 @@ ok "uploaded"
 
 # ---- 4. install + run ----
 step "Installing and running on the device"
-if ! timeout "$TIMEOUT" ssh -o BatchMode=yes "$HOST" "
+if ! timeout "$TIMEOUT" ssh "${SSHOPTS[@]}" "$HOST" "
   set -e
   rm -rf '$PORTS_DIR/gamedevstory'
   cd '$PORTS_DIR'
@@ -124,9 +160,9 @@ fi
 step "Pulling logs"
 mkdir -p "$LOGDIR"
 rm -f "$LOGDIR"/port_launch.log "$LOGDIR"/loader.log "$LOGDIR"/gamedevstory_loader.log
-timeout "$TIMEOUT" scp -o BatchMode=yes "$HOST:$PORTS_DIR/port_launch.log" "$LOGDIR/" 2>/dev/null || true
-timeout "$TIMEOUT" scp -o BatchMode=yes "$HOST:$PORTS_DIR/gamedevstory/loader.log" "$LOGDIR/" 2>/dev/null || true
-timeout "$TIMEOUT" scp -o BatchMode=yes "$HOST:/tmp/gamedevstory_loader.log" "$LOGDIR/" 2>/dev/null || true
+timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$HOST:$PORTS_DIR/port_launch.log" "$LOGDIR/" 2>/dev/null || true
+timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$HOST:$PORTS_DIR/gamedevstory/loader.log" "$LOGDIR/" 2>/dev/null || true
+timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$HOST:/tmp/gamedevstory_loader.log" "$LOGDIR/" 2>/dev/null || true
 
 echo
 echo "=== Logs saved to $LOGDIR/ ==="
