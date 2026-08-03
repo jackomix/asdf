@@ -4,3 +4,5 @@ __pycache__/
 *.so
 loader/data/
 GameDevStory_R36S.zip
+GameDevStory_PortMaster.zip
+ports/**/data/
