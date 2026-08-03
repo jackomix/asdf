@@ -274,34 +274,56 @@ static void *kv_il_sym(const char *name) {
     return p;
 }
 
-/* Set data/config/temp dirs then il2cpp_init.  data_dir is relative to the repo
- * root so the bench's openat (which resolves relative paths) finds the assets;
- * on the real device this is an absolute path under the APK. */
+/* Set data/config/temp dirs then il2cpp_init, mirroring kairovm/session.py.
+ * il2cpp_init returns 1 on success.  data_dir is relative so the bench's openat
+ * (which resolves relative paths) finds the assets; on the device it's the
+ * data/ dir next to the loader. */
 static int kv_il_boot(const char *data_dir) {
     void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+    void *(*set_cfg)(const char *) = kv_il_sym("il2cpp_set_config_dir");
+    void *(*set_temp)(const char *) = kv_il_sym("il2cpp_set_temp_dir");
+    void *(*set_cli)(int, void *, void *) = kv_il_sym("il2cpp_set_commandline_arguments");
     int (*init)(const char *) = kv_il_sym("il2cpp_init");
     if (!set_data || !init) return -1;
-    if (data_dir) { printf("[il2cpp] data_dir=%s\n", data_dir); set_data(data_dir); }
+    if (data_dir) {
+        printf("[il2cpp] data_dir=%s\n", data_dir);
+        set_data(data_dir);
+    }
+    if (set_cfg) set_cfg("etc");
+    if (set_temp) set_temp("/tmp");
+    if (set_cli) {
+        /* argv = {"GameDevStory"} in guest memory */
+        char **av = calloc(2, sizeof(char *));
+        av[0] = strdup("GameDevStory");
+        set_cli(1, av, 0);
+    }
     printf("[il2cpp] calling il2cpp_init ...\n");
     int rc = init("IL2CPP Root Domain");
     printf("[il2cpp] il2cpp_init -> %d\n", rc);
+    if (rc != 1) { printf("[il2cpp] WARNING: expected rc==1\n"); }
     return rc;
 }
 
-/* Find the game's managed entry point in the image and invoke it. */
+/* After init: disable the stop-the-world GC (green threads; collection stays
+ * off, as in kairovm), attach the current thread, then find and invoke the
+ * game's managed entry point. */
 static void kv_il_run_entry(void) {
+    void *(*gc_disable)(void) = kv_il_sym("il2cpp_gc_disable");
     void *(*domain_get)(void) = kv_il_sym("il2cpp_domain_get");
+    void *(*thread_attach)(void *) = kv_il_sym("il2cpp_thread_attach");
     void *(*asm_open)(void *, const char *) = kv_il_sym("il2cpp_domain_assembly_open");
     void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
     void *(*img_entry)(void *) = kv_il_sym("il2cpp_image_get_entry_point");
     void *(*runtime_invoke)(void *, void *, void *, void **) = kv_il_sym("il2cpp_runtime_invoke");
     void *(*method_name)(void *) = kv_il_sym("il2cpp_method_get_name");
-    if (!domain_get || !asm_open || !asm_img || !img_entry || !runtime_invoke) {
+    if (gc_disable) gc_disable();
+    void *dom = domain_get ? domain_get() : 0;
+    if (!dom) { printf("[il2cpp] no domain\n"); return; }
+    if (thread_attach) { void *t = thread_attach(dom); (void)t; }
+    if (!asm_open || !asm_img || !img_entry || !runtime_invoke) {
         printf("[il2cpp] entry-point symbols unavailable, skipping\n");
         return;
     }
-    void *dom = domain_get();
-    if (!dom) { printf("[il2cpp] no domain\n"); return; }
     /* Try the game's own assembly first, then the default "Assembly-CSharp". */
     const char *asms[] = { "Assembly-CSharp", "Assembly-CSharp-firstpass", 0 };
     void *img = 0;
@@ -406,7 +428,7 @@ int real_main(int argc, char **argv) {
      * is relative to the repo root so the bench resolves it; adjust for device. */
     if (loader_lookup_export("il2cpp_init")) {
         /* device: data/ dir next to the loader; bench: repo-root path. */
-        const char *data = kv_abspath(argv0, "data");
+        const char *data = kv_abspath(argv0, "data/Managed");
         kv_il_boot(data);
         kv_il_run_entry();
     }
