@@ -13,6 +13,11 @@
 #include <stdint.h>
 #include "kv_elf.h"
 #include "kv_libc.h"
+#ifdef KV_USE_GLIBC
+#include <dlfcn.h>
+#endif
+
+#ifndef KV_USE_GLIBC
 
 /* ---- math stubs (return values good enough to keep init_array alive) ---- */
 static double kv_nan(void) { union { double d; uint64_t u; } x; x.u = 0x7ff8000000000000ULL; return x.d; }
@@ -383,7 +388,17 @@ int __system_property_read(void *e, char *n, char *v) { (void)e;(void)n; if (v) 
 void __FD_ISSET_chk(int fd, void *set) { (void)fd;(void)set; }
 void _ZTH15gDeferredAction(void) {}
 
+#endif /* KV_USE_GLIBC */
+
 void *host_dlsym(const char *name) {
+#ifdef KV_USE_GLIBC
+    /* glibc build: the freestanding stub table is compiled out.  Delegate
+     * everything to the REAL system: glibc provides libc, and the GPU drivers
+     * (loaded by kv_egl_dlopen) provide egl/gl/NDK.  bionic-only symbols that
+     * glibc lacks are provided in glibc_shims.c. */
+    if (name) return dlsym(RTLD_DEFAULT, name);
+    return 0;
+#else
     /* exact-name table; keep in sync with what libil2cpp.so imports.  Each
      * pointer is the real freestanding implementation (freestdlib.c or this
      * file). */
@@ -673,4 +688,5 @@ void *host_dlsym(const char *name) {
     for (int i = 0; tab[i].n; i++)
         if (!strcmp(tab[i].n, name)) return tab[i].p;
     return 0;
+#endif /* KV_USE_GLIBC */
 }
