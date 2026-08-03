@@ -47,12 +47,29 @@ fi
 echo "✓ Device reachable + login works"
 
 # ---- 2. download the port zip ----
+# ---- show how fresh the remote build is (from GitHub API) ----
+echo "Checking latest build on branch '$BRANCH'..."
+GH_TS=$(curl -sL --max-time 15 "https://api.github.com/repos/jackomix/asdf/commits/$BRANCH" 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('commit',{}).get('committer',{}).get('date',''))" 2>/dev/null || true)
+GH_SHA=$(curl -sL --max-time 15 "https://api.github.com/repos/jackomix/asdf/commits/$BRANCH" 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('sha',''))" 2>/dev/null || true)
+if [ -n "$GH_TS" ]; then
+  # age in minutes (macOS date -j, Linux date -d)
+  NOW=$(date +%s)
+  if date -d "$GH_TS" +%s >/dev/null 2>&1; then TS=$(date -d "$GH_TS" +%s); else TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$GH_TS" +%s 2>/dev/null || echo 0); fi
+  AGE=$(( (NOW - TS) / 60 ))
+  echo "  latest commit: ${GH_SHA:0:8}  (${AGE} minutes ago)"
+else
+  echo "  (could not check commit time; continuing)"
+fi
+
 echo "Downloading gamedevstory.zip..."
 curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip"
 echo
 if [ ! -s "$ZIP" ] || ! unzip -t "$ZIP" >/dev/null 2>&1; then
   echo "!! Downloaded zip corrupt/missing. Try again."; exit 1
 fi
+# Show the loader version baked into this zip so we can spot a stale/cached zip
+GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+" | head -1 || true)
+echo "  zip loader2: build ${GZVER:-version unknown}"
 echo "✓ zip ready ($(du -h "$ZIP" | cut -f1))"
 
 # ---- 3. upload with retries ----
