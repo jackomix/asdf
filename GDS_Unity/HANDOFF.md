@@ -46,10 +46,12 @@ emulator (the slow, hard half) and does not reuse the native win.
   DT_INIT_ARRAY) without the big assets.
 - **`JNI_OnLoad` now runs to completion under a built-in JNI shim.**
   `loader/jni_shim.c` provides a full JNINativeInterface + JavaVMFunctionTable
-  (JNIEnv + JavaVM), and the loader calls `libunity.so`'s `JNI_OnLoad` after
-  both init_arrays.  It returns `JNI_VERSION_1_6` (0x10006) and the guest exits
-  0.  FindClass inventory it issues (the classes a real Android runtime must
-  supply):
+  (JNIEnv + JavaVM).  The loader can drive the whole Android native boot chain:
+  pass libil2cpp.so + libunity.so + libmain.so and it loads all three, runs all
+  their init_arrays, and calls `libmain.so`'s `JNI_OnLoad` (the real entry the
+  Android VM calls, which dlopen/dlsym's the other libs through our shim).  It
+  returns `JNI_VERSION_1_6` (0x10006) and the guest exits 0.  FindClass inventory
+  it issues (the classes a real Android runtime must supply):
   `com/unity3d/player/UnityPlayer`, `com/google/androidgamesdk/ChoreographerCallback`,
   `com/google/androidgamesdk/SwappyDisplayManager`, `com/unity3d/player/GoogleARCoreApi`,
   `com/unity3d/player/Camera2Wrapper`, `com/unity3d/player/HFPStatus`,
@@ -284,7 +286,13 @@ python3 tools/run_aarch64.py loader/loader2 \
   directory was NOT on `main`.  `git fetch origin '+refs/heads/*:refs/remotes/origin/*'`
   pulls it; `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`
   recovers the 53 MB APK.)
-- Latest commit on `arena/019fc860-asdf`: loader loads real libil2cpp.so, runs
-  init_array, exits 0 (see commit message).
+- Latest commits on `arena/019fc860-asdf`: loader loads all three real native
+  libs (libil2cpp.so + libunity.so + libmain.so), runs each init_array, drives
+  the Android `JNI_OnLoad` chain (libmain's JNI_OnLoad -> JNI_VERSION_1_6),
+  exits 0.  See commit messages for details.
 - `out/`, `*.so`, and APK binaries are gitignored by design; only source is
   committed.  The extracted libs live in `GDS_Unity/out/apk/` (not committed).
+  The Unity/IL2CPP GDS APKs are committed on `arena/019fbc18-asdf` under `APKs/`
+  (not on main) - recover with
+  `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
+  `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
