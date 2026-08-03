@@ -209,7 +209,10 @@ void *ALooper_prepare(int o) { (void)o; return (void *)1; }
 void ALooper_release(void) {}
 void ALooper_wake(void) {}
 void ANativeWindow_acquire(void *w) { (void)w; }
-void *ANativeWindow_fromSurface(void *s) { (void)s; return (void *)1; }
+/* Unity's nativeRecreateGfxState needs a REAL ANativeWindow (not (void*)1).
+ * fbdev: it's a struct {u16 w, u16 h}.  Return a valid one. */
+static struct { unsigned short w, h; } kv_fbdev_win = { 640, 480 };
+void *ANativeWindow_fromSurface(void *s) { (void)s; return &kv_fbdev_win; }
 int ANativeWindow_getHeight(void *w) { (void)w; return 480; }
 int ANativeWindow_getWidth(void *w) { (void)w; return 640; }
 void ANativeWindow_release(void *w) { (void)w; }
@@ -242,26 +245,41 @@ int inflate(kv_z_stream *s, int f) { (void)s;(void)f; return 1; } /* Z_STREAM_EN
 int inflateEnd(kv_z_stream *s) { (void)s; return 0; }
 
 /* ---- libunity.so: EGL ---- */
-void *eglGetDisplay(void *d) { (void)d; return (void *)1; }
+/* Return valid, distinct handles so Unity's nativeRecreateGfxState doesn't
+ * crash on null.  (Real GL would come from libEGL via dlopen on device; these
+ * are placeholders that let the boot proceed.) */
+void *eglGetDisplay(void *d) { (void)d; return (void *)0xE1000; }
 int eglInitialize(void *d, int *maj, int *min) { (void)d; if (maj) *maj=1; if (min) *min=4; return 1; }
 int eglTerminate(void *d) { (void)d; return 1; }
-int eglChooseConfig(void *d, const int *a, void *c, int n, int *num) { (void)d;(void)a;(void)c;(void)n; if (num) *num=0; return 1; }
+int eglChooseConfig(void *d, const int *a, void *c, int n, int *num) { (void)d;(void)a;(void)c;(void)n; if (num) *num=1; return 1; }
 int eglGetConfigAttrib(void *d, void *c, int a, int *v) { (void)d;(void)c;(void)a; if (v) *v=0; return 1; }
-void *eglCreateContext(void *d, void *c, void *s, const int *a) { (void)d;(void)c;(void)s;(void)a; return (void *)1; }
-void *eglCreateWindowSurface(void *d, void *c, void *w, const int *a) { (void)d;(void)c;(void)w;(void)a; return (void *)1; }
-void *eglCreatePbufferSurface(void *d, void *c, const int *a) { (void)d;(void)c;(void)a; return (void *)1; }
+void *eglCreateContext(void *d, void *c, void *s, const int *a) { (void)d;(void)c;(void)s;(void)a; return (void *)0xE2000; }
+void *eglCreateWindowSurface(void *d, void *c, void *w, const int *a) { (void)d;(void)c;(void)w;(void)a; return (void *)0xE3000; }
+void *eglCreatePbufferSurface(void *d, void *c, const int *a) { (void)d;(void)c;(void)a; return (void *)0xE3001; }
 int eglDestroyContext(void *d, void *c) { (void)d;(void)c; return 1; }
 int eglDestroySurface(void *d, void *s) { (void)d;(void)s; return 1; }
 int eglMakeCurrent(void *d, void *dr, void *rd, void *c) { (void)d;(void)dr;(void)rd;(void)c; return 1; }
-void *eglGetCurrentContext(void) { return (void *)1; }
-void *eglGetCurrentSurface(int r) { (void)r; return (void *)1; }
+void *eglGetCurrentContext(void) { return (void *)0xE2000; }
+void *eglGetCurrentSurface(int r) { (void)r; return (void *)0xE3000; }
 int eglSwapBuffers(void *d, void *s) { (void)d;(void)s; return 1; }
 int eglSwapInterval(void *d, int i) { (void)d;(void)i; return 1; }
 int eglGetError(void) { return 0x3000; } /* EGL_SUCCESS */
 int eglSurfaceAttrib(void *d, void *s, int a, int v) { (void)d;(void)s;(void)a;(void)v; return 1; }
 char *eglQueryString(void *d, int n) { (void)d;(void)n; return "1.4"; }
 int eglQuerySurface(void *d, void *s, int a, int *v) { (void)d;(void)s;(void)a; if (v) *v=0; return 1; }
-void *eglGetProcAddress(const char *n) { (void)n; return 0; }
+/* eglGetProcAddress must return a non-null function pointer so Unity can call
+ * the resolved GL function (glGetString etc.).  We return a generic stub. */
+static void kv_gl_stub(void) {}
+static const char *kv_glGetString(unsigned n) {
+    switch (n) { case 0x1F02: return "OpenGL ES 2.0"; /* GL_VERSION */
+                 case 0x1F01: return "Mali-G31";      /* GL_RENDERER */
+                 case 0x1F03: return "GLES";          /* GL_VENDOR */
+                 default: return ""; }
+}
+void *eglGetProcAddress(const char *n) {
+    if (n && strcmp(n, "glGetString") == 0) return (void *)kv_glGetString;
+    return (void *)kv_gl_stub;   /* non-null: Unity can call it safely */
+}
 
 /* ---- libunity.so: POSIX sockets / net ---- */
 int socket(int d, int t, int p) { (void)d;(void)t;(void)p; return -1; }
