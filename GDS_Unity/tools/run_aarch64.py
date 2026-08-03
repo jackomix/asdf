@@ -383,6 +383,17 @@ def main():
         print('[unicorn MEM %s @%#x sz %d pc=%#x]' % (
             {0: 'READ', 1: 'WRITE', 2: 'FETCH', 3: 'READ*', 4: 'WRITE*'}.get(access, access), addr, size,
             uc.reg_read(UC_ARM64_REG_PC)), file=sys.stderr)
+        # dump key regs to pinpoint null derefs
+        try:
+            from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, \
+                UC_ARM64_REG_X8, UC_ARM64_REG_X19, UC_ARM64_REG_X20, UC_ARM64_REG_X30, UC_ARM64_REG_SP
+            print('   x0=%#x x1=%#x x2=%#x x8=%#x x19=%#x x20=%#x x30=%#x sp=%#x' % (
+                uc.reg_read(UC_ARM64_REG_X0), uc.reg_read(UC_ARM64_REG_X1),
+                uc.reg_read(UC_ARM64_REG_X2), uc.reg_read(UC_ARM64_REG_X8),
+                uc.reg_read(UC_ARM64_REG_X19), uc.reg_read(UC_ARM64_REG_X20),
+                uc.reg_read(UC_ARM64_REG_X30), uc.reg_read(UC_ARM64_REG_SP)), file=sys.stderr)
+        except Exception:
+            pass
         return False
 
     uc.hook_add(unicorn.UC_HOOK_MEM_INVALID, _memerr)
