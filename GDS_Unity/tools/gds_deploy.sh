@@ -9,6 +9,8 @@
 #   GDS_SSH_PASS    device password (default: ark)
 #   GDS_PORTS_DIR   ports dir on device (default: /roms/ports)
 #   GDS_BRANCH      git branch (default: arena/019fc860-asdf)
+#   GDS_RUN_SECONDS how long to let the game boot before the deploy returns
+#                   (default: 12).  The deploy never blocks on a running game.
 set -uo pipefail
 
 HOST="${GDS_R36S_HOST:-${1:-ark@10.1.1.2}}"
@@ -21,6 +23,7 @@ GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.8.0-glibc}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 ZIP="$HERE/gamedevstory.zip"
+RUN_SECONDS="${GDS_RUN_SECONDS:-12}"
 
 # ---- password plumbing: make ssh/scp use $PASS automatically ----
 # Write a tiny askpass script that prints the password, and point ssh at it.
@@ -125,9 +128,14 @@ echo "Installing and running..."
   unzip -o gamedevstory.zip >/dev/null 2>&1
   rm -f gamedevstory.zip
   chmod +x '$PORTS_DIR/Game Dev Story.sh' '$PORTS_DIR/gamedevstory/loader2'
-  echo '=== running launcher ==='
-  bash '$PORTS_DIR/Game Dev Story.sh'
-  echo '=== launcher exited with code '\$?' ==='
+  echo '=== running launcher (background, '$RUN_SECONDS's) ==='
+  nohup bash '$PORTS_DIR/Game Dev Story.sh' >/dev/null 2>&1 &
+  for i in 1 2 3; do sleep $RUN_SECONDS; done
+  if kill -0 %1 2>/dev/null; then
+    echo 'launcher still running (game alive) after '$RUN_SECONDS's'
+  else
+    echo 'launcher already exited'
+  fi
 "
 
 # ---- 5. pull logs ----
