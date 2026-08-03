@@ -54,7 +54,17 @@ static int kv_logfd = -1;
 static void kv_outc(int c) { write(1, &c, 1); if (kv_logfd >= 0) write(kv_logfd, &c, 1); }
 static void kv_outstr(const char *s) { size_t n = strlen(s); write(1, s, n); if (kv_logfd >= 0) write(kv_logfd, s, n); }
 int kv_log_open(const char *path) {
-    if (path) kv_logfd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (path) {
+        /* O_TRUNC: fresh log every run.  Without it, loader.log kept the
+         * previous deployment's content forever (the stale-0.5.0 bug).  We
+         * also dup2 it onto stdout+stderr so every printf/crash line lands in
+         * the fresh loader.log, not just in the launcher's port_launch.log. */
+        kv_logfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (kv_logfd >= 0) {
+            dup2(kv_logfd, 1);   /* stdout -> loader.log */
+            dup2(kv_logfd, 2);   /* stderr -> loader.log */
+        }
+    }
     return 0;
 }
 static void kv_sighandler(int sig, void *info, void *ucontext) {

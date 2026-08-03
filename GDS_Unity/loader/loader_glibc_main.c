@@ -21,6 +21,15 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* kv_libc.h declares fopen/printf/etc. with freestanding signatures, so we
+ * can't include the real <stdio.h>.  It does declare setvbuf/fflush (void*
+ * FILE, which is ABI-compatible).  Declare just the stdout/stderr globals we
+ * need to keep the fresh loader.log unbuffered (so a hard crash doesn't drop
+ * the banner). */
+extern void *stdout;
+extern void *stderr;
+#define _IONBF 2
+
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
 #define GDS_BUILD_VERSION "0.7.0-glibc"
@@ -489,6 +498,11 @@ int real_main(int argc, char **argv) {
      * test always produces a diagnostic log even if the shell can't capture it.
      */
     kv_log_open(kv_abspath(argv0, "loader.log"));
+    /* stdout/stderr now point at the fresh loader.log (kv_log_open dup2'd
+     * them).  Keep stdout unbuffered so a hard crash doesn't lose the lines
+     * that led up to it. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     kv_set_asset_dir(kv_abspath(argv0, "data"));
     printf("[loader] === Game Dev Story native loader ===\n");
     printf("[loader] build: %s\n", GDS_BUILD_VERSION);
