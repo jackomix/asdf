@@ -14,6 +14,7 @@
  */
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include "kv_elf.h"
 #include "kv_libc.h"
 
@@ -86,14 +87,41 @@ static jclass kv_FindClass(JNIEnv env, const char *name) {
     return kv_find_or_add(name);
 }
 
-/* method IDs are returned as opaque pointers; we allocate them monotonically. */
+/* ---- jstring: store the real string so GetStringUTFChars returns it ---- */
+#define KV_MAX_JSTR 256
+static char kv_jstr_buf[KV_MAX_JSTR][256];
+static int kv_jstr_n = 0;
+static jstring kv_make_jstring(const char *s) {
+    int i = kv_jstr_n++ % KV_MAX_JSTR;
+    if (s) { unsigned n = strlen(s); if (n > 255) n = 255; memcpy(kv_jstr_buf[i], s, n); kv_jstr_buf[i][n] = 0; }
+    else kv_jstr_buf[i][0] = 0;
+    return (jstring)(uintptr_t)(0x4000 + (uintptr_t)i);
+}
+static const char *kv_resolve_jstring(jstring s) {
+    unsigned long v = (unsigned long)s;
+    if (v >= 0x4000 && v < 0x4000 + KV_MAX_JSTR) return kv_jstr_buf[v - 0x4000];
+    return "";
+}
+
+/* ---- method registry: store id -> name/sig so Call*Method can dispatch ---- */
+struct kv_method { jmethodID id; const char *name; const char *sig; };
+static struct kv_method kv_methods[1024];
+static int kv_nmethods = 0;
 static jmethodID kv_next_mid = (jmethodID)0x2000;
-static jmethodID kv_new_mid(void) {
-    jmethodID m = kv_next_mid; kv_next_mid = (jmethodID)((uintptr_t)kv_next_mid + 8); return m;
+static const char *kv_method_name(jmethodID m) {
+    for (int i = 0; i < kv_nmethods; i++)
+        if (kv_methods[i].id == m) return kv_methods[i].name;
+    return 0;
 }
 static jmethodID kv_GetMethodID(JNIEnv env, jclass c, const char *n, const char *sig) {
     (void)env; (void)c;
-    jmethodID m = kv_new_mid();
+    jmethodID m = kv_next_mid; kv_next_mid = (jmethodID)((uintptr_t)kv_next_mid + 8);
+    if (kv_nmethods < 1024) {
+        kv_methods[kv_nmethods].id = m;
+        kv_methods[kv_nmethods].name = strdup(n);
+        kv_methods[kv_nmethods].sig = sig;
+        kv_nmethods++;
+    }
     printf("[jni] GetMethodID(%s, %s) -> %p\n", n, sig, m);
     return m;
 }
@@ -109,15 +137,17 @@ static jfieldID kv_GetStaticFieldID(JNIEnv env, jclass c, const char *n, const c
 }
 
 static jstring kv_NewStringUTF(JNIEnv env, const char *utf) {
-    (void)env; (void)utf; return (jstring)(uintptr_t)0x4000;
+    (void)env; return kv_make_jstring(utf);
 }
 static const char *kv_GetStringUTFChars(JNIEnv env, jstring s, jboolean *copy) {
-    (void)env; (void)s; if (copy) *copy = 0; return "";
+    (void)env; if (copy) *copy = 0; return kv_resolve_jstring(s);
 }
 static void kv_ReleaseStringUTFChars(JNIEnv env, jstring s, const char *c) {
     (void)env; (void)s; (void)c;
 }
-static jint kv_GetStringUTFLength(JNIEnv env, jstring s) { (void)env; (void)s; return 0; }
+static jint kv_GetStringUTFLength(JNIEnv env, jstring s) {
+    (void)env; return (jint)strlen(kv_resolve_jstring(s));
+}
 
 static jobject kv_NewGlobalRef(JNIEnv env, jobject o) { (void)env; return o; }
 static jobject kv_NewLocalRef(JNIEnv env, jobject o) { (void)env; return o; }
@@ -179,8 +209,52 @@ static jint kv_GetArrayLength(JNIEnv env, jarray a) { (void)env;(void)a; return 
 static jobjectArray kv_NewObjectArray(JNIEnv env, jint n, jclass c, jobject i) { (void)env;(void)n;(void)c;(void)i; return (jobjectArray)(uintptr_t)0x7000; }
 static jint kv_GetJavaVM(JNIEnv env, JavaVM **vm) { (void)env; if (vm) *vm = kv_jni_java_vm(); return 0; }
 
-/* ---- generic Call/Get/New stubs (return 0/empty) ---- */
-static jobject kv_CallObj(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
+/* ---- CallObjectMethodV dispatch: return real values for the methods Unity
+ *      calls, modeled on terraria-nextos.  Without getAssets returning a valid
+ *      AssetManager (and open() returning a stream), Unity's asset load hits
+ *      a null deref -> crash at addr 0 right after initJni. ---- */
+static jobject kv_fake_obj = (jobject)(uintptr_t)0x6000;
+static jobject kv_assetmgr = (jobject)(uintptr_t)0x6100;   /* fake AssetManager */
+static jobject kv_asset_stream = (jobject)(uintptr_t)0x6200;/* fake InputStream */
+
+static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void *ap) {
+    (void)env;
+    const char *nm = kv_method_name(mid);
+    if (!nm) return kv_fake_obj;
+    if (strcmp(nm, "getAssets") == 0) return kv_assetmgr;
+    if (strcmp(nm, "open") == 0 || strcmp(nm, "openNonAsset") == 0) {
+        /* read the asset path; we don't serve content (no GPU) but must not
+         * return null or Unity crashes.  Return the fake stream. */
+        return kv_asset_stream;
+    }
+    if (strcmp(nm, "getFilesDir") == 0 || strcmp(nm, "getExternalFilesDir") == 0 ||
+        strcmp(nm, "getCacheDir") == 0 || strcmp(nm, "getDataDir") == 0 ||
+        strcmp(nm, "getPath") == 0 || strcmp(nm, "getAbsolutePath") == 0 ||
+        strcmp(nm, "getCanonicalPath") == 0) {
+        return kv_make_jstring(".");
+    }
+    if (strcmp(nm, "toString") == 0) return kv_make_jstring("");
+    if (strcmp(nm, "getName") == 0 || strcmp(nm, "getCanonicalName") == 0 ||
+        strcmp(nm, "getTypeName") == 0) return kv_make_jstring("java.lang.Object");
+    /* builders / chained setters return the object itself */
+    if (strcmp(nm, "addFlags") == 0 || strcmp(nm, "setFlags") == 0 ||
+        strcmp(nm, "setData") == 0 || strcmp(nm, "setAction") == 0 ||
+        strcmp(nm, "append") == 0 || strcmp(nm, "edit") == 0) return obj;
+    /* fluent prefs editor */
+    if (strcmp(nm, "putString") == 0 || strcmp(nm, "putInt") == 0 ||
+        strcmp(nm, "putBoolean") == 0 || strcmp(nm, "putFloat") == 0 ||
+        strcmp(nm, "putLong") == 0 || strcmp(nm, "remove") == 0) return obj;
+    /* queryIntentActivities etc -> empty list */
+    if (strcmp(nm, "queryIntentActivities") == 0 || strcmp(nm, "iterator") == 0)
+        return kv_fake_obj;
+    return kv_fake_obj;
+}
+static jobject kv_CallObjectMethodA(JNIEnv env, jobject obj, jmethodID mid, const jvalue *args) {
+    (void)args; return kv_CallObjectMethodV(env, obj, mid, 0);
+}
+static jobject kv_CallObj(JNIEnv env, jobject o, jmethodID m, ...) {
+    return kv_CallObjectMethodV(env, o, m, 0);
+}
 static jboolean kv_CallBool(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
 static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
 static jlong kv_CallLong(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
@@ -473,7 +547,7 @@ const struct JNINativeInterface_ kv_jni_table = {
     kv_NewLocalRef, kv_EnsureLocalCapacity, kv_AllocObject, kv_NewObject,
     kv_unsupported, kv_unsupported, kv_GetObjectClass, kv_IsInstanceOf,
     kv_GetMethodID,
-    kv_CallObj, kv_unsupported, kv_unsupported,
+    kv_CallObj, kv_CallObjectMethodV, kv_CallObjectMethodA,
     kv_CallBool, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported,
     kv_unsupported, kv_unsupported, kv_unsupported,

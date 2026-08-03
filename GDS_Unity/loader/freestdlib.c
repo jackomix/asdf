@@ -555,18 +555,24 @@ static unsigned long kv_sig_pc;
 static unsigned long kv_sig_addr;
 
 static void kv_sighandler(int sig, void *info, void *ucontext) {
-    (void)sig; (void)ucontext;
+    (void)sig;
     /* siginfo: si_signo@0, si_errno@4, si_code@8, union@16; si_addr@16 */
     unsigned long addr = 0;
     unsigned char *p = (unsigned char *)info;
-    /* best-effort read; the union first member is _sigfault with si_addr */
     for (int i = 0; i < 8; i++) addr |= ((unsigned long)p[16 + i]) << (8 * i);
     kv_sig_addr = addr;
-    /* PC from ucontext is layout-dependent; log what we have and exit */
+    /* aarch64 ucontext_t: uc_mcontext.pc is at offset 0x130 (glibc).  Read it
+     * to know exactly which instruction faulted. */
+    unsigned long pc = 0;
+    unsigned char *u = (unsigned char *)ucontext;
+    if (u) for (int i = 0; i < 8; i++) pc |= ((unsigned long)u[0x130 + i]) << (8 * i);
+    kv_sig_pc = pc;
     kv_outstr("[loader] CRASH sig=");
     kv_outdec(sig);
     kv_outstr(" addr=");
     kv_outhex(addr, 1);
+    kv_outstr(" pc=");
+    kv_outhex(pc, 1);
     kv_outstr("\n");
     raw_syscall(SYS_exit, 139, 0, 0, 0, 0, 0);
     for (;;) {}
