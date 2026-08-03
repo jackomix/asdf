@@ -57,9 +57,16 @@ GH_SHA=$(curl -sL --max-time 15 "https://api.github.com/repos/jackomix/asdf/comm
 if [ -n "$GH_TS" ]; then
   # age in minutes (macOS date -j, Linux date -d)
   NOW=$(date +%s)
-  if date -d "$GH_TS" +%s >/dev/null 2>&1; then TS=$(date -d "$GH_TS" +%s); else TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$GH_TS" +%s 2>/dev/null || echo 0); fi
-  AGE=$(( (NOW - TS) / 60 ))
-  echo "  latest commit: ${GH_SHA:0:8}  (${AGE} minutes ago)"
+  # parse the ISO commit time (Linux 'date -d', macOS 'date -j')
+  if date -d "$GH_TS" +%s >/dev/null 2>&1; then TS=$(date -d "$GH_TS" +%s)
+  else TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$GH_TS" +%s 2>/dev/null || echo 0); fi
+  if [ "$TS" -gt 0 ] 2>/dev/null; then
+    AGE=$(( (NOW - TS) / 60 ))
+    if [ "$AGE" -lt 0 ]; then AGE=0; fi
+    echo "  latest commit: ${GH_SHA:0:8}  (~${AGE} minutes ago)"
+  else
+    echo "  latest commit: ${GH_SHA:0:8}"
+  fi
 else
   echo "  (could not check commit time; continuing)"
 fi
