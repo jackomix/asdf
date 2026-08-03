@@ -21,6 +21,10 @@
 #define SYS_close      57
 #define SYS_brk        214
 #define SYS_fstatat    79
+#define SYS_lseek      62
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
 
 static long raw_syscall(int n, long a, long b, long c, long d, long e, long f) {
     register long x8 __asm__("x8") = n;
@@ -53,12 +57,17 @@ ssize_t write(int fd, const void *buf, unsigned long n) {
 }
 int close(int fd) { return (int)raw_syscall(SYS_close, fd, 0, 0, 0, 0, 0); }
 int munmap(void *a, unsigned long l) { (void)a;(void)l; return 0; }
+long lseek(int fd, long off, int whence) {
+    return (long)raw_syscall(SYS_lseek, fd, off, whence, 0, 0, 0);
+}
 
 /* ---- bump allocator ---- */
 static uint8_t *heap_ptr = 0;
 static uint8_t *heap_end = 0;
 #define HEAP_START ((uint8_t *)0x9e000000UL)
-#define HEAP_SIZE  (64UL * 1024 * 1024)
+/* big enough for both 33 MB libil2cpp.so + 16 MB libunity.so file buffers and
+ * the .so boot-time allocations. */
+#define HEAP_SIZE  (256UL * 1024 * 1024)
 
 static void ensure_heap(void) {
     if (!heap_ptr) {
@@ -356,6 +365,7 @@ int pthread_rwlock_rdlock(void *l) { (void)l; return 0; }
 int pthread_rwlock_wrlock(void *l) { (void)l; return 0; }
 int pthread_rwlock_unlock(void *l) { (void)l; return 0; }
 int sem_init(void *s, int p, unsigned v) { (void)s;(void)p;(void)v; return 0; }
+int sem_destroy(void *s) { (void)s; return 0; }
 int sem_post(void *s) { (void)s; return 0; }
 int sem_wait(void *s) { (void)s; return 0; }
 int sem_timedwait(void *s, void *t) { (void)s;(void)t; return 0; }

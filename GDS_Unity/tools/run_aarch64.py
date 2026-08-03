@@ -16,7 +16,7 @@ from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM
 from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_X0, \
     UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3, UC_ARM64_REG_X4, \
     UC_ARM64_REG_X5, UC_ARM64_REG_X8, UC_ARM64_REG_PC, \
-    UC_ARM64_REG_LR, UC_ARM64_REG_X30
+    UC_ARM64_REG_LR, UC_ARM64_REG_X30, UC_ARM64_REG_TPIDR_EL0
 
 
 PAGE = 0x1000
@@ -105,6 +105,14 @@ def load(path, argv):
     uc.reg_write(UC_ARM64_REG_X0, len(argv))
     uc.reg_write(UC_ARM64_REG_X1, argv_ptr)
 
+    # TLS: aarch64 reads thread-local storage through tpidr_el0 (the thread
+    # pointer).  The real kernel sets it per-thread; libunity.so's init_array
+    # does `mrs x19, tpidr_el0; ldr x10, [x19, #0x28]`, so if it's 0 the first
+    # TLS access faults.  Map a zeroed TLS block and point tpidr_el0 at it.
+    tls_base = 0x7fef0000 - 0x10000  # just below the stack region
+    uc.mem_map(tls_base, 0x10000, 7)
+    uc.reg_write(UC_ARM64_REG_TPIDR_EL0, tls_base)
+
     return uc, entry, minv, maxv, BASE, span, len(argv), argv_ptr
 
 
@@ -188,6 +196,24 @@ def main():
                 return -1
         return -1
 
+    def sys_lseek(uc, fd, off, whence):
+        # whence: 0=SET, 1=CUR, 2=END.  Needed so read_all() can size a file
+        # (SEEK_END) then rewind (SEEK_SET:0) before reading it whole.
+        g = getattr(uc, '_guest_files', {})
+        if fd not in g:
+            return -1
+        base, total, cur = g[fd]
+        if whence == 2:       # END
+            new = total + off
+        elif whence == 1:     # CUR
+            new = cur + off
+        else:                 # SET
+            new = off
+        if new < 0:
+            return -1
+        g[fd] = (base, total, new)
+        return new
+
     def svc(uc):
         num = uc.reg_read(UC_ARM64_REG_X8)
         x0, x1, x2, x3, x4, x5 = [uc.reg_read(r) for r in
@@ -219,6 +245,8 @@ def main():
             uc.reg_write(UC_ARM64_REG_X0, sys_openat(uc, x0, x1, x2, x3))
         elif num == 63:  # read
             uc.reg_write(UC_ARM64_REG_X0, sys_read(uc, x0, x1, x2))
+        elif num == 62:  # lseek
+            uc.reg_write(UC_ARM64_REG_X0, sys_lseek(uc, x0, x1, x2))
         elif num == 57:  # close
             uc.reg_write(UC_ARM64_REG_X0, 0)
         elif num == 29:  # ioctl
@@ -285,8 +313,9 @@ def main():
     uc.hook_add(unicorn.UC_HOOK_CODE, _code)
 
     def _memerr(uc, access, addr, size, value, user):
-        print('[unicorn MEM %s @%#x sz %d]' % (
-            {0: 'READ', 1: 'WRITE', 2: 'FETCH', 3: 'READ*', 4: 'WRITE*'}.get(access, access), addr, size), file=sys.stderr)
+        print('[unicorn MEM %s @%#x sz %d pc=%#x]' % (
+            {0: 'READ', 1: 'WRITE', 2: 'FETCH', 3: 'READ*', 4: 'WRITE*'}.get(access, access), addr, size,
+            uc.reg_read(UC_ARM64_REG_PC)), file=sys.stderr)
 
     uc.hook_add(unicorn.UC_HOOK_MEM_INVALID, _memerr)
     print('[bench] entry=%#x minv=%#x maxv=%#x mapped %#x..%#x'

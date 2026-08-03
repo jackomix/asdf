@@ -58,22 +58,18 @@ static void *xmmap(uint8_t *hint, size_t len, int prot) {
 static void *read_all(const char *path, size_t *out_len) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { printf( "[loader] open %s: %m\n", path); exit(2); }
-    /* The real .so is tens of MB (libil2cpp.so is 33 MB), so grow the buffer
-     * dynamically instead of fixing it at 1 MB (which silently truncated the
-     * file and made the dynamic section come out as garbage). */
-    size_t cap = 1 << 20;
-    uint8_t *buf = malloc(cap);
+    /* Size the file first (lseek END) and allocate exactly once.  The real .so
+     * is tens of MB (libil2cpp.so 33 MB, libunity.so 16 MB), so this must not
+     * leak a doubling-growth buffer for every .so or the bump allocator
+     * exhausts and later modules get malloc(0). */
+    long sz = lseek(fd, 0, SEEK_END);
+    if (sz < 0) sz = (1 << 20);
+    lseek(fd, 0, SEEK_SET);
+    uint8_t *buf = malloc(sz ? (size_t)sz : 1);
+    if (!buf) { printf("[loader] malloc(%ld) failed for %s\n", sz, path); exit(2); }
     ssize_t got = 0;
-    for (;;) {
-        if (got >= (ssize_t)cap) {
-            cap <<= 1;
-            uint8_t *nb = malloc(cap);
-            if (got) memcpy(nb, buf, got);
-            /* leak old buf; this is a one-shot loader, memory is reclaimed on
-             * exit and there are at most a couple of .so files. */
-            buf = nb;
-        }
-        ssize_t r = read(fd, buf + got, cap - got);
+    while (got < sz) {
+        ssize_t r = read(fd, buf + got, sz - got);
         if (r <= 0) break;
         got += r;
     }
@@ -231,11 +227,21 @@ void _start(void) {
 }
 
 int real_main(int argc, char **argv) {
-    const char *lib = (argc > 1) ? argv[1] : "out/apk/lib/arm64-v8a/libil2cpp.so";
-    printf("[loader] real_main argc=%d\n", argc);
-    printf("[loader] loading %s\n", lib);
-    Module *m = load_object(lib);
-    (void)m;
-    printf("[loader] OK: %s loaded and initialised\n", lib);
+    /* Load every .so given on the command line, in order.  Passing two lets the
+     * engine (libunity.so) and the game (libil2cpp.so) both load+init before
+     * Unity's entry is driven in stage 2:
+     *   python3 tools/run_aarch64.py loader/loader2 libil2cpp.so libunity.so
+     */
+    if (argc < 2) {
+        printf("[loader] usage: loader2 <libil2cpp.so> [libunity.so ...]\n");
+        return 0;
+    }
+    int n = 0;
+    for (int i = 1; i < argc; i++) {
+        printf("[loader] loading %s\n", argv[i]);
+        Module *m = load_object(argv[i]);
+        if (m) n++;
+    }
+    printf("[loader] OK: %d module(s) loaded and initialised\n", n);
     return 0;
 }

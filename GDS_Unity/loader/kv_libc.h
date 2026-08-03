@@ -148,5 +148,6 @@ int sem_post(void *s);
 int sem_wait(void *s);
 int sem_timedwait(void *s, void *t);
 int sem_getvalue(void *s, int *v);
+int sem_destroy(void *s);
 
 #endif /* KV_LIBC_H */

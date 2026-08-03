@@ -134,7 +134,7 @@ int rmdir(const char *p) { (void)p; return 0; }
 int link(const char *a, const char *b) { (void)a;(void)b; return -1; }
 int symlink(const char *a, const char *b) { (void)a;(void)b; return -1; }
 int readlink(const char *p, char *b, unsigned long n) { (void)p;(void)b;(void)n; return -1; }
-int lseek(int fd, long o, int w) { (void)fd;(void)o;(void)w; return 0; }
+/* lseek is provided by freestdlib.c (needs to actually seek for read_all) */
 int dup(int fd) { (void)fd; return -1; }
 int ftruncate(int fd, long l) { (void)fd;(void)l; return 0; }
 int futimens(int fd, void *t) { (void)fd;(void)t; return 0; }
@@ -150,6 +150,7 @@ int stat(const char *p, void *st) { (void)p; if (st) memset(st, 0, 144); return 
 int lstat(const char *p, void *st) { (void)p; if (st) memset(st, 0, 144); return -1; }
 int sigaction(int s, const void *a, void *o) { (void)s;(void)a;(void)o; return 0; }
 int signal(int s, void *h) { (void)s;(void)h; return 0; }
+int sigaltstack(const void *ss, void *os) { (void)ss; if (os) memset(os, 0, 24); return 0; }
 void *sigemptyset(void *s) { (void)s; return s; }
 void *sigfillset(void *s) { (void)s; return s; }
 void *sigaddset(void *s, int n) { (void)s;(void)n; return s; }
@@ -178,6 +179,12 @@ int closelog(void) { return 0; }
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
     (void)prio;(void)tag;(void)fmt; return 0;
 }
+int __android_log_vprint(int prio, const char *tag, const char *fmt, void *ap) {
+    (void)prio;(void)tag;(void)fmt;(void)ap; return 0;
+}
+int __android_log_write(int prio, const char *tag, const char *msg) {
+    (void)prio;(void)tag;(void)msg; return 0;
+}
 int uname(void *u) {
     /* sys_utsname: 6 fixed char fields + version; zero it so .so boot doesn't
      * read garbage. */
@@ -197,6 +204,179 @@ long wcstol(const void *s, void **e, int b) { (void)s;(void)e;(void)b; return 0;
 long long wcstoll(const void *s, void **e, int b) { (void)s;(void)e;(void)b; return 0; }
 unsigned long wcstoul(const void *s, void **e, int b) { (void)s;(void)e;(void)b; return 0; }
 unsigned long long wcstoull(const void *s, void **e, int b) { (void)s;(void)e;(void)b; return 0; }
+
+/* ---- libunity.so: NDK native (ALooper / ANativeWindow / ASensor) ---- */
+void *ALooper_acquire(void) { return (void *)1; }
+void *ALooper_forThread(void) { return 0; }
+int ALooper_pollOnce(int t, int *o, void *e, void *d) { (void)t;(void)o;(void)e;(void)d; return 0; }
+void *ALooper_prepare(int o) { (void)o; return (void *)1; }
+void ALooper_release(void) {}
+void ALooper_wake(void) {}
+void ANativeWindow_acquire(void *w) { (void)w; }
+void *ANativeWindow_fromSurface(void *s) { (void)s; return (void *)1; }
+int ANativeWindow_getHeight(void *w) { (void)w; return 480; }
+int ANativeWindow_getWidth(void *w) { (void)w; return 640; }
+void ANativeWindow_release(void *w) { (void)w; }
+int ANativeWindow_setBuffersGeometry(void *w, int x, int y, int f) { (void)w;(void)x;(void)y;(void)f; return 0; }
+void *ASensorEventQueue_disableSensor(void *q, void *s) { (void)q;(void)s; return q; }
+void *ASensorEventQueue_enableSensor(void *q, void *s, int t) { (void)q;(void)s;(void)t; return q; }
+int ASensorEventQueue_getEvents(void *q, void *e, int n) { (void)q;(void)e;(void)n; return 0; }
+int ASensorEventQueue_hasEvents(void *q) { (void)q; return 0; }
+void *ASensorEventQueue_setEventRate(void *q, void *s, long t) { (void)q;(void)s;(void)t; return q; }
+void *ASensorManager_createEventQueue(void *m, void *l, int p, void *u) { (void)m;(void)l;(void)p;(void)u; return (void *)1; }
+void ASensorManager_destroyEventQueue(void *m, void *q) { (void)m;(void)q; }
+void *ASensorManager_getDefaultSensor(void *m, int t) { (void)m;(void)t; return (void *)1; }
+void *ASensorManager_getInstance(void) { return (void *)1; }
+void *ASensorManager_getSensorList(void *m, void **l) { (void)m; if (l) *l = 0; return 0; }
+int ASensor_getMinDelay(void *s) { (void)s; return 1000; }
+char *ASensor_getName(void *s) { (void)s; return "sensor"; }
+float ASensor_getResolution(void *s) { (void)s; return 1.0f; }
+int ASensor_getType(void *s) { (void)s; return 0; }
+char *ASensor_getVendor(void *s) { (void)s; return "vendor"; }
+
+/* ---- libunity.so: zlib (inflate) ---- */
+typedef unsigned long kv_z_uLong;
+typedef unsigned char kv_z_Bytef;
+typedef unsigned kv_z_uInt;
+typedef struct { kv_z_Bytef *next_in; kv_z_uInt avail_in; unsigned long total_in;
+                 kv_z_Bytef *next_out; kv_z_uInt avail_out; unsigned long total_out;
+                 void *state; } kv_z_stream;
+int inflateInit2_(kv_z_stream *s, int w, const char *v, int n) { (void)s;(void)w;(void)v;(void)n; return 0; }
+int inflate(kv_z_stream *s, int f) { (void)s;(void)f; return 1; } /* Z_STREAM_END */
+int inflateEnd(kv_z_stream *s) { (void)s; return 0; }
+
+/* ---- libunity.so: EGL ---- */
+void *eglGetDisplay(void *d) { (void)d; return (void *)1; }
+int eglInitialize(void *d, int *maj, int *min) { (void)d; if (maj) *maj=1; if (min) *min=4; return 1; }
+int eglTerminate(void *d) { (void)d; return 1; }
+int eglChooseConfig(void *d, const int *a, void *c, int n, int *num) { (void)d;(void)a;(void)c;(void)n; if (num) *num=0; return 1; }
+int eglGetConfigAttrib(void *d, void *c, int a, int *v) { (void)d;(void)c;(void)a; if (v) *v=0; return 1; }
+void *eglCreateContext(void *d, void *c, void *s, const int *a) { (void)d;(void)c;(void)s;(void)a; return (void *)1; }
+void *eglCreateWindowSurface(void *d, void *c, void *w, const int *a) { (void)d;(void)c;(void)w;(void)a; return (void *)1; }
+void *eglCreatePbufferSurface(void *d, void *c, const int *a) { (void)d;(void)c;(void)a; return (void *)1; }
+int eglDestroyContext(void *d, void *c) { (void)d;(void)c; return 1; }
+int eglDestroySurface(void *d, void *s) { (void)d;(void)s; return 1; }
+int eglMakeCurrent(void *d, void *dr, void *rd, void *c) { (void)d;(void)dr;(void)rd;(void)c; return 1; }
+void *eglGetCurrentContext(void) { return (void *)1; }
+void *eglGetCurrentSurface(int r) { (void)r; return (void *)1; }
+int eglSwapBuffers(void *d, void *s) { (void)d;(void)s; return 1; }
+int eglSwapInterval(void *d, int i) { (void)d;(void)i; return 1; }
+int eglGetError(void) { return 0x3000; } /* EGL_SUCCESS */
+int eglSurfaceAttrib(void *d, void *s, int a, int v) { (void)d;(void)s;(void)a;(void)v; return 1; }
+char *eglQueryString(void *d, int n) { (void)d;(void)n; return "1.4"; }
+int eglQuerySurface(void *d, void *s, int a, int *v) { (void)d;(void)s;(void)a; if (v) *v=0; return 1; }
+void *eglGetProcAddress(const char *n) { (void)n; return 0; }
+
+/* ---- libunity.so: POSIX sockets / net ---- */
+int socket(int d, int t, int p) { (void)d;(void)t;(void)p; return -1; }
+int bind(int fd, const void *a, unsigned n) { (void)fd;(void)a;(void)n; return -1; }
+int listen(int fd, int b) { (void)fd;(void)b; return -1; }
+int accept(int fd, void *a, void *n) { (void)fd;(void)a;(void)n; return -1; }
+int connect(int fd, const void *a, unsigned n) { (void)fd;(void)a;(void)n; return -1; }
+long send(int fd, const void *b, unsigned long n, int f) { (void)fd;(void)b;(void)n;(void)f; return -1; }
+long recv(int fd, void *b, unsigned long n, int f) { (void)fd;(void)b;(void)n;(void)f; return -1; }
+int getsockname(int fd, void *a, void *n) { (void)fd;(void)a;(void)n; return -1; }
+int getpeername(int fd, void *a, void *n) { (void)fd;(void)a;(void)n; return -1; }
+int getsockopt(int fd, int l, int o, void *v, void *n) { (void)fd;(void)l;(void)o;(void)v;(void)n; return -1; }
+int setsockopt(int fd, int l, int o, const void *v, unsigned n) { (void)fd;(void)l;(void)o;(void)v;(void)n; return -1; }
+int shutdown(int fd, int h) { (void)fd;(void)h; return -1; }
+int getaddrinfo(const char *n, const char *s, const void *h, void **r) { (void)n;(void)s;(void)h; if (r) *r=0; return -1; }
+void freeaddrinfo(void *r) { (void)r; }
+void *gethostbyname(const char *n) { (void)n; return 0; }
+void *gethostbyaddr(const void *a, unsigned l, int t) { (void)a;(void)l;(void)t; return 0; }
+unsigned long inet_addr(const char *s) { (void)s; return 0; }
+const char *inet_ntop(int f, const void *s, char *b, unsigned n) { (void)f;(void)s;(void)n; if (b) b[0]=0; return b; }
+int inet_pton(int f, const char *s, void *d) { (void)f;(void)s;(void)d; return -1; }
+int poll(void *f, unsigned long n, int t) { (void)f;(void)n;(void)t; return 0; }
+int fcntl(int fd, int c, ...) { (void)fd;(void)c; return -1; }
+int flock(int fd, int o) { (void)fd;(void)o; return 0; }
+int if_nametoindex(const char *n) { (void)n; return 0; }
+int getpriority(int w, int n) { (void)w;(void)n; return 0; }
+int setpriority(int w, int n, int p) { (void)w;(void)n;(void)p; return 0; }
+int sched_getaffinity(int p, unsigned n, void *m) { (void)p;(void)n; if (m) memset(m, 0, 8); return 0; }
+int sched_setaffinity(int p, unsigned n, const void *m) { (void)p;(void)n;(void)m; return 0; }
+long prctl(int o, ...) { (void)o; return 0; }
+long ptrace(int o, ...) { (void)o; return 0; }
+int raise(int s) { (void)s; return 0; }
+unsigned long getauxval(unsigned long t) { (void)t; return 0; }
+int gettid(void) { return getpid(); }
+void *getpwuid(unsigned u) { (void)u; return 0; }
+int getpwuid_r(unsigned u, void *p, char *b, unsigned n, void **r) { (void)u;(void)p;(void)b;(void)n; if (r) *r=0; return 0; }
+void *gmtime_r(const void *t, void *o) { (void)t;(void)o; return o; }
+void *localtime_r(const void *t, void *o) { (void)t;(void)o; return o; }
+long truncate(const char *p, long l) { (void)p;(void)l; return -1; }
+int utime(const char *p, const void *t) { (void)p;(void)t; return -1; }
+int statfs(const char *p, void *s) { (void)p; if (s) memset(s, 0, 120); return -1; }
+int fnmatch(const char *p, const char *n, int f) { (void)p;(void)n;(void)f; return 1; }
+void *memrchr(const void *s, int c, unsigned long n) {
+    const unsigned char *p = s;
+    for (unsigned long i = n; i > 0; i--) if (p[i-1]==(unsigned char)c) return (void *)(p+i-1);
+    return 0;
+}
+char *basename(char *p) { return p; }
+char *realpath(const char *p, char *r) { (void)p; if (r) r[0]='/'; return r; }
+int remove(const char *p) { (void)p; return -1; }
+
+/* ---- more libc stubs ---- */
+int _ctype_probe;  /* placeholder */
+void _ctype_(void) {}
+int puts(const char *s) { if (s) printf("%s\n", s); return 0; }
+float logf(float x) { (void)x; return 0.0f; }
+float ldexpf(float a, int e) { (void)a;(void)e; return 0.0f; }
+double ldexp(double a, int e) { (void)a;(void)e; return 0.0; }
+double exp(double x) { (void)x; return 1.0; }
+float expf(float x) { (void)x; return 1.0f; }
+float asinf(float x) { (void)x; return 0.0f; }
+float modff(float x, float *i) { (void)x; if (i) *i=0; return 0.0f; }
+float sqrtf(float x) { (void)x; return 1.0f; }
+int pthread_exit(void *r) { (void)r; for (;;) {} return 0; }
+int pthread_cond_init(void *c, void *a) { (void)c;(void)a; return 0; }
+int pthread_condattr_init(void *a) { (void)a; return 0; }
+int pthread_condattr_destroy(void *a) { (void)a; return 0; }
+int pthread_condattr_setclock(void *a, int c) { (void)a;(void)c; return 0; }
+int pthread_rwlock_init(void *l, void *a) { (void)l;(void)a; return 0; }
+int pthread_attr_setdetachstate(void *a, int d) { (void)a;(void)d; return 0; }
+int pthread_attr_setstacksize(void *a, unsigned long s) { (void)a;(void)s; return 0; }
+char *strerror(int e) { (void)e; return "error"; }
+int strcasecmp(const char *a, const char *b) {
+    unsigned char x,y; for (;;a++,b++){ x=*a; y=*b; if (x>='A'&&x<='Z')x+=32; if(y>='A'&&y<='Z')y+=32;
+        if (x!=y) return (int)x-(int)y; if (x==0) return 0; }
+}
+char *strcat(char *d, const char *s) { char *r=d; while(*d)d++; while((*d++=*s++)); return r; }
+unsigned long strcspn(const char *s, const char *rej) {
+    unsigned long n=0; for (const char*p=s;*p;p++){ const char*r=rej; while(*r) if(*r++==*p) return n; n++; } return n;
+}
+unsigned long strspn(const char *s, const char *acc) {
+    unsigned long n=0; for (const char*p=s;*p;p++){ int f=0; const char*r=acc; while(*r) if(*r++==*p){f=1;break;} if(!f)break; n++; } return n;
+}
+char *strtok_r(char *s, const char *delim, char **save) {
+    if (!s) s = *save; if (!s) return 0;
+    s += strspn(s, delim); if (!*s) { *save=0; return 0; }
+    char *start = s; s += strcspn(s, delim);
+    if (*s) { *s = 0; *save = s+1; } else *save = 0;
+    return start;
+}
+unsigned long strnlen(const char *s, unsigned long n) {
+    unsigned long i=0; while (i<n && s[i]) i++; return i;
+}
+int clearerr(void *f) { (void)f; return 0; }
+int feof(void *f) { (void)f; return 0; }
+int ferror(void *f) { (void)f; return 0; }
+int fileno(void *f) { (void)f; return -1; }
+void *fdopen(int fd, const char *m) { (void)fd;(void)m; return 0; }
+char *fgets(char *b, int n, void *f) { (void)b;(void)n;(void)f; return 0; }
+int fputs(const char *s, void *f) { (void)f; if (s) printf("%s", s); return 0; }
+int fscanf(void *f, const char *fmt, ...) { (void)f;(void)fmt; return 0; }
+long ftell(void *f) { (void)f; return 0; }
+int setbuf(void *f, char *b) { (void)f;(void)b; return 0; }
+int setvbuf(void *f, char *b, int m, unsigned long s) { (void)f;(void)b;(void)m;(void)s; return 0; }
+int vprintf(const char *fmt, void *a) { (void)fmt;(void)a; return 0; }
+long lseek64(int fd, long o, int w) { (void)fd;(void)o;(void)w; return 0; }
+int lldiv(long a, long b) { return (int)(a/b); }
+void __system_property_find(void) {}
+int __system_property_read(void *e, char *n, char *v) { (void)e;(void)n; if (v) v[0]=0; return 0; }
+void __FD_ISSET_chk(int fd, void *set) { (void)fd;(void)set; }
+void _ZTH15gDeferredAction(void) {}
 
 void *host_dlsym(const char *name) {
     /* exact-name table; keep in sync with what libil2cpp.so imports.  Each
@@ -280,7 +460,7 @@ void *host_dlsym(const char *name) {
         {"pthread_rwlock_unlock", (void *)pthread_rwlock_unlock},
         {"sem_init", (void *)sem_init}, {"sem_post", (void *)sem_post},
         {"sem_wait", (void *)sem_wait}, {"sem_timedwait", (void *)sem_timedwait},
-        {"sem_getvalue", (void *)sem_getvalue},
+        {"sem_getvalue", (void *)sem_getvalue}, {"sem_destroy", (void *)sem_destroy},
         {"cos", (void *)cos}, {"cosf", (void *)cosf},
         {"sin", (void *)sin}, {"sinf", (void *)sinf},
         {"tan", (void *)tan}, {"tanf", (void *)tanf},
@@ -344,6 +524,7 @@ void *host_dlsym(const char *name) {
         {"closedir", (void *)closedir}, {"stat", (void *)stat},
         {"lstat", (void *)lstat},
         {"sigaction", (void *)sigaction}, {"signal", (void *)signal},
+        {"sigaltstack", (void *)sigaltstack},
         {"sigemptyset", (void *)sigemptyset}, {"sigfillset", (void *)sigfillset},
         {"sigaddset", (void *)sigaddset}, {"sigdelset", (void *)sigdelset},
         {"sigsuspend", (void *)sigsuspend}, {"madvise", (void *)madvise},
@@ -372,6 +553,116 @@ void *host_dlsym(const char *name) {
         {"close", (void *)close}, {"open", (void *)open},
         {"mmap", (void *)mmap}, {"munmap", (void *)munmap},
         {"fstat", (void *)fstat},
+        /* libunity.so: NDK native */
+        {"ALooper_acquire", (void *)ALooper_acquire},
+        {"ALooper_forThread", (void *)ALooper_forThread},
+        {"ALooper_pollOnce", (void *)ALooper_pollOnce},
+        {"ALooper_prepare", (void *)ALooper_prepare},
+        {"ALooper_release", (void *)ALooper_release},
+        {"ALooper_wake", (void *)ALooper_wake},
+        {"ANativeWindow_acquire", (void *)ANativeWindow_acquire},
+        {"ANativeWindow_fromSurface", (void *)ANativeWindow_fromSurface},
+        {"ANativeWindow_getHeight", (void *)ANativeWindow_getHeight},
+        {"ANativeWindow_getWidth", (void *)ANativeWindow_getWidth},
+        {"ANativeWindow_release", (void *)ANativeWindow_release},
+        {"ANativeWindow_setBuffersGeometry", (void *)ANativeWindow_setBuffersGeometry},
+        {"ASensorEventQueue_disableSensor", (void *)ASensorEventQueue_disableSensor},
+        {"ASensorEventQueue_enableSensor", (void *)ASensorEventQueue_enableSensor},
+        {"ASensorEventQueue_getEvents", (void *)ASensorEventQueue_getEvents},
+        {"ASensorEventQueue_hasEvents", (void *)ASensorEventQueue_hasEvents},
+        {"ASensorEventQueue_setEventRate", (void *)ASensorEventQueue_setEventRate},
+        {"ASensorManager_createEventQueue", (void *)ASensorManager_createEventQueue},
+        {"ASensorManager_destroyEventQueue", (void *)ASensorManager_destroyEventQueue},
+        {"ASensorManager_getDefaultSensor", (void *)ASensorManager_getDefaultSensor},
+        {"ASensorManager_getInstance", (void *)ASensorManager_getInstance},
+        {"ASensorManager_getSensorList", (void *)ASensorManager_getSensorList},
+        {"ASensor_getMinDelay", (void *)ASensor_getMinDelay},
+        {"ASensor_getName", (void *)ASensor_getName},
+        {"ASensor_getResolution", (void *)ASensor_getResolution},
+        {"ASensor_getType", (void *)ASensor_getType},
+        {"ASensor_getVendor", (void *)ASensor_getVendor},
+        /* libunity.so: zlib */
+        {"inflateInit2_", (void *)inflateInit2_},
+        {"inflate", (void *)inflate},
+        {"inflateEnd", (void *)inflateEnd},
+        /* libunity.so: EGL */
+        {"eglGetDisplay", (void *)eglGetDisplay},
+        {"eglInitialize", (void *)eglInitialize},
+        {"eglTerminate", (void *)eglTerminate},
+        {"eglChooseConfig", (void *)eglChooseConfig},
+        {"eglGetConfigAttrib", (void *)eglGetConfigAttrib},
+        {"eglCreateContext", (void *)eglCreateContext},
+        {"eglCreateWindowSurface", (void *)eglCreateWindowSurface},
+        {"eglCreatePbufferSurface", (void *)eglCreatePbufferSurface},
+        {"eglDestroyContext", (void *)eglDestroyContext},
+        {"eglDestroySurface", (void *)eglDestroySurface},
+        {"eglMakeCurrent", (void *)eglMakeCurrent},
+        {"eglGetCurrentContext", (void *)eglGetCurrentContext},
+        {"eglGetCurrentSurface", (void *)eglGetCurrentSurface},
+        {"eglSwapBuffers", (void *)eglSwapBuffers},
+        {"eglSwapInterval", (void *)eglSwapInterval},
+        {"eglGetError", (void *)eglGetError},
+        {"eglSurfaceAttrib", (void *)eglSurfaceAttrib},
+        {"eglQueryString", (void *)eglQueryString},
+        {"eglQuerySurface", (void *)eglQuerySurface},
+        {"eglGetProcAddress", (void *)eglGetProcAddress},
+        /* libunity.so: POSIX sockets / net */
+        {"socket", (void *)socket}, {"bind", (void *)bind},
+        {"listen", (void *)listen}, {"accept", (void *)accept},
+        {"connect", (void *)connect}, {"send", (void *)send},
+        {"recv", (void *)recv}, {"getsockname", (void *)getsockname},
+        {"getpeername", (void *)getpeername}, {"getsockopt", (void *)getsockopt},
+        {"setsockopt", (void *)setsockopt}, {"shutdown", (void *)shutdown},
+        {"getaddrinfo", (void *)getaddrinfo}, {"freeaddrinfo", (void *)freeaddrinfo},
+        {"gethostbyname", (void *)gethostbyname}, {"gethostbyaddr", (void *)gethostbyaddr},
+        {"inet_addr", (void *)inet_addr}, {"inet_ntop", (void *)inet_ntop},
+        {"inet_pton", (void *)inet_pton}, {"poll", (void *)poll},
+        {"fcntl", (void *)fcntl}, {"flock", (void *)flock},
+        {"if_nametoindex", (void *)if_nametoindex},
+        {"getpriority", (void *)getpriority}, {"setpriority", (void *)setpriority},
+        {"sched_getaffinity", (void *)sched_getaffinity},
+        {"sched_setaffinity", (void *)sched_setaffinity},
+        {"prctl", (void *)prctl}, {"ptrace", (void *)ptrace},
+        {"raise", (void *)raise}, {"getauxval", (void *)getauxval},
+        {"gettid", (void *)gettid}, {"getpwuid", (void *)getpwuid},
+        {"getpwuid_r", (void *)getpwuid_r}, {"gmtime_r", (void *)gmtime_r},
+        {"localtime_r", (void *)localtime_r}, {"truncate", (void *)truncate},
+        {"utime", (void *)utime}, {"statfs", (void *)statfs},
+        {"fnmatch", (void *)fnmatch}, {"memrchr", (void *)memrchr},
+        {"basename", (void *)basename}, {"realpath", (void *)realpath},
+        {"remove", (void *)remove},
+        /* libunity.so: more libc */
+        {"puts", (void *)puts}, {"logf", (void *)logf},
+        {"ldexpf", (void *)ldexpf}, {"ldexp", (void *)ldexp},
+        {"exp", (void *)exp}, {"expf", (void *)expf},
+        {"asinf", (void *)asinf}, {"modff", (void *)modff},
+        {"sqrtf", (void *)sqrtf}, {"pthread_exit", (void *)pthread_exit},
+        {"pthread_cond_init", (void *)pthread_cond_init},
+        {"pthread_condattr_init", (void *)pthread_condattr_init},
+        {"pthread_condattr_destroy", (void *)pthread_condattr_destroy},
+        {"pthread_condattr_setclock", (void *)pthread_condattr_setclock},
+        {"pthread_rwlock_init", (void *)pthread_rwlock_init},
+        {"pthread_attr_setdetachstate", (void *)pthread_attr_setdetachstate},
+        {"pthread_attr_setstacksize", (void *)pthread_attr_setstacksize},
+        {"strerror", (void *)strerror}, {"strcasecmp", (void *)strcasecmp},
+        {"strcat", (void *)strcat}, {"strcspn", (void *)strcspn},
+        {"strspn", (void *)strspn}, {"strtok_r", (void *)strtok_r},
+        {"strnlen", (void *)strnlen}, {"clearerr", (void *)clearerr},
+        {"feof", (void *)feof}, {"ferror", (void *)ferror},
+        {"fileno", (void *)fileno}, {"fdopen", (void *)fdopen},
+        {"fgets", (void *)fgets}, {"fputs", (void *)fputs},
+        {"fscanf", (void *)fscanf}, {"ftell", (void *)ftell},
+        {"setbuf", (void *)setbuf}, {"setvbuf", (void *)setvbuf},
+        {"vprintf", (void *)vprintf}, {"lseek64", (void *)lseek64},
+        {"lldiv", (void *)lldiv},
+        {"__system_property_find", (void *)__system_property_find},
+        {"__system_property_read", (void *)__system_property_read},
+        {"__FD_ISSET_chk", (void *)__FD_ISSET_chk},
+        {"_ZTH15gDeferredAction", (void *)_ZTH15gDeferredAction},
+        {"_ctype_", (void *)_ctype_},
+        {"mprotect", (void *)mprotect},
+        {"__android_log_vprint", (void *)__android_log_vprint},
+        {"__android_log_write", (void *)__android_log_write},
         {0, 0},
     };
     for (int i = 0; tab[i].n; i++)

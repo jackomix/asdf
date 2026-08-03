@@ -146,5 +146,9 @@ void   exit(int code);
 int    fstat(int fd, void *st);
 char  *strncpy(char *d, const char *s, unsigned long n);
 int    memcmp(const void *a, const void *b, unsigned long n);
+long   lseek(int fd, long off, int whence);
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
 
 #endif /* KV_ELF_H */
