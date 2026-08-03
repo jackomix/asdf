@@ -44,6 +44,19 @@ emulator (the slow, hard half) and does not reuse the native win.
   Each .so alone also loads/init/exits 0.  A synthetic `loader/so_probe.c`
   exercises the reloc path in isolation (RELATIVE, self GLOB_DAT, JUMP_SLOT,
   DT_INIT_ARRAY) without the big assets.
+- **`JNI_OnLoad` now runs to completion under a built-in JNI shim.**
+  `loader/jni_shim.c` provides a full JNINativeInterface + JavaVMFunctionTable
+  (JNIEnv + JavaVM), and the loader calls `libunity.so`'s `JNI_OnLoad` after
+  both init_arrays.  It returns `JNI_VERSION_1_6` (0x10006) and the guest exits
+  0.  FindClass inventory it issues (the classes a real Android runtime must
+  supply):
+  `com/unity3d/player/UnityPlayer`, `com/google/androidgamesdk/ChoreographerCallback`,
+  `com/google/androidgamesdk/SwappyDisplayManager`, `com/unity3d/player/GoogleARCoreApi`,
+  `com/unity3d/player/Camera2Wrapper`, `com/unity3d/player/HFPStatus`,
+  `com/unity3d/player/AudioVolumeHandler`, `com/unity3d/player/UnityCoreAssetPacksStatusCallbacks`,
+  `com/unity3d/player/OrientationLockListener`, `com/unity3d/player/SoftInputProvider`.
+  Build with `loader/build.sh` (compiles jni_shim.c; `-Wno-*` relax pedantic
+  function-pointer checks that don't matter for the ARM64 JNI ABI).
 - The loader's ELF machinery is written (`loader/loader.c`): maps PT_LOAD
   segments, applies RELATIVE + GLOB_DAT/JUMP_SLOT/ABS relocs, runs DT_INIT_ARRAY,
   resolves the `.so`'s libc/libm/bionic imports via a host symbol table.  It
@@ -73,12 +86,21 @@ emulator (the slow, hard half) and does not reuse the native win.
   `ANativeWindow*`, `ASensor*`), **EGL** (`egl*`), **zlib** (`inflate*`), and
   **POSIX sockets/net**.  These are the symbols `host_dlsym`'s table maps to;
   add any newly-unresolved symbol there (it prints `unresolved <name>`).
-- The loader currently **only runs init_array** for each .so.  It does NOT yet
-  call into the game logic or Unity's main loop, and the IL2CPP runtime
-  initialised by the ctors is not driven (no `il2cpp_runtime_invoke`/threads/
-  Unity host).
-- No GPU / JNI / SDL window yet.  Next milestones (stage 2+): drive Unity's
-  entry + player loop, and provide EGL/SDL + JNI shims (model on
+- The loader runs each .so's **init_array** and **libunity's `JNI_OnLoad`** (which
+  now returns JNI_VERSION_1_6).  It does NOT yet run Unity's **main loop**:
+  `UnityMain` is invoked from the Java Activity's native methods (not from
+  JNI_OnLoad), and it needs a real EGL surface + AssetManager + the APK's
+  assets.  Those need a display/GPU and are not fully exercisable headless under
+  the Unicorn bench (no GPU); that is the R36S-device stage.
+- **JNI shim is minimal-by-design.**  `jni_shim.c` implements GetVersion,
+  FindClass, GetMethodID/GetStaticMethodID, GetFieldID/GetStaticFieldID,
+  NewStringUTF/GetStringUTFChars, RegisterNatives, exception funcs, NewObject,
+  Call*/Get* as no-op stubs returning 0.  Everything else points at a non-null
+  stub so calls don't fault.  The engine's JavaVM expects **GetEnv at offset
+  0x20** in the JavaVM function table (it does `vm->functions[0x20](vm,&env,0)`
+  to obtain the JNIEnv) - the shim is laid out to match that.
+- No GPU / EGL / SDL window yet.  Next milestones (stage 2+): run Unity's main
+  loop + player loop, and provide EGL/SDL + JNI shims (model on
   `NextOs-Ports/terraria-nextos` src/bionic_shims.c, jni_shim.c, egl_shim.c).
 - `kairovm/` is slow/incomplete as a game and is intentionally not the target.
 
@@ -202,22 +224,29 @@ GDS_Unity/
 ## NEXT STEPS (in order)
 
 0. **(DONE)** Real `libil2cpp.so` + `libunity.so` both load, run init_array,
-   exit 0.  The real GDS APK is at `APKs/Game+Dev+Story_2.6.9.apk` (53 MB),
-   extracted to `GDS_Unity/out/apk/` (gitignored).  Rebuild + rerun:
-   `python3 -m ziglang cc ... loader/loader.c loader/freestdlib.c loader/host_syms.c -o loader/loader2`
+   exit 0.  **Also (DONE)** libunity's `JNI_OnLoad` runs to completion under
+   `loader/jni_shim.c` and returns JNI_VERSION_1_6, guest exits 0.  The real GDS
+   APK is at `APKs/Game+Dev+Story_2.6.9.apk` (53 MB), extracted to
+   `GDS_Unity/out/apk/` (gitignored).  Rebuild + rerun:
+   `bash loader/build.sh`
    `python3 tools/run_aarch64.py loader/loader2 $(pwd)/out/apk/lib/arm64-v8a/libil2cpp.so $(pwd)/out/apk/lib/arm64-v8a/libunity.so`
-   Expect `init_array ran (18 ctors)` + `(1aa ctors)` and `[guest exit 0]`.
-1. **Drive the Unity player loop**: call Unity's entry (`UnityPluginLoad` /
-   `UnityMain` / `JNI_OnLoad` in libmain.so) so the engine actually starts, not
-   just init_array.  This is the bulk of the remaining work and will surface
-   the JNI classes the game calls and the bionic/glibc ABI gaps (notably arm64
-   `sigaction`/`sigset_t`: bionic 8 bytes vs glibc 128).
+   Expect `init_array ran (18 ctors)` + `(1aa ctors)`, the FindClass inventory,
+   `JNI_OnLoad returned 0x10006`, and `[guest exit 0]`.
+1. **Drive Unity's main/player loop.**  `UnityMain` is invoked from the Java
+   Activity's native methods (not JNI_OnLoad), and needs a real EGL surface +
+   AssetManager + APK assets.  On the bench (no GPU) this can't fully run; the
+   device-facing step is to call UnityMain / the player-loop entry and provide
+   EGL/SDL + AssetManager.  This is the bulk of the remaining work and will
+   surface the bionic/glibc ABI gaps (notably arm64 `sigaction`/`sigset_t`:
+   bionic 8 bytes vs glibc 128).
 2. Add the shim surface modeled on terraria-nextos:
    - `bionic_shims.c`: FORTIFY `_chk` wrappers, `__sF`, `__system_property_get`,
      and the **bionic/glibc `sigaction`/`sigset_t` ABI difference** (bionic arm64
      sigset is 8 bytes; glibc 128 — must convert, or it overruns caller stack).
      This is a real hazard.
-   - `jni_shim.c` + generated stubs: from the JNI call inventory the VM produced.
+   - `jni_shim.c` (built) + expand the stubs from the JNI call inventory
+     (`jni_shim.c` already logs FindClass/GetMethodID — extend as new classes
+     are requested).
    - `egl_shim.c` / SDL2: window, input, audio.
 3. Build for the real device: the same `loader.c` compiled for `aarch64-linux-gnu`
    (glibc) instead of freestanding becomes the R36S binary. Test on-device for
@@ -239,13 +268,13 @@ magnitude less than the first.
 ```
 pip install --break-system-packages unicorn capstone ziglang   # if missing
 cd GDS_Unity
-python3 -m ziglang cc -target aarch64-linux-gnu -ffreestanding -nostdlib \
-    -fno-pic -fno-pie -O0 -fno-sanitize=undefined \
-    loader/loader.c loader/freestdlib.c loader/host_syms.c -o loader/loader2
+bash loader/build.sh          # builds loader/loader2 (loader + freestdlib + host_syms + jni_shim)
 # freestanding smoke test (no asset needed):
 python3 tools/run_aarch64.py loader/tiny
-# full loader (needs extracted .so):
-python3 tools/run_aarch64.py loader/loader2 /abs/path/to/libil2cpp.so
+# full loader: engine + game + JNI_OnLoad (needs extracted .so in out/apk):
+python3 tools/run_aarch64.py loader/loader2 \
+    $(pwd)/out/apk/lib/arm64-v8a/libil2cpp.so \
+    $(pwd)/out/apk/lib/arm64-v8a/libunity.so
 ```
 
 ## COMMIT STATE

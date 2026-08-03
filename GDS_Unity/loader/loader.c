@@ -17,8 +17,14 @@
  * tools/run_aarch64.py (no GPU needed).
  */
 #include "kv_elf.h"
+#include "kv_libc.h"
 #include <stdint.h>
 #include <stddef.h>
+
+/* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
+ * needs.  Declared here so loader.c can drive the Unity boot. */
+void *kv_jni_java_vm(void);
+void *kv_jni_env(void);
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -84,6 +90,26 @@ static Module *module_new(const char *name) {
     m->next = g_modules;
     g_modules = m;
     return m;
+}
+
+/* Look up a DEFINED dynamic symbol (e.g. an export) in module `m` and return
+ * its runtime address, or 0.  Used to find entry points like JNI_OnLoad. */
+static void *module_export(Module *m, const char *wanted) {
+    if (!m->symtab || !m->strtab) return 0;
+    for (size_t i = 0; i < 200000; i++) {
+        Elf64_Sym *sym = &m->symtab[i];
+        const char *nm = m->strtab + sym->st_name;
+        /* stop when we run off into garbage; dynamic symtab ends where st_name
+         * is huge - guard with a cheap check */
+        if (sym->st_name > 0xffffffffULL || (uintptr_t)nm < (uintptr_t)m->strtab) break;
+        if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0 &&
+            strcmp(nm, wanted) == 0) {
+            return (void *)(m->bias + sym->st_value);
+        }
+        if (sym->st_name == 0 && sym->st_shndx == 0 && sym->st_value == 0 &&
+            sym->st_size == 0 && i > 8) break; /* hit the null entry */
+    }
+    return 0;
 }
 
 static void *resolve(const char *sym) {
@@ -237,11 +263,25 @@ int real_main(int argc, char **argv) {
         return 0;
     }
     int n = 0;
+    Module *last = 0;
     for (int i = 1; i < argc; i++) {
         printf("[loader] loading %s\n", argv[i]);
         Module *m = load_object(argv[i]);
-        if (m) n++;
+        if (m) { n++; last = m; }
     }
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
+
+    /* Stage 2: drive the Unity boot.  libunity.so's only entry is JNI_OnLoad;
+     * hand it our JNI shim's JavaVM + JNIEnv (no real Android underneath). */
+    if (last) {
+        void *(*jni_onload)(void *, void *) = module_export(last, "JNI_OnLoad");
+        if (jni_onload) {
+            printf("[loader] calling JNI_OnLoad (vm=%p)\n", kv_jni_java_vm());
+            void *r = jni_onload(kv_jni_java_vm(), 0);
+            printf("[loader] JNI_OnLoad returned %p (0x%lx)\n", r, (unsigned long)r);
+        } else {
+            printf("[loader] no JNI_OnLoad in %s\n", last->name);
+        }
+    }
     return 0;
 }
