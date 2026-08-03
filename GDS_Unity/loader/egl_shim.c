@@ -177,9 +177,11 @@ void egl_shim_create_window(void) {
     }
     if (egl_share_root) { g_alpha_size = fmts[f][0]; g_depth_size = fmts[f][1]; g_stencil_size = fmts[f][2]; }
   }
-  if (!egl_share_root) { printf("[egl] no GL context created\n"); return; }
+    if (!egl_share_root) { printf("[egl] no GL context created\n"); return; }
+    printf("[egl] window=%p context=%p (SDL_CreateWindow may have logged a surface warning)\n",
+           (void *)egl_window, (void *)egl_share_root);
 
-  if (S.GL_GetDrawableSize) S.GL_GetDrawableSize(egl_window, &g_screen_w, &g_screen_h);
+    if (S.GL_GetDrawableSize) S.GL_GetDrawableSize(egl_window, &g_screen_w, &g_screen_h);
   if (g_screen_w <= 0) g_screen_w = width;
   if (g_screen_h <= 0) g_screen_h = height;
   if (S.GL_SetSwapInterval) S.GL_SetSwapInterval(1);
@@ -292,7 +294,18 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
 
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
-  if (has_real_gl && egl_window && S.GL_SwapWindow) S.GL_SwapWindow(egl_window);
+  static int swn = 0;
+  if (has_real_gl && egl_window && S.GL_SwapWindow) {
+    S.GL_SwapWindow(egl_window);
+    /* Log the first few swap failures - this distinguishes "present not
+     * reached" from "present attempted but fails (DRM master / GBM surface)". */
+    if (S.GetError && ++swn <= 8) {
+      const char *e = S.GetError();
+      if (e && *e) printf("[egl] SDL_GL_SwapWindow error: %s\n", e);
+    }
+  } else {
+    if (++swn <= 8) printf("[egl] SwapBuffers SKIPPED (no real GL / window)\n");
+  }
   return EGL_TRUE;
 }
 
