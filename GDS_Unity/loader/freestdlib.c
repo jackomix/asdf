@@ -14,6 +14,7 @@
 
 #define SYS_mmap       222
 #define SYS_mprotect   226
+#define SYS_munmap     215
 #define SYS_write      64
 #define SYS_exit       93
 #define SYS_openat     56     /* aarch64 openat (was wrongly 257 = x86_64!) */
@@ -41,6 +42,37 @@ static long raw_syscall(int n, long a, long b, long c, long d, long e, long f) {
 }
 
 void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, long off) {
+    /* Unity's Boehm GC requires mmap'd heap memory to be aligned to HBLKSIZE,
+     * a power-of-two larger than a page (often 64 KB+).  The kernel only
+     * guarantees page (4 KB) alignment, so on the real device the GC aborts
+     * with "GC_unix_get_mem: Memory returned by mmap is not aligned to
+     * HBLKSIZE".  Fix: overallocate by ALIGN-1 and remap the middle at an
+     * ALIGN-aligned address via MAP_FIXED, then trim the head/tail.
+     * ALIGN = 1 MB covers any reasonable HBLKSIZE (and is itself a multiple
+     * of every smaller power-of-two). */
+    #define KV_MMAP_ALIGN (1UL << 20)   /* 1 MB */
+    unsigned long need = len;
+    /* Only bother aligning anonymous maps the GC would use; file maps and
+     * exact MAP_FIXED requests are left alone. */
+    if ((flags & 0x20) && !(flags & 0x10)) {   /* MAP_ANONYMOUS && !MAP_FIXED */
+        unsigned long over = need + KV_MMAP_ALIGN;
+        unsigned long base = (unsigned long)raw_syscall(SYS_mmap,
+            (long)addr, over, prot, flags, fd, off);
+        if (base == (unsigned long)-1) return (void *)-1;
+        unsigned long aligned = (base + KV_MMAP_ALIGN - 1) & ~(KV_MMAP_ALIGN - 1);
+        if (aligned == base) {
+            /* already aligned; trim the tail */
+            if (aligned + need < base + over)
+                raw_syscall(SYS_munmap, (long)(aligned + need), (long)(base + over - (aligned + need)), 0,0,0,0);
+            return (void *)base;
+        }
+        /* unmap head + tail, then MAP_FIXED the aligned region */
+        raw_syscall(SYS_munmap, (long)base, (long)(aligned - base), 0,0,0,0);
+        raw_syscall(SYS_munmap, (long)(aligned + need), (long)(base + over - (aligned + need)), 0,0,0,0);
+        unsigned long r = (unsigned long)raw_syscall(SYS_mmap,
+            (long)aligned, need, prot, flags | 0x10, fd, off);   /* MAP_FIXED */
+        return (void *)r;
+    }
     return (void *)raw_syscall(SYS_mmap, (long)addr, (long)len, prot, flags, fd, off);
 }
 int mprotect(void *addr, unsigned long len, int prot) {

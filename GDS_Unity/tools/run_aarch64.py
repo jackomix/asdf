@@ -265,7 +265,7 @@ def main():
             uc.reg_write(UC_ARM64_REG_X0, 0)
         elif num == 113:  # set_robust_list
             uc.reg_write(UC_ARM64_REG_X0, 0)
-        elif num == 215:  # access
+        elif num == 215:  # munmap (aarch64; no-op in bench - memory freed is reclaimed)
             uc.reg_write(UC_ARM64_REG_X0, 0)
         elif num == 257 or num == 56:  # openat (56=aarch64, 257=x86_64 legacy)
             uc.reg_write(UC_ARM64_REG_X0, sys_openat(uc, x0, x1, x2, x3))
