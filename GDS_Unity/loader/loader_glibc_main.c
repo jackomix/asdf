@@ -32,7 +32,7 @@ extern void *stderr;
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.11.0-glibc"
+#define GDS_BUILD_VERSION "0.12.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -429,6 +429,11 @@ static void kv_unity_boot(void) {
     for (int f = 0; f < 1000000; f++) {
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
+        /* Periodic liveness: confirms nativeRender is actually looping (and not
+         * stuck inside one call).  Also tells us how fast frames are being
+         * produced relative to real time. */
+        if (f == 1 || f == 60 || f == 600 || (f > 0 && f % 6000 == 0))
+            printf("[unity] nativeRender frame %d alive\n", f);
     }
     printf("[unity] player loop ended\n");
 }

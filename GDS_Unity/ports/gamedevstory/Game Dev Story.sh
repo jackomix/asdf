@@ -48,6 +48,22 @@ fi
 echo "--- all checks done, launching ---"
 } >> "$LOG" 2>&1
 
+# --- Kill any stale loader2 from a previous run ---
+# A leftover loader2 holds the DRM/GL display, so a new instance boots to a
+# black screen (can't create a presentable GBM surface).  Terraria's run.sh
+# does this too.  Only kill processes running the same loader2 binary.
+{
+echo "--- killing stale loader2 ---"
+# The loader runs as ./loader2 (comm truncated to "loader2").  Kill any prior
+# instance so it can't hold the DRM/GL display (which causes a black screen).
+for p in $(pgrep -x loader2 2>/dev/null; pgrep -f '\./loader2' 2>/dev/null); do
+  if [ "$p" != "$$" ] && [ "$p" != "$PPID" ]; then
+    echo "  killing stale loader2 pid $p"
+    kill -9 "$p" 2>/dev/null || true
+  fi
+done
+} >> "$LOG" 2>&1
+
 # --- Make the firmware's graphics libs findable ---
 # Terraria's launcher does this: SDL2, libEGL/libGLESv2 (Mali) and libz live in
 # these dirs on ArkOS, and our loader dlopens them at runtime (kv_egl_dlopen +

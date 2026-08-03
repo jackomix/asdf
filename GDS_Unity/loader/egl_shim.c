@@ -110,6 +110,18 @@ static pthread_mutex_t egl_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int next_context_id = 1;
 static int g_did_init = 0;
 
+/* ---- per-call counters (diagnostics: is Unity actually driving our EGL?) ---- */
+static volatile int g_n_eglGetDisplay, g_n_eglInitialize, g_n_eglChooseConfig;
+static volatile int g_n_eglCreateContext, g_n_eglMakeCurrent, g_n_eglSwapBuffers;
+static volatile int g_n_eglCreateWindowSurface, g_n_eglGetProcAddress;
+static void egl_show_counts(const char *why) {
+  printf("[egl] CALLS %s: GetDisplay=%d Initialize=%d ChooseConfig=%d "
+         "CreateContext=%d MakeCurrent=%d SwapBuffers=%d CreateWindowSurface=%d GetProcAddress=%d\n",
+         why, g_n_eglGetDisplay, g_n_eglInitialize, g_n_eglChooseConfig,
+         g_n_eglCreateContext, g_n_eglMakeCurrent, g_n_eglSwapBuffers,
+         g_n_eglCreateWindowSurface, g_n_eglGetProcAddress);
+}
+
 typedef struct {
   SDL_GLContext sdl_context;
   int id;
@@ -214,10 +226,14 @@ int egl_shim_ensure_current(void) {
 void egl_shim_swap(void) { if (egl_window && S.GL_SwapWindow) S.GL_SwapWindow(egl_window); }
 
 /* ---- EGL API ---- */
-EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) { (void)display_id; return (EGLDisplay)&g_did_init; }
+EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
+  (void)display_id; g_n_eglGetDisplay++; return (EGLDisplay)&g_did_init;
+}
 
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor) {
-  (void)dpy; if (major) *major = 1; if (minor) *minor = 4; return EGL_TRUE;
+  (void)dpy; if (major) *major = 1; if (minor) *minor = 4;
+  g_n_eglInitialize++; if (g_n_eglInitialize == 1) egl_show_counts("after Initialize");
+  return EGL_TRUE;
 }
 
 EGLBoolean eglTerminate(EGLDisplay dpy) {
@@ -232,6 +248,7 @@ EGLBoolean eglTerminate(EGLDisplay dpy) {
 EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig *configs,
                            EGLint config_size, EGLint *num_config) {
   (void)dpy; (void)attrib_list;
+  g_n_eglChooseConfig++;
   if (configs && config_size > 0) configs[0] = (EGLConfig)&g_did_init;
   if (num_config) *num_config = 1;
   return EGL_TRUE;
@@ -240,6 +257,7 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig 
 EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win,
                                   const EGLint *attrib_list) {
   (void)dpy; (void)config; (void)win; (void)attrib_list;
+  g_n_eglCreateWindowSurface++;
   return (EGLSurface)&g_did_init; /* the real window lives in SDL; surface is symbolic */
 }
 
@@ -269,12 +287,14 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
   pthread_mutex_unlock(&egl_ctx_mutex);
   if (!c->sdl_context) { free(c); return EGL_NO_CONTEXT; }
   c->id = next_context_id++;
+  g_n_eglCreateContext++;
   printf("[egl] eglCreateContext -> %p [ctx_id=%d]\n", c, c->id);
   return (EGLContext)c;
 }
 
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
   (void)dpy; (void)read;
+  g_n_eglMakeCurrent++;
   _egl_context *context = (_egl_context *)ctx;
   if (!context || !draw || !S.GL_MakeCurrent) {
     current_context = NULL; has_real_gl = 0;
@@ -289,22 +309,26 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
     has_real_gl = 0;
     printf("[egl] eglMakeCurrent failed: %s\n", S.GetError ? S.GetError() : "?");
   }
+  if (g_n_eglMakeCurrent <= 4) egl_show_counts("MakeCurrent");
   return EGL_TRUE;
 }
 
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
+  g_n_eglSwapBuffers++;
   static int swn = 0;
   if (has_real_gl && egl_window && S.GL_SwapWindow) {
     S.GL_SwapWindow(egl_window);
-    /* Log the first few swap failures - this distinguishes "present not
-     * reached" from "present attempted but fails (DRM master / GBM surface)". */
-    if (S.GetError && ++swn <= 8) {
-      const char *e = S.GetError();
-      if (e && *e) printf("[egl] SDL_GL_SwapWindow error: %s\n", e);
+    if (g_n_eglSwapBuffers <= 3) {
+      egl_show_counts("SwapBuffers(real)");
+      if (S.GetError && ++swn <= 8) {
+        const char *e = S.GetError();
+        if (e && *e) printf("[egl] SDL_GL_SwapWindow error: %s\n", e);
+      }
     }
   } else {
     if (++swn <= 8) printf("[egl] SwapBuffers SKIPPED (no real GL / window)\n");
+    if (g_n_eglSwapBuffers == 1) egl_show_counts("SwapBuffers(skipped)");
   }
   return EGL_TRUE;
 }

@@ -19,7 +19,7 @@ PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fc860-asdf}"
 # The loader build version the deployed zip MUST contain.  Bump alongside
 # loader.c's GDS_BUILD_VERSION so the deploy refuses stale/cached zips.
-GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.11.0-glibc}"
+GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.12.0-glibc}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 ZIP="$HERE/gamedevstory.zip"
@@ -66,9 +66,10 @@ if [ -n "$GH_TS" ]; then
   if [ "$TS" -gt 0 ] 2>/dev/null; then
     AGE=$(( (NOW - TS) / 60 ))
     if [ "$AGE" -lt 0 ]; then AGE=0; fi
-    echo "  latest commit: ${GH_SHA:0:8}  (~${AGE} minutes ago)"
+    # Also print the raw UTC commit timestamp so the age isn't ambiguous.
+    echo "  latest commit: ${GH_SHA:0:8}  (committed $GH_TS UTC, ~${AGE} minutes ago)"
   else
-    echo "  latest commit: ${GH_SHA:0:8}"
+    echo "  latest commit: ${GH_SHA:0:8}  (commit time unknown: $GH_TS)"
   fi
 else
   echo "  (could not check commit time; continuing)"
