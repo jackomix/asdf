@@ -15,6 +15,9 @@ HOST="${GDS_R36S_HOST:-${1:-ark@10.1.1.2}}"
 PASS="${GDS_SSH_PASS:-ark}"
 PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fc860-asdf}"
+# The loader build version the deployed zip MUST contain.  Bump alongside
+# loader.c's GDS_BUILD_VERSION so the deploy refuses stale/cached zips.
+GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.3.0}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 ZIP="$HERE/gamedevstory.zip"
@@ -62,7 +65,10 @@ else
 fi
 
 echo "Downloading gamedevstory.zip..."
-curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip"
+# Cache-buster (?ts=...) forces GitHub's raw CDN to serve a fresh copy instead
+# of a cached stale zip.  This was why the device ran an old loader2.
+CACHEBUST="?ts=$(date +%s)"
+curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip$CACHEBUST"
 echo
 if [ ! -s "$ZIP" ] || ! unzip -t "$ZIP" >/dev/null 2>&1; then
   echo "!! Downloaded zip corrupt/missing. Try again."; exit 1
@@ -70,6 +76,24 @@ fi
 # Show the loader version baked into this zip so we can spot a stale/cached zip
 GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+" | head -1 || true)
 echo "  zip loader2: build ${GZVER:-version unknown}"
+# Hard check: the zip MUST contain the current loader build or the deploy is
+# pointless (the device would run stale code again).  Retry once with a fresh
+# cache-buster if the version is wrong/missing.
+if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
+  echo "!! Downloaded zip has loader build '${GZVER:-none}' but expected '$GDS_EXPECT_VER'."
+  echo "   (GitHub CDN cached an old zip) - retrying with a fresh cache-buster..."
+  sleep 2
+  CACHEBUST="?ts=$(date +%s%N)"
+  curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip$CACHEBUST"
+  echo
+  GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+" | head -1 || true)
+  echo "  retry: zip loader2 build ${GZVER:-unknown}"
+  if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
+    echo "!! Still got '${GZVER:-none}' (expected $GDS_EXPECT_VER). Aborting."
+    echo "   The repo may not have the latest zip pushed yet, or GitHub is caching hard."
+    exit 1
+  fi
+fi
 echo "✓ zip ready ($(du -h "$ZIP" | cut -f1))"
 
 # ---- 3. upload with retries ----
