@@ -569,12 +569,26 @@ static void kv_sighandler(int sig, void *info, void *ucontext) {
     unsigned char *u = (unsigned char *)ucontext;
     if (u) for (int i = 0; i < 8; i++) pc |= ((unsigned long)u[0x1C0 + i]) << (8 * i);
     kv_sig_pc = pc;
+    /* read x30 (regs[30] @ mcontext+8+30*8 = 0x168) and x19 (regs[19] @ 0x138)
+     * to pinpoint the call site that jumped to the bad address */
+    unsigned long x30 = 0, x19 = 0, x0 = 0;
+    if (u) {
+        for (int i = 0; i < 8; i++) x30 |= ((unsigned long)u[0x168 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) x19 |= ((unsigned long)u[0x138 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) x0  |= ((unsigned long)u[0xB8 + 8 + i]) << (8 * i);
+    }
     kv_outstr("[loader] CRASH sig=");
     kv_outdec(sig);
     kv_outstr(" addr=");
     kv_outhex(addr, 1);
     kv_outstr(" pc=");
     kv_outhex(pc, 1);
+    kv_outstr(" x0=");
+    kv_outhex(x0, 1);
+    kv_outstr(" x19=");
+    kv_outhex(x19, 1);
+    kv_outstr(" x30=");
+    kv_outhex(x30, 1);
     kv_outstr("\n");
     raw_syscall(SYS_exit, 139, 0, 0, 0, 0, 0);
     for (;;) {}
