@@ -312,14 +312,18 @@ int kv_log_open(const char *path) {
     return 0;
 }
 
-static void kv_outc(int c) {
+static void putdec(long v, int neg);
+static void puthex(unsigned long v, int alt);
+void kv_outc(int c) {
     raw_syscall(SYS_write, 1, (long)&c, 1, 0, 0, 0);
     if (kv_logfd >= 0) raw_syscall(SYS_write, kv_logfd, (long)&c, 1, 0, 0, 0);
 }
-static void kv_outstr(const char *s) {
+void kv_outstr(const char *s) {
     raw_syscall(SYS_write, 1, (long)s, (long)strlen(s), 0, 0, 0);
     if (kv_logfd >= 0) raw_syscall(SYS_write, kv_logfd, (long)s, (long)strlen(s), 0, 0, 0);
 }
+void kv_outdec(long v) { putdec(v, v < 0); }
+void kv_outhex(unsigned long v, int alt) { puthex(v, alt); }
 static void putdec(long v, int neg) {
     char buf[24]; int i = 0;
     unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
@@ -499,6 +503,52 @@ int sem_post(void *s) { (void)s; return 0; }
 int sem_wait(void *s) { (void)s; return 0; }
 int sem_timedwait(void *s, void *t) { (void)s;(void)t; return 0; }
 int sem_getvalue(void *s, int *v) { (void)s; if (v) *v = 0; return 0; }
+
+/* ---- SIGSEGV/SIGBUS handler ----
+ * On the real device a crash otherwise just prints "Segmentation fault" with
+ * no detail.  Install a handler via rt_sigaction (aarch64 syscall 134) that
+ * logs the faulting address (siginfo si_addr) and the PC, then exits.  This
+ * turns an opaque segfault into a diagnostic line in loader.log.
+ */
+#define SYS_rt_sigaction 134
+#define SIGSEGV 11
+#define SIGBUS  7
+#define SA_SIGINFO 0x4
+
+/* aarch64 kernel sigaction: handler, flags, restorer, mask(128 bytes) */
+struct kv_ksigaction { unsigned long handler; unsigned long flags;
+                       unsigned long restorer; unsigned char mask[128]; };
+
+static unsigned long kv_sig_pc;
+static unsigned long kv_sig_addr;
+
+static void kv_sighandler(int sig, void *info, void *ucontext) {
+    (void)sig; (void)ucontext;
+    /* siginfo: si_signo@0, si_errno@4, si_code@8, union@16; si_addr@16 */
+    unsigned long addr = 0;
+    unsigned char *p = (unsigned char *)info;
+    /* best-effort read; the union first member is _sigfault with si_addr */
+    for (int i = 0; i < 8; i++) addr |= ((unsigned long)p[16 + i]) << (8 * i);
+    kv_sig_addr = addr;
+    /* PC from ucontext is layout-dependent; log what we have and exit */
+    kv_outstr("[loader] CRASH sig=");
+    kv_outdec(sig);
+    kv_outstr(" addr=");
+    kv_outhex(addr, 1);
+    kv_outstr("\n");
+    raw_syscall(SYS_exit, 139, 0, 0, 0, 0, 0);
+    for (;;) {}
+}
+
+void kv_install_crash_handler(void) {
+    static struct kv_ksigaction act;
+    memset(&act, 0, sizeof act);
+    act.handler = (unsigned long)kv_sighandler;
+    act.flags = SA_SIGINFO;
+    /* rt_sigaction(signum, act, oldact, sigsetsize=8) */
+    raw_syscall(SYS_rt_sigaction, SIGSEGV, (long)&act, 0, 8, 0, 0);
+    raw_syscall(SYS_rt_sigaction, SIGBUS, (long)&act, 0, 8, 0, 0);
+}
 
 /* ---- dlsym / dlopen ---- */
 /* loader_lookup_export (defined in loader.c) resolves against loaded .so files

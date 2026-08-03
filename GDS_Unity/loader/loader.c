@@ -26,6 +26,7 @@
 void *kv_jni_java_vm(void);
 void *kv_jni_env(void);
 int kv_log_open(const char *path);
+void kv_install_crash_handler(void);
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -345,6 +346,36 @@ static void kv_il_run_entry(void) {
 
 int real_main(int argc, char **argv);
 
+/* ---- TLS setup ----
+ * libunity.so's init_array reads the current thread's stack bounds + stack
+ * guard from thread-local storage via tpidr_el0 (mrs x19, tpidr_el0; then
+ * reads slots).  On the bench this was set up by the harness; on the REAL
+ * device the loader must set up its own TLS block and point tpidr_el0 at it,
+ * because the kernel's initial TLS (intended for glibc) has no thread info.
+ * tpidr_el0 is user-writable, so we do it directly.
+ *
+ * bionic/il2cpp TLS layout (8-byte slots from tpidr_el0):
+ *   slot 1 (off 0x08) thread id
+ *   slot 5 (off 0x28) stack guard magic (GC checks this)
+ *   slot 6 (off 0x30) stack lo
+ *   slot 7 (off 0x38) stack hi
+ */
+static void kv_setup_tls(void) {
+    static char tls[0x100] __attribute__((aligned(16)));
+    /* current stack pointer (stack grows down; main thread stack is below it) */
+    unsigned long sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    unsigned long hi = (sp + 0x400000) & ~0xffffUL;   /* ~4 MB headroom above sp */
+    unsigned long lo = (sp - 0x800000) & ~0xffffUL;   /* ~8 MB below sp */
+    *(unsigned long *)(tls + 0x08) = 1;                          /* thread id */
+    *(unsigned long *)(tls + 0x28) = 0x0BADC0DEDEADBEEFUL;       /* stack guard */
+    *(unsigned long *)(tls + 0x30) = lo;
+    *(unsigned long *)(tls + 0x38) = hi;
+    unsigned long tp = (unsigned long)tls;
+    __asm__ volatile("msr tpidr_el0, %0" :: "r"(tp));
+    printf("[loader] TLS set: tp=%#lx lo=%#lx hi=%#lx\n", tp, lo, hi);
+}
+
 void _start(void) {
     /* Read the aarch64 Linux entry registers before anything can clobber x0/x1.
      * (register-asm locals get spilled to the stack at -O0, so we read x0/x1
@@ -358,6 +389,8 @@ void _start(void) {
      * instead of chasing garbage past the top of the stack.  Without this the
      * IL2CPP GC scan runs off the mapped stack. */
     __asm__ volatile("mov x29, xzr");
+    kv_install_crash_handler();
+    kv_setup_tls();
     real_main((int)argc, argv);
     sys_exit0();   /* stage-1 success path: return cleanly with exit code 0 */
 }
