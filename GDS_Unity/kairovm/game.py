@@ -45,6 +45,8 @@ class Game(object):
         self.app_class = 0
         self.behaviours = []         # (native, managed, class) started
         self.errors = []
+        self._begin_gui = None       # UnityEngine.GUIUtility::BeginGUI
+        self._begin_gui_args = None
 
     # ------------------------------------------------------------- helpers
     def _invoke(self, klass, name, obj, args=(), argc=-1, quiet=False):
@@ -93,6 +95,7 @@ class Game(object):
                 rt.invoke(ctor, obj, [])
             except GuestError as e:
                 print('[game] ctor raised: %s' % e)
+        self.h.build_default_skin()
         print('[game] main.Main instance at %#x' % obj)
         return obj
 
@@ -121,11 +124,51 @@ class Game(object):
         self.pump_coroutines()
         self._invoke(self.app_class, 'LateUpdate', self.app, quiet=True)
         if gui:
-            self._invoke(self.app_class, 'OnGUI', self.app, quiet=True)
+            # Unity brackets every OnGUI callback with a GUI depth of its own;
+            # GUIUtility.CheckOnGUI() reads it before it will draw anything.
+            h.gui_depth += 1
+            try:
+                self.begin_gui()
+                self._invoke(self.app_class, 'OnGUI', self.app, quiet=True)
+            finally:
+                h.gui_depth -= 1
         self.post_frame()
         h.keys_down.clear()
         h.keys_up.clear()
         return h.gl
+
+    def begin_gui(self):
+        """Open an IMGUI frame the way Unity's own player loop does.
+
+        GUI.skin is a static the runtime only fills in from
+        GUIUtility.ResetGlobalState(), which BeginGUI() calls; without it
+        kairo.unity.ui.IApplication.OnGUI dereferences a null skin and gives
+        up before it paints.  useGUILayout is 0 because the engine draws
+        through its own Canvas/Graphics stack, never GUILayout.
+
+        Event.current has to exist first: OnGUI reads it on its first line.
+        """
+        self.h.make_event(self.h.event_type)
+        if self._begin_gui is None:
+            try:
+                k = self.s.cls('UnityEngine.IMGUIModule.dll', 'UnityEngine',
+                               'GUIUtility')
+                self._begin_gui = self.rt.method_from_name(k, 'BeginGUI', 3) or 0
+            except KeyError:
+                self._begin_gui = 0
+        if not self._begin_gui:
+            return
+        if not self._begin_gui_args:
+            # il2cpp_runtime_invoke takes a pointer per value-type argument
+            p = self.m.env.alloc(3 * 8)
+            for i, v in enumerate((0, 1, 0)):   # skinMode, id, useGUILayout
+                self.m.write64(p + i * 8, v)
+            self._begin_gui_args = [p, p + 8, p + 16]
+        try:
+            self.rt.invoke(self._begin_gui, 0, self._begin_gui_args)
+        except GuestError as e:
+            print('[game] BeginGUI raised: %s' % e)
+            self._begin_gui = 0
 
     def post_frame(self):
         """Everything that needs guest calls but cannot run inside a hook."""

@@ -158,6 +158,7 @@ class UnityHost(object):
         self.viewport = (0, 0, width, height)
         self.clears = 0
         self.draw_calls = 0
+        self.gui_depth = 0               # >0 only while OnGUI is running
 
         # input state (set by the front end)
         self.keys = set()
@@ -177,6 +178,22 @@ class UnityHost(object):
         self.resource_requests = []
         self.guistyles = {}
         self.default_skin = 0
+        self.event = 0                   # managed UnityEngine.Event
+        self.event_type = 7              # EventType.Repaint
+        # IMGUI state Unity keeps on the native side of UnityEngine.GUI
+        self.gui_color = (1.0, 1.0, 1.0, 1.0)
+        self.gui_bg_color = (1.0, 1.0, 1.0, 1.0)
+        self.gui_content_color = (1.0, 1.0, 1.0, 1.0)
+        self.gui_enabled = 1
+        self.gui_changed = 0
+        self.hot_control = 0
+        self.keyboard_control = 0
+        self.control_id = 0
+        self.clips = []                  # GUIClip stack
+        self.gui_material = 0
+        self.dta = {}
+        self.f_content_text = 0x10
+        self.f_content_image = 0x18
         self._shader = None
         self._props = {}
         self._prop_names = {}
@@ -301,6 +318,73 @@ class UnityHost(object):
         self._isa[key] = r
         return r
 
+    def build_default_skin(self):
+        """Build the GUISkin that GUI.skin hands out.
+
+        Unity keeps the built-in skin in libunity's builtin_extra resources,
+        which we do not have, and kairo.unity.ui.IApplication.OnGUI bails out
+        with a null dereference the moment GUI.skin comes back null.  The
+        shipped GUISkin constructor is real code, so run it: it allocates the
+        GUISettings and the custom-style array, and the engine only reads
+        .font back off the skin.
+        """
+        if self.default_skin:
+            return self.default_skin
+        k = self.klass.get('UnityEngine.GUISkin')
+        if not k:
+            return 0
+        try:
+            self.rt.runtime_class_init(k)
+            obj = self.rt.call('il2cpp_object_new', k)
+            ctor = self.rt.method_from_name(k, '.ctor', 0)
+            if ctor:
+                self.rt.invoke(ctor, obj, [])
+        except Exception as e:
+            print('[unity] default GUISkin failed: %r' % (e,))
+            return 0
+        self.bind(UObj(self, 'GUISkin', obj, 'default'), obj)
+        self.default_skin = obj
+        if self.verbose:
+            print('[unity] default GUISkin at %#x' % obj)
+        return obj
+
+    def make_event(self, kind=7):
+        """Install Event.current, the way Unity's IMGUI pump does.
+
+        The player loop in libunity fills a native event, hands it to the
+        managed `UnityEngine.Event` singleton and stores it in
+        `Event.s_Current` before every OnGUI callback.  The very first thing
+        kairo.unity.ui.IApplication.OnGUI does is dereference
+        `Event.current`, so with no event installed the whole GUI pass dies
+        on a NullReferenceException and the game never paints.
+
+        Everything here except the native event block is the shipped code:
+        `Event..ctor` and the `Event.current` setter are invoked for real, so
+        `s_Current`/`s_MasterEvent` end up exactly as the engine expects.
+        """
+        self.event_type = kind
+        if self.event:
+            return self.event
+        k = self.klass.get('UnityEngine.Event')
+        if not k:
+            return 0
+        try:
+            self.rt.runtime_class_init(k)
+            obj = self.rt.call('il2cpp_object_new', k)
+            ctor = self.rt.method_from_name(k, '.ctor', 0)
+            if ctor:
+                self.rt.invoke(ctor, obj, [])
+            setter = self.rt.method_from_name(k, 'set_current', 1)
+            if setter:
+                self.rt.invoke(setter, 0, [obj])
+        except Exception as e:
+            print('[unity] Event.current failed: %r' % (e,))
+            return 0
+        self.event = obj
+        if self.verbose:
+            print('[unity] Event.current at %#x (type %d)' % (obj, kind))
+        return obj
+
     def resolve_pending(self):
         """Called from the driver (outside the hook) - guest calls are legal."""
         if not self.pending_types:
@@ -341,7 +425,7 @@ class UnityHost(object):
         for img, names in (('UnityEngine.TextRenderingModule.dll', ('Font',)),
                            ('UnityEngine.AudioModule.dll', ('AudioClip',)),
                            ('UnityEngine.IMGUIModule.dll',
-                            ('GUIStyle', 'GUISkin'))):
+                            ('GUIStyle', 'GUISkin', 'Event'))):
             im = self.s.images.get(img)
             if not im:
                 continue
@@ -364,6 +448,7 @@ class UnityHost(object):
                                   self.klass['String'], 1)
         col = self.klass.get('UnityEngine.Color')
         self.arr_color = rt.call('il2cpp_array_class_get', col, 1) if col else 0
+        self.struct_layout()
         # JNI primitive arrays: descriptor -> (array class, elem size, format)
         self.arrays = {}
         for key, nm, sz, fmt in (('Z', 'Boolean', 1, '<B'), ('B', 'Byte', 1, '<B'),
@@ -568,6 +653,49 @@ class UnityHost(object):
         """byte[] in the managed heap holding `data`."""
         return self.new_array(self.arr_byte, len(data), 1, data)
 
+    def struct_layout(self):
+        """Field offsets the icall handlers read straight out of guest memory.
+
+        Handlers cannot call into the runtime, and these layouts change
+        between Unity versions, so ask the shipped metadata once, here.
+        Offsets are taken relative to the first field, which cancels out the
+        object header IL2CPP folds into value-type field offsets.
+        """
+        rt, m = self.rt, self.m
+
+        def layout(image, ns, name, fields):
+            out = {}
+            img = self.s.images.get(image)
+            k = rt.class_from_name(img, ns, name) if img else 0
+            if not k:
+                return out
+            base = None
+            for f in fields:
+                fi = rt.call('il2cpp_class_get_field_from_name', k,
+                             m.put_cstr(f))
+                if not fi:
+                    continue
+                off = rt.field_offset(fi)
+                if base is None:
+                    base = off
+                out[f] = off - base
+            return out
+
+        # UnityEngine.Graphics::Internal_DrawTexture takes this by reference
+        self.dta = layout('UnityEngine.CoreModule.dll', 'UnityEngine',
+                          'Internal_DrawTextureArguments',
+                          ('screenRect', 'sourceRect', 'leftBorder', 'color',
+                           'pass', 'texture', 'mat')) or {}
+        self.dta.setdefault('screenRect', 0)
+        self.dta.setdefault('sourceRect', 16)
+        self.dta.setdefault('texture', 112)
+        self.dta.setdefault('mat', 120)
+        # GUIContent is a class, so its fields sit after the object header
+        gc = layout('UnityEngine.IMGUIModule.dll', 'UnityEngine', 'GUIContent',
+                    ('m_Text', 'm_Image', 'm_Tooltip'))
+        self.f_content_text = 0x10 + gc.get('m_Text', 0)
+        self.f_content_image = 0x10 + gc.get('m_Image', 8)
+
     def _find_size_offset(self):
         """Byte offset of Il2CppClass::instance_size (differs per version)."""
         rt, m = self.rt, self.m
@@ -653,7 +781,10 @@ class UnityHost(object):
         o = self.by_managed.get(managed)
         if o is not None:
             return o
-        h = self.m.read64(managed + self.f_cached_ptr)
+        try:
+            h = self.m.read64(managed + self.f_cached_ptr)
+        except Exception:
+            return None          # not a managed pointer at all
         return self.objects.get(h)
 
     def obj_or_make(self, managed, kind='Object'):
@@ -750,6 +881,16 @@ class UnityHost(object):
 
     def read_color(self, p):
         return struct.unpack('<ffff', self.m.read(p, 16))
+
+    def content_text(self, guicontent):
+        """Text out of a UnityEngine.GUIContent (layout from struct_layout)."""
+        if not guicontent:
+            return ''
+        try:
+            return self.read_string(
+                self.m.read64(guicontent + self.f_content_text)) or ''
+        except Exception:
+            return ''
 
     def save_prefs(self):
         if self.prefs_path:
@@ -1885,6 +2026,11 @@ def _meshnop(h, this, a):
     return None
 
 
+@icall('UnityEngine.Graphics::Internal_GetMaxDrawMeshInstanceCount()')
+def _maxinstances(h, this, a):
+    return 511
+
+
 @icall('UnityEngine.Graphics::Internal_DrawMeshNow2_Injected(UnityEngine.Mesh,System.Int32,UnityEngine.Matrix4x4&)')
 def _drawmeshnow(h, this, a):
     m = h.obj(a[0])
@@ -1895,9 +2041,14 @@ def _drawmeshnow(h, this, a):
 
 @icall('UnityEngine.Graphics::Internal_DrawTexture(UnityEngine.Internal_DrawTextureArguments&)')
 def _drawtexture(h, this, a):
-    x, y, w, hh = struct.unpack('<ffff', h.m.read(a[0], 16))
-    tex = h.m.read64(a[0] + 16)
-    h.gl.append({'mode': -3, 'rect': (x, y, w, hh), 'tex': h.obj(tex)})
+    """GUI.DrawTexture - the IMGUI blit path, laid out by struct_layout()."""
+    d = h.dta
+    x, y, w, hh = struct.unpack('<ffff', h.m.read(a[0] + d['screenRect'], 16))
+    u0, v0, uw, uh = struct.unpack('<ffff',
+                                   h.m.read(a[0] + d['sourceRect'], 16))
+    tex = h.m.read64(a[0] + d['texture'])
+    h.gl.append({'mode': -3, 'rect': (x, y, w, hh), 'uv': (u0, v0, uw, uh),
+                 'tex': h.obj(tex), 'color': h.gui_color})
     h.draw_calls += 1
 
 
@@ -2038,16 +2189,246 @@ def _guiskin(h, this, a):
     return h.default_skin
 
 
+@icall('UnityEngine.GUIStyle::SetDefaultFont(UnityEngine.Font)',
+       'UnityEngine.GUIUtility::set_guiIsExiting(System.Boolean)',
+       'UnityEngine.GUIUtility::set_mouseUsed(System.Boolean)',
+       'UnityEngine.GUIUtility::set_textFieldInput(System.Boolean)',
+       'UnityEngine.GUIUtility::set_imeCompositionMode(UnityEngine.IMECompositionMode)',
+       'UnityEngine.GUIUtility::set_compositionCursorPos_Injected(UnityEngine.Vector2&)',
+       'UnityEngine.GUIUtility::set_systemCopyBuffer(System.String)',
+       'UnityEngine.GUIUtility::Internal_ExitGUI()',
+       'UnityEngine.GUIUtility::Internal_EndContainer()',
+       'UnityEngine.GUIUtility::SetKeyboardControlToFirstControlId()',
+       'UnityEngine.GUIUtility::SetKeyboardControlToLastControlId()',
+       'UnityEngine.GUI::FocusControl(System.String)',
+       'UnityEngine.GUI::SetNextControlName(System.String)',
+       'UnityEngine.GUI::ReleaseMouseControl()',
+       'UnityEngine.GUI::InternalRepaintEditorWindow()')
+def _guinop(h, this, a):
+    return None
+
+
+# ------------------------------------------------------------ GUI globals
+@icall('UnityEngine.GUI::set_changed(System.Boolean)')
+def _guisetchanged(h, this, a):
+    h.gui_changed = a[0] & 1
+
+
+@icall('UnityEngine.GUI::get_changed()')
+def _guichanged(h, this, a):
+    return h.gui_changed
+
+
+@icall('UnityEngine.GUI::set_enabled(System.Boolean)')
+def _guisetenabled(h, this, a):
+    h.gui_enabled = a[0] & 1
+
+
+@icall('UnityEngine.GUI::get_enabled()')
+def _guienabled(h, this, a):
+    return h.gui_enabled
+
+
+@icall('UnityEngine.GUI::get_usePageScrollbars()')
+def _guipagescroll(h, this, a):
+    return 0
+
+
+@icall('UnityEngine.GUI::set_color_Injected(UnityEngine.Color&)')
+def _guisetcolor(h, this, a):
+    h.gui_color = h.read_color(a[0])
+
+
+@icall('UnityEngine.GUI::set_backgroundColor_Injected(UnityEngine.Color&)')
+def _guisetbg(h, this, a):
+    h.gui_bg_color = h.read_color(a[0])
+
+
+@icall('UnityEngine.GUI::set_contentColor_Injected(UnityEngine.Color&)')
+def _guisetcontent(h, this, a):
+    h.gui_content_color = h.read_color(a[0])
+
+
+@icall('UnityEngine.GUI::get_color_Injected(UnityEngine.Color&)')
+def _guigetcolor(h, this, a):
+    h.m.write(a[0], struct.pack('<4f', *h.gui_color))
+
+
+@icall('UnityEngine.GUI::get_backgroundColor_Injected(UnityEngine.Color&)')
+def _guigetbg(h, this, a):
+    h.m.write(a[0], struct.pack('<4f', *h.gui_bg_color))
+
+
+@icall('UnityEngine.GUI::get_contentColor_Injected(UnityEngine.Color&)')
+def _guigetcontent(h, this, a):
+    h.m.write(a[0], struct.pack('<4f', *h.gui_content_color))
+
+
+@icall('UnityEngine.GUI::get_blendMaterial()',
+       'UnityEngine.GUI::get_blitMaterial()',
+       'UnityEngine.GUI::get_roundedRectMaterial()',
+       'UnityEngine.GUI::get_roundedRectWithColorPerBorderMaterial()')
+def _guimaterial(h, this, a):
+    """The materials Unity blits IMGUI through; one shared stand-in is enough.
+
+    Nothing managed reads anything off them, they are only handed straight
+    back to Graphics.DrawTexture, so the identity is all that matters.
+    """
+    if not h.gui_material:
+        k = h.klass.get('UnityEngine.Material')
+        if not k:
+            return 0
+        h.gui_material = h.alloc_object(k)
+        h.bind(UObj(h, 'Material', h.gui_material, 'GUI blit'),
+               h.gui_material)
+    return h.gui_material
+
+
+@icall('UnityEngine.GUI::GrabMouseControl(System.Int32)',
+       'UnityEngine.GUI::HasMouseControl(System.Int32)',
+       'UnityEngine.GUIUtility::OwnsId(System.Int32)',
+       'UnityEngine.GUIUtility::HasFocusableControls()',
+       'UnityEngine.GUIUtility::CheckForTabEvent(UnityEngine.Event)',
+       'UnityEngine.GUIStyle::IsTooltipActive(System.String)')
+def _guifalse(h, this, a):
+    return 0
+
+
 @icall('UnityEngine.GUIUtility::get_pixelsPerPoint()')
 def _guippp(h, this, a):
     return f32(1.0)
 
 
-@icall('UnityEngine.GUIUtility::Internal_GetHotControl()',
-       'UnityEngine.GUIUtility::Internal_GetKeyboardControl()',
-       'UnityEngine.GUIUtility::get_guiDepth()')
-def _guizero(h, this, a):
+@icall('UnityEngine.GUIUtility::get_compositionString()',
+       'UnityEngine.GUIUtility::get_systemCopyBuffer()')
+def _guiemptystr(h, this, a):
+    return h.new_string('')
+
+
+@icall('UnityEngine.GUIUtility::get_textFieldInput()')
+def _guitextfield(h, this, a):
     return 0
+
+
+@icall('UnityEngine.GUIUtility::Internal_SetHotControl(System.Int32)')
+def _guisethot(h, this, a):
+    h.hot_control = a[0]
+
+
+@icall('UnityEngine.GUIUtility::Internal_SetKeyboardControl(System.Int32)')
+def _guisetkbd(h, this, a):
+    h.keyboard_control = a[0]
+
+
+@icall('UnityEngine.GUIUtility::Internal_GetHotControl()')
+def _guihot(h, this, a):
+    return h.hot_control
+
+
+@icall('UnityEngine.GUIUtility::Internal_GetKeyboardControl()')
+def _guikbd(h, this, a):
+    return h.keyboard_control
+
+
+@icall('UnityEngine.GUIUtility::Internal_GetControlID_Injected(System.Int32,UnityEngine.FocusType,UnityEngine.Rect&)')
+def _guicontrolid(h, this, a):
+    """Hand out the per-pass control ids IMGUI keys its state on.
+
+    Unity derives them from a hash of the call site plus a running counter;
+    all the engine needs is that they are stable within a pass and distinct
+    between controls, which this is.
+    """
+    h.control_id += 1
+    return (a[0] ^ (h.control_id * 0x9E3779B1)) & 0x7FFFFFFF
+
+
+@icall('UnityEngine.GUIUtility::AlignRectToDevice_Injected(UnityEngine.Rect&,System.Int32&,System.Int32&,UnityEngine.Rect&)')
+def _guialignrect(h, this, a):
+    x, y, w, hh = struct.unpack('<4f', h.m.read(a[0], 16))
+    h.m.write32(a[1], max(1, int(round(w))))
+    h.m.write32(a[2], max(1, int(round(hh))))
+    h.m.write(a[3], struct.pack('<4f', float(int(x)), float(int(y)),
+                                float(max(1, int(round(w)))),
+                                float(max(1, int(round(hh))))))
+
+
+@icall('UnityEngine.GUIUtility::BeginContainer(UnityEngine.ObjectGUIState)',
+       'UnityEngine.GUIUtility::BeginContainerFromOwner(UnityEngine.ScriptableObject)')
+def _guibegincontainer(h, this, a):
+    return None
+
+
+# --------------------------------------------------------------- GUIClip
+@icall('UnityEngine.GUIClip::Internal_Push_Injected(UnityEngine.Rect&,UnityEngine.Vector2&,UnityEngine.Vector2&,System.Boolean)')
+def _clippush(h, this, a):
+    """GUI.BeginGroup / BeginScrollView; the stack the engine unwinds later."""
+    rect = struct.unpack('<4f', h.m.read(a[0], 16))
+    scroll = struct.unpack('<2f', h.m.read(a[1], 8))
+    render = struct.unpack('<2f', h.m.read(a[2], 8))
+    h.clips.append((rect, scroll, render, a[3] & 1))
+    h.gl.append({'mode': -5, 'clip': rect, 'scroll': scroll})
+
+
+@icall('UnityEngine.GUIClip::Internal_Pop()')
+def _clippop(h, this, a):
+    if h.clips:
+        h.clips.pop()
+    h.gl.append({'mode': -6})
+
+
+@icall('UnityEngine.GUIClip::Internal_GetCount()')
+def _clipcount(h, this, a):
+    return len(h.clips)
+
+
+@icall('UnityEngine.GUIClip::get_visibleRect_Injected(UnityEngine.Rect&)')
+def _clipvisible(h, this, a):
+    r = h.clips[-1][0] if h.clips else (0.0, 0.0, float(h.width),
+                                        float(h.height))
+    h.m.write(a[0], struct.pack('<4f', 0.0, 0.0, r[2], r[3]))
+
+
+@icall('UnityEngine.GUIClip::GetMatrix_Injected(UnityEngine.Matrix4x4&)')
+def _clipmatrix(h, this, a):
+    h.m.write(a[0], struct.pack('<16f', 1, 0, 0, 0, 0, 1, 0, 0,
+                                0, 0, 1, 0, 0, 0, 0, 1))
+
+
+@icall('UnityEngine.GUIClip::SetMatrix_Injected(UnityEngine.Matrix4x4&)',
+       'UnityEngine.GUIClip::Internal_PushParentClip_Injected(UnityEngine.Matrix4x4&,UnityEngine.Matrix4x4&,UnityEngine.Rect&)',
+       'UnityEngine.GUIClip::Internal_PopParentClip()')
+def _clipnop(h, this, a):
+    return None
+
+
+@icall('UnityEngine.GUIClip::UnclipToWindow_Vector2_Injected(UnityEngine.Vector2&,UnityEngine.Vector2&)')
+def _clipunclip(h, this, a):
+    x, y = struct.unpack('<2f', h.m.read(a[0], 8))
+    for rect, scroll, render, _r in h.clips:
+        x += rect[0] - scroll[0]
+        y += rect[1] - scroll[1]
+    h.write_vec2(a[1], x, y)
+
+
+@icall('UnityEngine.GUIUtility::get_guiDepth()')
+def _guidepth(h, this, a):
+    """GUIUtility.CheckOnGUI() refuses to draw unless this is positive.
+
+    Unity's own player loop bumps it around every OnGUI callback; the driver
+    does the same, so the engine's IMGUI painting runs instead of throwing
+    "You can only call GUI functions from inside OnGUI".
+    """
+    return h.gui_depth
+
+
+@icall('UnityEngine.ScriptableObject::CreateScriptableObject(UnityEngine.ScriptableObject)')
+def _scriptableobject(h, this, a):
+    """Give a ScriptableObject a native side, so Object.op_Equality sees it."""
+    o = h.obj(a[0])
+    if o is None and a[0]:
+        o = UObj(h, 'ScriptableObject', a[0], h.class_name(a[0]))
+        h.bind(o, a[0])
+    return None
 
 
 @icall('UnityEngine.GUIStyle::Internal_Create(UnityEngine.GUIStyle)')
@@ -2091,7 +2472,119 @@ def _guisetfontsize(h, this, a):
 
 @icall('UnityEngine.GUIStyle::get_alignment()')
 def _guialign(h, this, a):
-    return 0
+    o = h.objects.get(this)
+    return o.data.get('alignment', 0) if o else 0
+
+
+@icall('UnityEngine.GUIStyle::set_alignment(UnityEngine.TextAnchor)')
+def _guisetalign(h, this, a):
+    o = h.objects.get(this)
+    if o:
+        o.data['alignment'] = a[0]
+
+
+@icall('UnityEngine.GUIStyle::get_fontStyle()')
+def _guifontstyle(h, this, a):
+    o = h.objects.get(this)
+    return o.data.get('fontStyle', 0) if o else 0
+
+
+@icall('UnityEngine.GUIStyle::set_fontStyle(UnityEngine.FontStyle)')
+def _guisetfontstyle(h, this, a):
+    o = h.objects.get(this)
+    if o:
+        o.data['fontStyle'] = a[0]
+
+
+@icall('UnityEngine.GUIStyle::get_imagePosition()')
+def _guiimagepos(h, this, a):
+    o = h.objects.get(this)
+    return o.data.get('imagePosition', 0) if o else 0
+
+
+@icall('UnityEngine.GUIStyle::get_wordWrap()')
+def _guiwordwrap(h, this, a):
+    o = h.objects.get(this)
+    return o.data.get('wordWrap', 0) if o else 0
+
+
+@icall('UnityEngine.GUIStyle::get_stretchWidth()',
+       'UnityEngine.GUIStyle::get_stretchHeight()')
+def _guistretch(h, this, a):
+    return 1
+
+
+@icall('UnityEngine.GUIStyle::set_stretchWidth(System.Boolean)',
+       'UnityEngine.GUIStyle::set_stretchHeight(System.Boolean)',
+       'UnityEngine.GUIStyle::set_contentOffset_Injected(UnityEngine.Vector2&)',
+       'UnityEngine.GUIStyle::set_Internal_clipOffset_Injected(UnityEngine.Vector2&)',
+       'UnityEngine.GUIStyle::AssignStyleState(System.Int32,System.IntPtr)',
+       'UnityEngine.GUIStyle::Internal_Destroy(System.IntPtr)',
+       'UnityEngine.GUIStyle::SetMouseTooltip_Injected(System.String,UnityEngine.Rect&)')
+def _guistylenop(h, this, a):
+    return None
+
+
+@icall('UnityEngine.GUIStyle::get_fixedWidth()',
+       'UnityEngine.GUIStyle::get_fixedHeight()',
+       'UnityEngine.GUIStyle::Internal_GetCursorFlashOffset()')
+def _guistylezerof(h, this, a):
+    return f32(0.0)
+
+
+@icall('UnityEngine.GUIStyle::get_contentOffset_Injected(UnityEngine.Vector2&)')
+def _guicontentoffset(h, this, a):
+    h.write_vec2(a[0], 0.0, 0.0)
+
+
+@icall('UnityEngine.GUIStyle::get_rawName()')
+def _guirawname(h, this, a):
+    o = h.objects.get(this)
+    return h.new_string(o.data.get('name', '') if o else '')
+
+
+@icall('UnityEngine.GUIStyle::set_rawName(System.String)')
+def _guisetrawname(h, this, a):
+    o = h.objects.get(this)
+    if o:
+        o.data['name'] = h.read_string(a[0]) or ''
+
+
+@icall('UnityEngine.GUIStyle::Internal_Copy(UnityEngine.GUIStyle,UnityEngine.GUIStyle)')
+def _guistylecopy(h, this, a):
+    src = h.guistyles.get(a[1])
+    dst = h.guistyles.get(a[0])
+    if src is not None and dst is not None:
+        for k, v in src.data.items():
+            if not k.startswith('state'):
+                dst.data[k] = v
+
+
+@icall('UnityEngine.GUIStyle::Internal_Draw_Injected(UnityEngine.Rect&,UnityEngine.GUIContent,System.Boolean,System.Boolean,System.Boolean,System.Boolean)',
+       'UnityEngine.GUIStyle::Internal_Draw2_Injected(UnityEngine.Rect&,UnityEngine.GUIContent,System.Int32,System.Boolean)')
+def _guistyledraw(h, this, a):
+    """Record the IMGUI text/box draws the engine asks the native side for.
+
+    Unity rasterises these inside libunity with its own font atlas.  The
+    Kairosoft engine paints everything it actually shows through its own
+    Canvas -> Graphics -> DrawMeshNow path, so the batch is captured here as
+    a text primitive rather than dropped, and the front end can lay it out.
+    """
+    o = h.objects.get(this)
+    h.gl.append({'mode': -4,
+                 'rect': struct.unpack('<4f', h.m.read(a[0], 16)),
+                 'text': h.content_text(a[1]),
+                 'color': h.gui_content_color,
+                 'font_size': (o.data.get('fontSize', 12) if o else 12),
+                 'alignment': (o.data.get('alignment', 0) if o else 0)})
+    h.draw_calls += 1
+
+
+@icall('UnityEngine.GUIStyle::Internal_CalcHeight(UnityEngine.GUIContent,System.Single)')
+def _guicalcheight(h, this, a):
+    o = h.objects.get(this)
+    size = o.data.get('fontSize', 12) if o else 12
+    return f32(float(size + 4))
 
 
 @icall('UnityEngine.GUIStyle::get_font()')
@@ -2110,7 +2603,18 @@ def _guisetfont(h, this, a):
 @icall('UnityEngine.GUIStyle::Internal_CalcSize_Injected(UnityEngine.GUIContent,UnityEngine.Vector2&)',
        'UnityEngine.GUIStyle::Internal_CalcMinMaxWidth_Injected(UnityEngine.GUIContent,UnityEngine.Vector2&)')
 def _guicalcsize(h, this, a):
-    h.write_vec2(a[1], 8.0, 12.0)
+    o = h.objects.get(this)
+    size = o.data.get('fontSize', 12) if o else 12
+    n = len(h.content_text(a[0]) or '')
+    h.write_vec2(a[1], n * size * 0.55, float(size + 4))
+
+
+@icall('UnityEngine.GUIStyle::Internal_CalcSizeWithConstraints_Injected(UnityEngine.GUIContent,UnityEngine.Vector2&,UnityEngine.Vector2&)')
+def _guicalcsizecon(h, this, a):
+    o = h.objects.get(this)
+    size = o.data.get('fontSize', 12) if o else 12
+    n = len(h.content_text(a[0]) or '')
+    h.write_vec2(a[2], n * size * 0.55, float(size + 4))
 
 
 @icall('UnityEngine.GUIStyle::Internal_GetLineHeight(System.IntPtr)')
@@ -2154,9 +2658,38 @@ def _eventnop(h, this, a):
     return None
 
 
-@icall('UnityEngine.Event::get_type()', 'UnityEngine.Event::get_rawType()')
+@icall('UnityEngine.Event::get_type()', 'UnityEngine.Event::get_rawType()',
+       'UnityEngine.Event::GetTypeForControl(System.Int32)')
 def _eventtype(h, this, a):
-    return 7                     # EventType.Repaint
+    """EventType of the event the driver pushed for this OnGUI pass."""
+    return h.event_type
+
+
+@icall('UnityEngine.Event::get_button()',
+       'UnityEngine.Event::get_clickCount()',
+       'UnityEngine.Event::get_modifiers()',
+       'UnityEngine.Event::get_keyCode()',
+       'UnityEngine.Event::get_character()',
+       'UnityEngine.Event::get_displayIndex()')
+def _eventzero(h, this, a):
+    return 0
+
+
+@icall('UnityEngine.Event::get_mousePosition_Injected(UnityEngine.Vector2&)')
+def _eventmouse(h, this, a):
+    """IMGUI space: y grows downward from the top of the window."""
+    if a[0]:
+        h.m.write(a[0], struct.pack('<ff', float(h.mouse[0]),
+                                    float(h.height - h.mouse[1])))
+    return None
+
+
+@icall('UnityEngine.Event::get_delta_Injected(UnityEngine.Vector2&)',
+       'UnityEngine.Event::get_tilt_Injected(UnityEngine.Vector2&)')
+def _eventdelta(h, this, a):
+    if a[0]:
+        h.m.write(a[0], b'\0' * 8)
+    return None
 
 
 @icall('UnityEngine.Event::PopEvent(UnityEngine.Event)')

@@ -231,6 +231,9 @@ def build(apk_root, pkg=DEFAULT_PKG, verbose=0, echo_log=True, trace=False):
         os.symlink(os.path.abspath(apk_root), apk_mount)
     files_dir = os.path.join(rootfs, 'data/data', pkg, 'files')
     os.makedirs(files_dir, exist_ok=True)
+    # mono probes the temp dir for case sensitivity on first use, and the
+    # runtime writes its unwind/AOT scratch there, so it has to exist
+    os.makedirs(os.path.join(rootfs, 'data/data', pkg, 'cache'), exist_ok=True)
 
     host = Bionic(m, rootfs, cwd='/')          # Android starts a process at /
     host.log_echo = echo_log
