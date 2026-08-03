@@ -341,3 +341,39 @@ natively and correctly.
   (not on main) - recover with
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
+
+## LATEST STATUS (build 0.5.0) - Unity player-loop boot
+
+The loader now boots the real game correctly up to Unity's **graphics
+initialization** (`nativeRecreateGfxState`), verified on-device:
+- all 3 libs load, all init ctors run
+- all 3 JNI_OnLoads fire
+- initJni runs (boot.config, AssetManager, jnibridge)
+- nativeRecreateGfxState is reached, then crashes
+
+Crash: SIGSEGV at `pc=0x60000000 addr=0x0` during nativeRecreateGfxState.
+The bench crashes at a DIFFERENT site (write to 0 at libunity+0x5ccb38, no GPU),
+so the device PC read via ucontext may be off OR it's a genuine jump to a bad
+function pointer.  The graphics layer needs the real Mali GPU (libEGL/libGLESv2).
+
+### The architectural wall
+terraria-nextos (which runs a full Unity game on this exact R36S) uses a
+**glibc+SDL2 loader**: it dlopen's libEGL.so/libGLESv2.so RTLD_GLOBAL, creates a
+real GL context via SDL, and its eglGetProcAddress/glGetString return real GPU
+function pointers.  My loader is **freestanding** (no glibc/SDL), stubs EGL/GL
+to placeholders, and can't load real GPU drivers -> nativeRecreateGfxState can't
+get a real context.
+
+### Two ways forward
+1. **Freestanding GL shims** (current): keep iterating on the crash via device
+   logs.  The crash is deep in graphics init; progress is slow and the bench
+   can't validate GPU.
+2. **glibc+SDL loader** (terraria's proven path): rewrite the loader to link
+   glibc+SDL2, dlopen real libEGL/libGLESv2 on the device, and drive the real GL
+   context.  Requires building SDL2 for aarch64 (source downloaded) and porting
+   terraria's so_util/jni_shim/egl_shim architecture.  This is the only path to
+   actual on-screen rendering.  Large effort but proven to work on this device.
+
+### Deploy (works, version-checked)
+    curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+Expect `[loader] build: 0.5.0` in the log (stale-zip guard aborts otherwise).
