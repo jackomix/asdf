@@ -382,6 +382,15 @@ curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-as
 Expect `[loader] build: 0.7.0-glibc`, then `[egl] GL_VENDOR/RENDERER/VERSION`
 proving the Mali driver is behind the context, then graphics init to proceed.
 
+> **GOTCHA (fixed in 0.7.0):** the glibc build must NOT call `msr tpidr_el0` to
+> set up a fake bionic TLS block.  That hack belonged to the freestanding
+> loader.  Now that we link glibc, clobbering tpidr_el0 destroys glibc's own
+> TLS (errno/stdio/locale/stack-protector), so the next glibc call jumps to
+> `pc=0x0` before the banner even prints.  We keep glibc's TLS.  If libunity's
+> init_array later needs the bionic thread-info slots (thread id @+0x08, stack
+> guard @+0x28, stack lo/hi @+0x30/+0x38), replicate terraria-nextos's TLS
+> guard-pad layout instead of overwriting the register.
+
 ### Deploy (works, version-checked)
     curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 Expect `[loader] build: 0.7.0-glibc` in the log (stale-zip guard aborts otherwise).
