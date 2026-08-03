@@ -436,19 +436,15 @@ int real_main(int argc, char **argv);
  *   slot 7 (off 0x38) stack hi
  */
 static void kv_setup_tls(void) {
-    static char tls[0x100] __attribute__((aligned(16)));
-    /* current stack pointer (stack grows down; main thread stack is below it) */
-    unsigned long sp;
-    __asm__ volatile("mov %0, sp" : "=r"(sp));
-    unsigned long hi = (sp + 0x400000) & ~0xffffUL;   /* ~4 MB headroom above sp */
-    unsigned long lo = (sp - 0x800000) & ~0xffffUL;   /* ~8 MB below sp */
-    *(unsigned long *)(tls + 0x08) = 1;                          /* thread id */
-    *(unsigned long *)(tls + 0x28) = 0x0BADC0DEDEADBEEFUL;       /* stack guard */
-    *(unsigned long *)(tls + 0x30) = lo;
-    *(unsigned long *)(tls + 0x38) = hi;
-    unsigned long tp = (unsigned long)tls;
-    __asm__ volatile("msr tpidr_el0, %0" :: "r"(tp));
-    printf("[loader] TLS set: tp=%#lx lo=%#lx hi=%#lx\n", tp, lo, hi);
+    /* The freestanding loader had to synthesize a bionic-style TLS block and
+     * point tpidr_el0 at it via `msr`, because there was no libc.  This glibc
+     * build MUST NOT do that: glibc owns tpidr_el0 (errno, stdio, locale,
+     * stack-protector, thread-local storage all hang off it).  Clobbering it
+     * breaks the very next glibc call (jumps to pc=0).  Keep glibc's TLS.
+     * (libunity's init_array reads bionic thread-info slots off tpidr_el0; if
+     * that becomes a problem, replicate terraria-nextos's TLS guard-pad layout
+     * instead of overwriting the register.) */
+    printf("[loader] using glibc TLS (tpidr_el0 owned by glibc)\n");
 }
 
 void kv_egl_dlopen(void);   /* glibc_shims.c: load real Mali GPU drivers */
