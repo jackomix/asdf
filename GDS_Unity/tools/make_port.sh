@@ -11,11 +11,11 @@ cd "$here"
 
 APKROOT="${1:-$here/out/apk}"
 [ -d "$APKROOT/lib/arm64-v8a" ] || { echo "missing $APKROOT/lib/arm64-v8a - run tools/extract_apk.sh first"; exit 1; }
-[ -f loader/loader2 ] || { echo "missing loader/loader2 - run bash loader/build.sh first"; exit 1; }
+[ -f loader/loader2_glibc ] || { echo "missing loader/loader2_glibc - run bash loader/build_glibc.sh first"; exit 1; }
 
 PD="ports/gamedevstory/gamedevstory"
 mkdir -p "$PD/licenses"
-cp loader/loader2 "$PD/loader2"
+cp loader/loader2_glibc "$PD/loader2"
 cp "$APKROOT/lib/arm64-v8a/libil2cpp.so" \
    "$APKROOT/lib/arm64-v8a/libunity.so" \
    "$APKROOT/lib/arm64-v8a/libmain.so" "$PD/"

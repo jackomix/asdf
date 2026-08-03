@@ -23,7 +23,7 @@
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.6.0-glibc"
+#define GDS_BUILD_VERSION "0.7.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -134,7 +134,16 @@ void *loader_lookup_export(const char *wanted) {
     return 0;
 }
 
+void *kv_egl_route(const char *name);   /* egl_shim.c: surface symbols -> shim */
 static void *resolve(const char *sym) {
+    /* The EGL/ANativeWindow/sensor/looper surface libunity imports must bind to
+     * our SDL-backed shim (egl_shim.c), NOT to dlsym: glibc has no EGL and the
+     * real libEGL (dlopen'd RTLD_GLOBAL) wants an Android ANativeWindow, which
+     * doesn't exist here.  The shim turns those calls into real SDL2 GL ops. */
+    if (sym) {
+        void *r = kv_egl_route(sym);
+        if (r) return r;
+    }
     return dlsym(0, sym);
 }
 
@@ -355,6 +364,8 @@ static void kv_il_run_entry(void) {
  * call initJni then loop nativeRender.  This drives the whole engine (including
  * il2cpp init internally) instead of calling il2cpp_init directly, which hits
  * uninitialized globals. */
+void egl_shim_create_window(void);   /* egl_shim.c */
+int egl_shim_ensure_current(void);
 static void kv_unity_boot(void) {
     void *env = kv_jni_env();
     /* Give Unity real, zeroed thiz/ctx/surf objects instead of tiny fake
@@ -367,6 +378,15 @@ static void kv_unity_boot(void) {
     void *thizp = thiz;
     unsigned char (*render)(void *, void *) = (unsigned char (*)(void *, void *))kv_jni_find_native("nativeRender");
     if (!render) { printf("[unity] no nativeRender registered - cannot drive player loop\n"); return; }
+
+    /* THE fix for nativeRecreateGfxState (the graphics-init wall): per
+     * terraria-nextos, create the REAL SDL2 window + GLES2 context and make it
+     * current BEFORE Unity's graphics init runs, and route libunity's
+     * egl + ANativeWindow imports to that real context.  Without a current GL
+     * context Unity's graphics init derefs garbage and SIGSEGVs. */
+    egl_shim_create_window();
+    egl_shim_ensure_current();
+
     void *fn;
     if ((fn = kv_jni_find_native("initJni"))) {
         printf("[unity] initJni...\n");
