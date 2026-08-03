@@ -438,8 +438,30 @@ int pthread_kill(kv_pthread_t t, int s) { (void)t;(void)s; return 0; }
 int pthread_atfork(void (*a)(void), void (*b)(void), void (*c)(void)) { (void)a;(void)b;(void)c; return 0; }
 int pthread_attr_init(void *a) { (void)a; return 0; }
 int pthread_attr_destroy(void *a) { (void)a; return 0; }
-int pthread_attr_getstack(void *a, void **s, void **sz) { (void)a;(void)s;(void)sz; return 0; }
-int pthread_getattr_np(kv_pthread_t t, void *a) { (void)t;(void)a; return 0; }
+/* The main thread's stack bounds live in the TLS block (slots 6/7), which the
+ * bench sets from the real stack region.  Return them so the IL2CPP GC's stack
+ * scan stays within the mapped stack instead of walking off the end. */
+static void kv_get_main_stack(unsigned long *lo, unsigned long *hi) {
+    unsigned long tls = 0;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
+    if (tls) {
+        *lo = *(volatile unsigned long *)(tls + 48);
+        *hi = *(volatile unsigned long *)(tls + 56);
+        return;
+    }
+    *lo = 0; *hi = 0;
+}
+int pthread_attr_getstack(void *a, void **s, void **sz) {
+    (void)a;
+    unsigned long lo, hi; kv_get_main_stack(&lo, &hi);
+    if (s) *s = (void *)(uintptr_t)lo;
+    if (sz) *sz = (void *)(uintptr_t)(hi - lo);
+    return 0;
+}
+int pthread_getattr_np(kv_pthread_t t, void *a) {
+    (void)t; (void)a;
+    return 0;
+}
 int pthread_setname_np(kv_pthread_t t, const char *n) { (void)t;(void)n; return 0; }
 int pthread_rwlock_rdlock(void *l) { (void)l; return 0; }
 int pthread_rwlock_wrlock(void *l) { (void)l; return 0; }

@@ -330,6 +330,11 @@ void _start(void) {
     char **argv;
     __asm__ volatile("mov %0, x0" : "=r"(argc));
     __asm__ volatile("mov %0, x1" : "=r"(argv));
+    /* Terminate the frame-pointer chain: glibc's _start zeroes x29 so that a
+     * GC stack-walk (which follows saved x29/frame records) stops at NULL
+     * instead of chasing garbage past the top of the stack.  Without this the
+     * IL2CPP GC scan runs off the mapped stack. */
+    __asm__ volatile("mov x29, xzr");
     real_main((int)argc, argv);
     sys_exit0();   /* stage-1 success path: return cleanly with exit code 0 */
 }

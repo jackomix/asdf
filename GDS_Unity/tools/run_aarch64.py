@@ -73,7 +73,10 @@ def load(path, argv):
     entry = BASE + (e_entry - minv)    # == e_entry
 
     # Stack
-    uc.mem_map(STACK_TOP - STACK_SZ, STACK_SZ + 0x20000, 3)  # +128 KB headroom above top (guard/red-zone reads)
+    # Map a large flat region covering the stack plus generous headroom above.
+    # The IL2CPP GC scans a window above the stack top (up to ~4 MB past the
+    # entry SP), so the whole scan range must stay mapped.
+    uc.mem_map(STACK_TOP - STACK_SZ, 0x5000000, 3)  # ~80 MB covering stack + headroom
     sp = STACK_TOP
     # Build argv strings at the very top of the stack region.
     arg_bytes = []
@@ -111,9 +114,23 @@ def load(path, argv):
     # pointer).  The real kernel sets it per-thread; libunity.so's init_array
     # does `mrs x19, tpidr_el0; ldr x10, [x19, #0x28]`, so if it's 0 the first
     # TLS access faults.  Map a zeroed TLS block and point tpidr_el0 at it.
-    tls_base = 0x7f7e0000  # just below the 8 MB stack region (0x7f7f0000..)
+    # TLS block that libil2cpp's GC uses to find the current thread's stack
+    # bounds.  bionic arm64 TLS layout (offsets in 8-byte slots):
+    #   slot 1  = thread id
+    #   slot 5  = stack guard (magic the GC checks)
+    # We also store the stack base (lo) and size so pthread_attr_getstack /
+    # pthread_getattr_np (which we stub) can return real bounds, letting the
+    # GC's stack scan stay within the mapped region instead of walking off it.
+    tls_base = 0x7f7e0000  # just below the stack region
     uc.mem_map(tls_base, 0x10000, 7)
+    uc.mem_write(tls_base, struct.pack('<Q', 0))          # slot 0
+    uc.mem_write(tls_base + 8, struct.pack('<Q', 1))      # slot 1: thread id
+    uc.mem_write(tls_base + 40, struct.pack('<Q', 0x0BADC0DEDEADBEEF))  # slot 5: stack guard
+    # slot 6/7: stack lo, stack hi (so thread stack lookup works)
+    uc.mem_write(tls_base + 48, struct.pack('<Q', STACK_TOP - STACK_SZ))
+    uc.mem_write(tls_base + 56, struct.pack('<Q', STACK_TOP))
     uc.reg_write(UC_ARM64_REG_TPIDR_EL0, tls_base)
+    uc._tls_base = tls_base
 
     return uc, entry, minv, maxv, BASE, span, len(argv), argv_ptr
 
