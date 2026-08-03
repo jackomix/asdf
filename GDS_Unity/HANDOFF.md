@@ -342,7 +342,27 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.9.0-glibc) - game boots player loop; GL context missing -> fix rendering
+## LATEST STATUS (build 0.10.0-glibc) - point SDL at the Mali EGL driver
+
+0.9.0 confirmed the game boots fully into the player loop and SDL_Init(VIDEO)
+works (KMSDRM).  Only remaining blocker: SDL_CreateWindow still couldn't load
+EGL/GL -> no context -> no frames.
+
+Device library inspection found the root cause: on this ArkOS device
+`libEGL.so -> libMali.so` (Mali G31 gbm driver) but `libEGL.so.1 ->
+libEGL.so.1.1.0` (a standalone non-Mali EGL).  SDL's KMSDRM backend dlopens
+`libEGL.so.1` by default -> wrong/stub EGL -> "Can't load EGL/GL library."
+
+Fix (0.10.0):
+- launcher sets `SDL_VIDEO_EGL_DRIVER=libEGL.so` and `SDL_VIDEO_GL_DRIVER=libGLESv2.so`
+  so SDL loads the Mali driver, and
+- kv_egl_dlopen dlopens `libmali.so`/`libEGL.so` (Mali) RTLD_GLOBAL (was loading
+  the standalone libEGL.so.1).
+
+Expected next log: `[egl] SDL video driver = KMSDRM`, `[egl] GL_VENDOR=ARM ...`
+`GL_RENDERER=... Mali-G31 ...`, `window ... context ready (ES2)`, then real frames.
+
+### Prior: 0.9.0 - game boots player loop; GL context missing -> fix rendering
 
 0.8.0's bionic bridge + TLS guard pad WORKED on-device:
 - libil2cpp init_array ran (24 ctors) — no more "malloc(): invalid size"

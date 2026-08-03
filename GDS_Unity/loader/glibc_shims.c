@@ -111,15 +111,20 @@ void _ZTH15gDeferredAction(void) {}
  * so Unity resolves eglGetProcAddress/glGetString to the real driver. --- */
 #include <dlfcn.h>
 void kv_egl_dlopen(void) {
-    /* libz.so: libunity.so needs inflate/inflateInit2_/inflateEnd (its NEEDED
-     * list includes libz.so), and resolve() falls back to dlsym(RTLD_DEFAULT) -
-     * so libz must be loaded globally for those relocations to resolve. */
+    /* On ArkOS the Mali G31 driver is at libMali.so (gbm variant) with
+     * libEGL.so / libGLESv2.so / libgbm.so -> libMali.so.  The .so.1 names can
+     * point at a standalone non-Mali EGL, so load the Mali-named libs
+     * RTLD_GLOBAL first; dlopen-ing libMali puts egl and gl entry points in
+     * the global namespace for both our shim and SDL's eglGetProcAddress.
+     * libz too: libunity.so needs inflate/inflateInit2_/inflateEnd. */
+    void *m = dlopen("libmali.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!m) m = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!m) m = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+    void *g = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!g) g = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
     void *z = dlopen("libz.so.1", RTLD_NOW | RTLD_GLOBAL);
     if (!z) z = dlopen("libz.so", RTLD_NOW | RTLD_GLOBAL);
-    void *g = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
-    if (!g) dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
-    void *e = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
-    if (!e) dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
     void *s = dlopen("libSDL2.so.0", RTLD_NOW | RTLD_GLOBAL);
-    if (!s) dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!s) s = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!m) printf("[egl] WARNING: could not dlopen libmali.so/libEGL.so\n");
 }

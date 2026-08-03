@@ -57,6 +57,14 @@ firmware_libs="/usr/local/lib/aarch64-linux-gnu:/usr/local/lib:/usr/lib/aarch64-
 export LD_LIBRARY_PATH="$firmware_libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TER_GAMEDIR="$GAMEDIR"
 
+# --- Point SDL's KMSDRM backend at the REAL Mali EGL driver ---
+# On this ArkOS device libEGL.so -> libMali.so (the Mali G31 driver, gbm variant),
+# but libEGL.so.1 -> libEGL.so.1.1.0 (a standalone non-Mali EGL).  SDL's KMSDRM
+# video backend dlopens "libEGL.so.1" by default -> "Can't load EGL/GL library".
+# SDL_VIDEO_EGL_DRIVER forces it to load the Mali one so the GL context is real.
+export SDL_VIDEO_EGL_DRIVER="${SDL_VIDEO_EGL_DRIVER:-libEGL.so}"
+export SDL_VIDEO_GL_DRIVER="${SDL_VIDEO_GL_DRIVER:-libGLESv2.so}"
+
 # --- Run the game.  loader2 self-logs to loader.log next to itself. ---
 cd "$GAMEDIR" || { echo "cannot cd $GAMEDIR" >> "$LOG"; exit 1; }
 
