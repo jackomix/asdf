@@ -89,8 +89,10 @@ def load(path, argv):
         uc.mem_write(p, b)
         str_ptrs.append(p)
     str_ptrs = str_ptrs[::-1]
-    # argc, argv[], NULL, envp NULL
-    sp = (STACK_TOP - 256) & ~(0xf)
+    # argc, argv[], NULL, envp NULL.  Leave lots of room: argv strings are
+    # placed just below STACK_TOP and grow downward, so if they overflow the
+    # argv-array region they'd corrupt the pointers.  Reserve 4 KB.
+    sp = (STACK_TOP - 4096) & ~(0xf)
     uc.mem_write(sp, struct.pack('<Q', len(argv)))
     ap = sp + 8
     for ptr in str_ptrs:

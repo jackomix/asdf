@@ -112,6 +112,17 @@ static void *module_export(Module *m, const char *wanted) {
     return 0;
 }
 
+/* Look up a DEFINED dynamic symbol across ALL loaded modules.  This is what
+ * dlopen/dlsym need so libmain.so's JNI_OnLoad can dlsym into libunity.so /
+ * libil2cpp.so the way Android's linker would. */
+void *loader_lookup_export(const char *wanted) {
+    for (Module *m = g_modules; m; m = m->next) {
+        void *p = module_export(m, wanted);
+        if (p) return p;
+    }
+    return 0;
+}
+
 static void *resolve(const char *sym) {
     return dlsym(0, sym);
 }

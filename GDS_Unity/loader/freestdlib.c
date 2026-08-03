@@ -371,6 +371,17 @@ int sem_wait(void *s) { (void)s; return 0; }
 int sem_timedwait(void *s, void *t) { (void)s;(void)t; return 0; }
 int sem_getvalue(void *s, int *v) { (void)s; if (v) *v = 0; return 0; }
 
-/* ---- dlsym against the host symbol table (host_syms.c) ---- */
-void *dlsym(void *handle, const char *name) { (void)handle; return host_dlsym(name); }
-void *dlopen(const char *name, int flags) { (void)name; (void)flags; return (void *)1; }
+/* ---- dlsym / dlopen ---- */
+/* loader_lookup_export (defined in loader.c) resolves against loaded .so files
+ * so libmain's JNI_OnLoad can find libunity/libil2cpp symbols via dlsym. */
+void *loader_lookup_export(const char *wanted);
+void *dlsym(void *handle, const char *name) {
+    (void)handle;
+    /* 1) our own freestanding libc, 2) any loaded .so export (libunity etc.) */
+    void *p = host_dlsym(name);
+    if (p) return p;
+    return loader_lookup_export(name);
+}
+void *dlopen(const char *name, int flags) {
+    (void)name; (void)flags; return (void *)1; /* always "succeeds" */
+}
