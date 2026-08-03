@@ -26,8 +26,20 @@ PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fc860-asdf}"
 TIMEOUT="${GDS_SSH_TIMEOUT:-25}"
 XFER_TIMEOUT="${GDS_XFER_TIMEOUT:-300}"
+# Optional SSH private key, e.g. GDS_SSH_KEY="$HOME/.ssh/id_ed25519_antigravity".
+# If set, the script uses it (passwordless, no prompts).  If unset, scp/ssh
+# will prompt for the R36S password normally.
+SSH_KEY="${GDS_SSH_KEY:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
+
+# SSH options: tolerant of ArkOS host-key changes.  If an SSH key is set it's
+# used (no prompts); otherwise normal password auth is left enabled.
+if [ -n "$SSH_KEY" ]; then
+  SSHOPTS=(-i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=5 -o BatchMode=yes)
+else
+  SSHOPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=5)
+fi
 
 # ---- pretty helpers (color if tty) ----
 if [ -t 1 ]; then C_GREEN=$'\e[32m'; C_CYAN=$'\e[36m'; C_YEL=$'\e[33m'; C_RED=$'\e[31m'; C_DIM=$'\e[2m'; C_BOLD=$'\e[1m'; C_RST=$'\e[0m'; else C_GREEN= C_CYAN= C_YEL= C_RED= C_DIM= C_BOLD= C_RST=; fi
@@ -112,9 +124,30 @@ if [ "$alive" != "1" ]; then
 fi
 ok "Device is online and reachable"
 
-# SSH options used by later steps: NOT BatchMode (so password login works),
-# but tolerant of ArkOS host-key changes.
-SSHOPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=5)
+# ---- 1b. SSH login check (catches auth problems that TCP won't) ----
+step "Checking SSH login: $HOST"
+if [ -n "$SSH_KEY" ]; then
+  # key auth: must succeed non-interactively
+  if ! timeout "$TIMEOUT" ssh "${SSHOPTS[@]}" "$HOST" 'echo ok' >/dev/null 2>&1; then
+    fail "SSH key auth failed with key '$SSH_KEY'."
+    echo "  Check that the key exists and is authorized on the R36S:"
+    echo "    ssh-copy-id -i $SSH_KEY $HOST"
+    echo "  (or set GDS_SSH_KEY to the correct private key path.)"
+    exit 1
+  fi
+else
+  # password auth: test it.  This may prompt for the R36S password once.
+  if ! timeout "$TIMEOUT" ssh "${SSHOPTS[@]}" "$HOST" 'echo ok'; then
+    fail "SSH login failed (password auth)."
+    echo "  The R36S is reachable but login failed. Likely causes:"
+    echo "    • Wrong password / user (tried '$HOST')"
+    echo "    • SSH key needed - set GDS_SSH_KEY=~/.ssh/<yourkey>"
+    echo "  To set up passwordless login once:"
+    echo "    ssh-copy-id $HOST   # then re-run with GDS_SSH_KEY=~/.ssh/id_ed25519"
+    exit 1
+  fi
+fi
+ok "SSH login works"
 
 # ---- 2. get the port zip ----
 step "Fetching gamedevstory.zip"
@@ -151,7 +184,11 @@ echo "   (be patient - 38 MB over handheld Wi-Fi can take a minute or two;"
 echo "    scp shows a progress bar below. A failed attempt is retried"
 echo "    automatically up to ${XFER_TIMEOUT}s.)"
 
-SCP_BASE="scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+if [ -n "$SSH_KEY" ]; then
+  SCP_BASE="scp -i $SSH_KEY -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+else
+  SCP_BASE="scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+fi
 start=$(date +%s)
 uploaded=0
 while [ $(( $(date +%s) - start )) -lt "$XFER_TIMEOUT" ]; do
@@ -189,9 +226,9 @@ fi
 step "Pulling logs"
 mkdir -p "$LOGDIR"
 rm -f "$LOGDIR"/port_launch.log "$LOGDIR"/loader.log "$LOGDIR"/gamedevstory_loader.log
-timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$HOST:$PORTS_DIR/port_launch.log" "$LOGDIR/" 2>/dev/null || true
-timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$HOST:$PORTS_DIR/gamedevstory/loader.log" "$LOGDIR/" 2>/dev/null || true
-timeout "$TIMEOUT" scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$HOST:/tmp/gamedevstory_loader.log" "$LOGDIR/" 2>/dev/null || true
+$SCP_BASE "$HOST:$PORTS_DIR/port_launch.log" "$LOGDIR/" 2>/dev/null || true
+$SCP_BASE "$HOST:$PORTS_DIR/gamedevstory/loader.log" "$LOGDIR/" 2>/dev/null || true
+$SCP_BASE "$HOST:/tmp/gamedevstory_loader.log" "$LOGDIR/" 2>/dev/null || true
 
 echo
 echo "=== Logs saved to $LOGDIR/ ==="
