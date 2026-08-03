@@ -25,6 +25,7 @@
  * needs.  Declared here so loader.c can drive the Unity boot. */
 void *kv_jni_java_vm(void);
 void *kv_jni_env(void);
+void *kv_jni_find_native(const char *name);
 int kv_log_open(const char *path);
 void kv_install_crash_handler(void);
 
@@ -344,6 +345,36 @@ static void kv_il_run_entry(void) {
     else printf("[il2cpp] entry point returned %p\n", r);
 }
 
+/* ---- Stage 2c: drive Unity's player loop (the correct boot path) ----
+ * Following terraria-nextos: after JNI_OnLoad registers the native methods,
+ * call initJni then loop nativeRender.  This drives the whole engine (including
+ * il2cpp init internally) instead of calling il2cpp_init directly, which hits
+ * uninitialized globals. */
+static void kv_unity_boot(void) {
+    void *env = kv_jni_env();
+    long thiz = 0xA1;
+    unsigned char (*render)(void *, void *) = (unsigned char (*)(void *, void *))kv_jni_find_native("nativeRender");
+    if (!render) { printf("[unity] no nativeRender registered - cannot drive player loop\n"); return; }
+    void *fn;
+    if ((fn = kv_jni_find_native("initJni"))) {
+        printf("[unity] initJni...\n");
+        ((void (*)(void *, void *, void *))fn)(env, &thiz, &thiz);
+        printf("[unity] initJni OK\n");
+    }
+    if ((fn = kv_jni_find_native("nativeResume"))) {
+        ((void (*)(void *, void *))fn)(env, &thiz);
+    }
+    if ((fn = kv_jni_find_native("nativeFocusChanged"))) {
+        ((void (*)(void *, void *, int))fn)(env, &thiz, 1);
+    }
+    printf("[unity] nativeRender loop...\n");
+    for (int f = 0; f < 1000000; f++) {
+        unsigned char keep = render(env, &thiz);
+        if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
+    }
+    printf("[unity] player loop ended\n");
+}
+
 int real_main(int argc, char **argv);
 
 /* ---- TLS setup ----
@@ -441,35 +472,40 @@ int real_main(int argc, char **argv) {
         libc = 3;
     }
     int n = 0;
-    Module *last = 0;
+    Module *m_il2cpp = 0, *m_unity = 0, *m_main = 0;
     for (int i = 0; i < libc; i++) {
         printf("[loader] loading %s\n", libs[i]);
         Module *m = load_object(libs[i]);
-        if (m) { n++; last = m; }
+        if (m) {
+            n++;
+            if (strstr(m->name, "libil2cpp")) m_il2cpp = m;
+            else if (strstr(m->name, "libunity")) m_unity = m;
+            else if (strstr(m->name, "libmain")) m_main = m;
+        }
     }
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
 
-    /* Stage 2: drive the Unity boot.  libunity.so's only entry is JNI_OnLoad;
-     * hand it our JNI shim's JavaVM + JNIEnv (no real Android underneath). */
-    if (last) {
-        void *(*jni_onload)(void *, void *) = module_export(last, "JNI_OnLoad");
-        if (jni_onload) {
-            printf("[loader] calling JNI_OnLoad (vm=%p)\n", kv_jni_java_vm());
-            void *r = jni_onload(kv_jni_java_vm(), 0);
-            printf("[loader] JNI_OnLoad returned %p (0x%lx)\n", r, (unsigned long)r);
-        } else {
-            printf("[loader] no JNI_OnLoad in %s\n", last->name);
-        }
+    /* Stage 2: Unity boot.  JNI_OnLoad for EACH lib is what registers the
+     * native methods.  libunity's JNI_OnLoad registers initJni/nativeRender/
+     * nativeResume/... (needed to drive the player loop); libil2cpp's and
+     * libmain's register their own.  Order matters (libunity first). */
+    void *vm = kv_jni_java_vm();
+    void *(*onload)(void *, void *);
+    if (m_unity && (onload = module_export(m_unity, "JNI_OnLoad"))) {
+        printf("[loader] libunity JNI_OnLoad...\n");
+        printf("[loader]   -> %#lx\n", (unsigned long)onload(vm, 0));
+    }
+    if (m_il2cpp && (onload = module_export(m_il2cpp, "JNI_OnLoad"))) {
+        printf("[loader] libil2cpp JNI_OnLoad...\n");
+        printf("[loader]   -> %#lx\n", (unsigned long)onload(vm, 0));
+    }
+    if (m_main && (onload = module_export(m_main, "JNI_OnLoad"))) {
+        printf("[loader] libmain JNI_OnLoad...\n");
+        printf("[loader]   -> %#lx\n", (unsigned long)onload(vm, 0));
     }
 
-    /* Stage 2b: drive the IL2CPP runtime directly so the game's own managed
-     * code runs (simulation), not just init_array + JNI_OnLoad.  The data dir
-     * is relative to the repo root so the bench resolves it; adjust for device. */
-    if (loader_lookup_export("il2cpp_init")) {
-        /* device: data/ dir next to the loader; bench: repo-root path. */
-        const char *data = kv_abspath(argv0, "data/Managed");
-        kv_il_boot(data);
-        kv_il_run_entry();
-    }
+    /* Stage 2b/c: drive Unity's player loop (correct boot path per
+     * terraria-nextos).  initJni + nativeRender loop boots il2cpp internally. */
+    kv_unity_boot();
     return 0;
 }

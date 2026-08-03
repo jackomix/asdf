@@ -127,8 +127,37 @@ static jboolean kv_IsSameObject(JNIEnv env, jobject a, jobject b) { (void)env; r
 static jclass kv_GetObjectClass(JNIEnv env, jobject o) { (void)env; (void)o; return (jclass)(uintptr_t)0x5000; }
 static jboolean kv_IsInstanceOf(JNIEnv env, jobject o, jclass c) { (void)env; (void)o; (void)c; return 1; }
 static jclass kv_GetSuperclass(JNIEnv env, jclass c) { (void)env; (void)c; return 0; }
+/* ---- native method capture ----
+ * libunity.so's JNI_OnLoad calls RegisterNatives to register its native
+ * methods (initJni, nativeRender, nativeResume, ...).  We capture the
+ * {name, sig, fnPtr} triples so the loader can then CALL those methods to
+ * drive Unity's player loop - the correct boot path (not a direct
+ * il2cpp_init call, which hits uninitialized globals).
+ */
+struct kv_native_method { const char *name; const char *sig; void *fn; };
+static struct kv_native_method kv_natives[512];
+static int kv_natives_count = 0;
+
+void *kv_jni_find_native(const char *name) {
+    for (int i = 0; i < kv_natives_count; i++)
+        if (strcmp(kv_natives[i].name, name) == 0) return kv_natives[i].fn;
+    return 0;
+}
+
 static jint kv_RegisterNatives(JNIEnv env, jclass c, const void *methods, jint n) {
-    (void)env; (void)c; (void)methods; (void)n;
+    (void)env; (void)c;
+    const uintptr_t *m = (const uintptr_t *)methods;   /* {name, sig, fnPtr} x n */
+    for (int i = 0; i < n && i < 128; i++) {
+        const char *nm = (const char *)m[i * 3];
+        const char *sg = (const char *)m[i * 3 + 1];
+        void *fn = (void *)m[i * 3 + 2];
+        if (nm && kv_natives_count < 512) {
+            kv_natives[kv_natives_count].name = strdup(nm);
+            kv_natives[kv_natives_count].sig = sg;
+            kv_natives[kv_natives_count].fn = fn;
+            kv_natives_count++;
+        }
+    }
     return 0;
 }
 static jint kv_UnregisterNatives(JNIEnv env, jclass c) { (void)env; (void)c; return 0; }
