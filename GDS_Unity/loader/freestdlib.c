@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include "kv_elf.h"
+#include "kv_libc.h"
 
 #define SYS_mmap       222
 #define SYS_mprotect   226
@@ -47,7 +48,11 @@ int open(const char *path, int flags) {
 ssize_t read(int fd, void *buf, unsigned long n) {
     return (ssize_t)raw_syscall(SYS_read, fd, (long)buf, (long)n, 0, 0, 0);
 }
+ssize_t write(int fd, const void *buf, unsigned long n) {
+    return (ssize_t)raw_syscall(SYS_write, fd, (long)buf, (long)n, 0, 0, 0);
+}
 int close(int fd) { return (int)raw_syscall(SYS_close, fd, 0, 0, 0, 0, 0); }
+int munmap(void *a, unsigned long l) { (void)a;(void)l; return 0; }
 
 /* ---- bump allocator ---- */
 static uint8_t *heap_ptr = 0;
@@ -73,21 +78,56 @@ void free(void *p) { (void)p; }
 void *calloc(unsigned long n, unsigned long sz) {
     unsigned long t = n * sz; void *p = malloc(t); if (p) memset(p, 0, t); return p;
 }
+void *realloc(void *old, unsigned long sz) {
+    if (!old) return malloc(sz);
+    /* bump allocator can't free old, so allocate fresh and copy (kept small:
+     * realloc is rare in the .so boot path; leak the old block). */
+    void *n = malloc(sz);
+    if (n && old) { unsigned long csz = sz; memcpy(n, old, csz); }
+    return n;
+}
+void *memalign(unsigned long align, unsigned long sz) { (void)align; return malloc(sz); }
+int posix_memalign(void **memptr, unsigned long align, unsigned long sz) {
+    *memptr = malloc(sz); (void)align; return *memptr ? 0 : 12; /* ENOMEM */
+}
 
 /* ---- string / mem helpers ---- */
 void *memset(void *d, int c, unsigned long n) {
-    unsigned char *p = d; for (unsigned long i = 0; i < n; i++) p[i] = (unsigned char)c;
+    unsigned char *p = d;
+    /* word-wise fill (the loader copies multi-MB segments into mapped memory;
+     * a byte loop is ~8x slower and dominates load time under the bench). */
+    unsigned long v = (unsigned char)c;
+    v |= v << 8; v |= v << 16; v |= v << 32;
+    unsigned long i = 0;
+    while (i + 8 <= n) { *(unsigned long *)(p + i) = v; i += 8; }
+    while (i < n) p[i++] = (unsigned char)c;
     return d;
 }
 void *memcpy(void *d, const void *s, unsigned long n) {
     unsigned char *p = d; const unsigned char *q = s;
-    for (unsigned long i = 0; i < n; i++) p[i] = q[i];
+    /* word-wise copy, 8 bytes at a time (see memset note). */
+    unsigned long i = 0;
+    while (i + 8 <= n) { *(unsigned long *)(p + i) = *(const unsigned long *)(q + i); i += 8; }
+    while (i < n) { p[i] = q[i]; i++; }
     return d;
 }
 int memcmp(const void *a, const void *b, unsigned long n) {
     const unsigned char *x = a, *y = b;
     for (unsigned long i = 0; i < n; i++)
         if (x[i] != y[i]) return (int)x[i] - (int)y[i];
+    return 0;
+}
+void *memmove(void *d, const void *s, unsigned long n) {
+    unsigned char *p = d; const unsigned char *q = s;
+    if (p == q || n == 0) return d;
+    if (p < q) return memcpy(d, s, n);
+    /* overlap with dst after src: copy backwards */
+    for (unsigned long i = n; i > 0; i--) p[i - 1] = q[i - 1];
+    return d;
+}
+void *memchr(const void *s, int c, unsigned long n) {
+    const unsigned char *p = s;
+    for (unsigned long i = 0; i < n; i++) if (p[i] == (unsigned char)c) return (void *)(p + i);
     return 0;
 }
 unsigned long strlen(const char *s) { unsigned long n = 0; while (s[n]) n++; return n; }
@@ -99,11 +139,63 @@ int strncmp(const char *a, const char *b, unsigned long n) {
     }
     return 0;
 }
+char *strcpy(char *d, const char *s) { return memcpy(d, s, strlen(s) + 1); }
 char *strncpy(char *d, const char *s, unsigned long n) {
     unsigned long i = 0;
     for (; i < n && s[i]; i++) d[i] = s[i];
     for (; i < n; i++) d[i] = 0;
     return d;
+}
+char *strchr(const char *s, int c) {
+    do { if (*s == (char)c) return (char *)s; } while (*s++);
+    return 0;
+}
+char *strrchr(const char *s, int c) {
+    const char *last = 0;
+    do { if (*s == (char)c) last = s; } while (*s++);
+    return (char *)last;
+}
+char *strstr(const char *h, const char *n) {
+    if (!*n) return (char *)h;
+    for (; *h; h++) {
+        const char *a = h, *b = n;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b) return (char *)h;
+    }
+    return 0;
+}
+char *strdup(const char *s) {
+    unsigned long n = strlen(s) + 1; char *p = malloc(n); if (p) memcpy(p, s, n); return p;
+}
+char *strlcpy(char *d, const char *s, unsigned long n) {
+    unsigned long sl = strlen(s);
+    if (n) { unsigned long c = sl < n - 1 ? sl : n - 1; memcpy(d, s, c); d[c] = 0; }
+    return d;
+}
+int atoi(const char *s) { return (int)strtol(s, 0, 10); }
+long atol(const char *s) { return strtol(s, 0, 10); }
+long strtol(const char *s, char **end, int base) {
+    long v = 0; int neg = 0; const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '-') { neg = 1; p++; } else if (*p == '+') p++;
+    if (base == 0) { base = 10; if (p[0]=='0' && (p[1]=='x'||p[1]=='X')) { base=16; p+=2; } }
+    while ((*p >= '0' && *p <= '9') ||
+           (base == 16 && ((*p>='a'&&*p<='f')||(*p>='A'&&*p<='F')))) {
+        int d; if (*p>='0'&&*p<='9') d=*p-'0';
+        else if (*p>='a'&&*p<='f') d=*p-'a'+10; else d=*p-'A'+10;
+        v = v * base + d; p++;
+    }
+    if (end) *end = (char *)p;
+    return neg ? -v : v;
+}
+unsigned long strtoul(const char *s, char **end, int base) {
+    long v = strtol(s, end, base); return (unsigned long)v;
+}
+unsigned long long strtoull(const char *s, char **end, int base) {
+    return (unsigned long long)strtoul(s, end, base);
+}
+long long strtoll(const char *s, char **end, int base) {
+    return (long long)strtol(s, end, base);
 }
 int fstat(int fd, void *st) {
     (void)fd; (void)st;
@@ -151,6 +243,123 @@ int printf(const char *fmt, ...) {
 int fprintf(int fd, const char *fmt, ...) { (void)fd; va_list ap; va_start(ap,fmt); (void)ap; return printf(fmt, ap); }
 void perror(const char *s) { if (s) printf("%s: error\n", s); }
 void exit(int code) { raw_syscall(SYS_exit, code, 0, 0, 0, 0, 0); for (;;) {} }
+void _Exit(int code) { exit(code); }
+void _exit(int code) { exit(code); }
+void abort(void) { raw_syscall(SYS_write, 1, (long)"abort()\n", 8, 0, 0, 0); raw_syscall(SYS_exit, 134, 0,0,0,0,0); for (;;) {} }
+
+/* TLS errno: the .so reads *__errno() (bionic exports __errno as a function).
+ * Give it a stable slot. */
+static int kv_errno_slot;
+int *__errno(void) { return &kv_errno_slot; }
+
+/* environ (bionic global; glibc has it as a symbol). */
+char **environ = 0;
+
+/* __sF: glibc's file array.  libil2cpp references stderr/stdout via it; a
+ * minimal 3-entry table lets it not crash on early stderr writes. */
+static char kv_stdin_buf, kv_stdout_buf, kv_stderr_buf;
+static void *kv_sF[3] = { &kv_stdin_buf, &kv_stdout_buf, &kv_stderr_buf };
+void *__sF = kv_sF;
+
+/* cxa runtime: only need to count/ignore for boot (no objects actually need
+ * their destructors in stage 1). */
+static unsigned kv_atexit_count;
+int __cxa_atexit(void (*f)(void *), void *arg, void *dso) {
+    (void)f; (void)arg; (void)dso; kv_atexit_count++; return 0;
+}
+void __cxa_finalize(void *dso) { (void)dso; }
+void __stack_chk_fail(void) {
+    raw_syscall(SYS_write, 1, (long)"stack smashing detected\n", 24, 0, 0, 0);
+    abort();
+}
+void *__memmove_chk(void *d, const void *s, unsigned long n, unsigned long dlen) {
+    (void)dlen; return memmove(d, s, n);
+}
+void *__memcpy_chk(void *d, const void *s, unsigned long n, unsigned long dlen) {
+    (void)dlen; return memcpy(d, s, n);
+}
+void *__memset_chk(void *d, int c, unsigned long n, unsigned long dlen) {
+    (void)dlen; return memset(d, c, n);
+}
+unsigned long __strlen_chk(const char *s, unsigned long slen) { (void)slen; return strlen(s); }
+int __vsnprintf_chk(char *s, unsigned long n, int flag, unsigned long slen, const char *fmt, void *ap) {
+    (void)flag; (void)slen; (void)ap; (void)s; (void)fmt; (void)n; return 0;
+}
+void __FD_SET_chk(int fd, void *set) { (void)fd; (void)set; }
+
+/* ---- time / syscall-facing libc ---- */
+long time(long *t) { return (long)raw_syscall(169, 0,0,0,0,0,0); } /* clock_gettime? use gettimeofday */
+int gettimeofday(void *tv, void *tz) { (void)tz; return (int)raw_syscall(169, (long)tv, 0,0,0,0,0); }
+long clock(void) { return -1; }
+int clock_gettime(int c, void *tp) { return (int)raw_syscall(113, c, (long)tp, 0,0,0,0); }
+int clock_getres(int c, void *tp) { return (int)raw_syscall(114, c, (long)tp, 0,0,0,0); }
+int nanosleep(void *req, void *rem) { return (int)raw_syscall(101, (long)req, (long)rem, 0,0,0,0); }
+int usleep(unsigned long u) {
+    long ts[2] = { (long)(u / 1000000), (long)((u % 1000000) * 1000) };
+    return nanosleep(ts, 0);
+}
+int getpid(void) { return (int)raw_syscall(172, 0,0,0,0,0,0); }
+int getuid(void) { return (int)raw_syscall(174, 0,0,0,0,0,0); }
+int geteuid(void) { return (int)raw_syscall(175, 0,0,0,0,0,0); }
+int getegid(void) { return (int)raw_syscall(177, 0,0,0,0,0,0); }
+int sched_yield(void) { return (int)raw_syscall(124, 0,0,0,0,0,0); }
+int getpagesize(void) { return 4096; }
+long sysconf(int name) { return name == 30 ? 4096 : -1; } /* _SC_PAGESIZE */
+int isatty(int fd) { (void)fd; return 0; }
+int getenv_probe;
+
+char *getenv(const char *name) {
+    (void)name; return 0;  /* no env in the bench */
+}
+int setenv(const char *n, const char *v, int o) { (void)n;(void)v;(void)o; return 0; }
+int unsetenv(const char *n) { (void)n; return 0; }
+int gethostname(char *n, unsigned long len) { (void)len; if (n) n[0]=0; return 0; }
+int getcwd(char *b, unsigned long n) { (void)n; if (b) b[0]='/'; return 0; }
+
+/* pthread: minimal no-op stubs so the .so's threaded boot doesn't crash. */
+typedef unsigned long kv_pthread_t;
+int pthread_mutex_init(void *m, void *a) { (void)m;(void)a; return 0; }
+int pthread_mutex_destroy(void *m) { (void)m; return 0; }
+int pthread_mutex_lock(void *m) { (void)m; return 0; }
+int pthread_mutex_unlock(void *m) { (void)m; return 0; }
+int pthread_mutex_trylock(void *m) { (void)m; return 0; }
+int pthread_mutexattr_init(void *a) { (void)a; return 0; }
+int pthread_mutexattr_destroy(void *a) { (void)a; return 0; }
+int pthread_mutexattr_settype(void *a, int t) { (void)a;(void)t; return 0; }
+int pthread_cond_init2(void *c) { (void)c; return 0; }
+int pthread_cond_destroy(void *c) { (void)c; return 0; }
+int pthread_cond_broadcast(void *c) { (void)c; return 0; }
+int pthread_cond_signal(void *c) { (void)c; return 0; }
+int pthread_cond_wait(void *c, void *m) { (void)c;(void)m; return 0; }
+int pthread_cond_timedwait(void *c, void *m, void *t) { (void)c;(void)m;(void)t; return 0; }
+int pthread_create(kv_pthread_t *t, void *a, void *(*fn)(void *), void *arg) {
+    (void)t;(void)a;(void)fn;(void)arg; return 0;  /* pretend thread already ran */
+}
+int pthread_join(kv_pthread_t t, void **r) { (void)t;(void)r; return 0; }
+int pthread_detach(kv_pthread_t t) { (void)t; return 0; }
+kv_pthread_t pthread_self(void) { return 0; }
+int pthread_equal(kv_pthread_t a, kv_pthread_t b) { return a == b; }
+int pthread_once(void *c, void (*fn)(void)) { (void)c; if (fn) fn(); return 0; }
+int pthread_key_create(unsigned *k, void (*d)(void *)) { (void)d; *k = 1; return 0; }
+int pthread_key_delete(unsigned k) { (void)k; return 0; }
+void *pthread_getspecific(unsigned k) { (void)k; return 0; }
+int pthread_setspecific(unsigned k, const void *v) { (void)k;(void)v; return 0; }
+int pthread_sigmask(int h, void *s, void *o) { (void)h;(void)s;(void)o; return 0; }
+int pthread_kill(kv_pthread_t t, int s) { (void)t;(void)s; return 0; }
+int pthread_atfork(void (*a)(void), void (*b)(void), void (*c)(void)) { (void)a;(void)b;(void)c; return 0; }
+int pthread_attr_init(void *a) { (void)a; return 0; }
+int pthread_attr_destroy(void *a) { (void)a; return 0; }
+int pthread_attr_getstack(void *a, void **s, void **sz) { (void)a;(void)s;(void)sz; return 0; }
+int pthread_getattr_np(kv_pthread_t t, void *a) { (void)t;(void)a; return 0; }
+int pthread_setname_np(kv_pthread_t t, const char *n) { (void)t;(void)n; return 0; }
+int pthread_rwlock_rdlock(void *l) { (void)l; return 0; }
+int pthread_rwlock_wrlock(void *l) { (void)l; return 0; }
+int pthread_rwlock_unlock(void *l) { (void)l; return 0; }
+int sem_init(void *s, int p, unsigned v) { (void)s;(void)p;(void)v; return 0; }
+int sem_post(void *s) { (void)s; return 0; }
+int sem_wait(void *s) { (void)s; return 0; }
+int sem_timedwait(void *s, void *t) { (void)s;(void)t; return 0; }
+int sem_getvalue(void *s, int *v) { (void)s; if (v) *v = 0; return 0; }
 
 /* ---- dlsym against the host symbol table (host_syms.c) ---- */
 void *dlsym(void *handle, const char *name) { (void)handle; return host_dlsym(name); }

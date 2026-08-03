@@ -33,17 +33,17 @@ emulator (the slow, hard half) and does not reuse the native win.
 - Proven end-to-end: `loader/tiny` (freestanding aarch64 calling write/exit and
   an init_array ctor) compiles, loads under the bench, prints its message, exits
   0.
-- **The loader's `.so`-loading path is now verified end-to-end** — with a small
-  synthetic shared object, since the 33 MB game asset is absent:
-  `python3 -m ziglang cc -target aarch64-linux-gnu -shared -fPIC -ffreestanding
-  -nostdlib -fno-sanitize=undefined loader/so_probe.c -o /tmp/so_probe.so`, then
-  `python3 tools/run_aarch64.py loader/loader2 /tmp/so_probe.so`.  The loader
-  now maps PT_LOAD, applies RELATIVE, resolves **GLOB_DAT symbols defined in the
-  module itself** (`kairo_marker` -> `bias+st_value`, not host dlsym), resolves
-  JUMP_SLOT imports through `.rela.plt` (`DT_JMPREL`) against the host symbol
-  table (`strlen` -> `kv_strlen`), and runs DT_INIT_ARRAY.  Verified output:
-  `[so_probe] ctor ran; strlen("probe")=5 marker=1234abcd marker_addr=200030808`,
-  exit 0.
+- **The loader now loads the REAL Game Dev Story `libil2cpp.so` end-to-end.**
+  With the extracted APK at `out/apk/lib/arm64-v8a/libil2cpp.so`:
+  `python3 tools/run_aarch64.py loader/loader2 $(pwd)/out/apk/lib/arm64-v8a/libil2cpp.so`
+  reads the entire 33 MB file, maps PT_LOAD, resolves ALL ~261 imported libc/
+  libm/pthread/locale symbols (0 unresolved), applies ~30k relocations, **runs
+  all 18 real init_array ctors of the IL2CPP runtime, and exits 0**:
+  `[loader] ... mapped @0x200000000 span=0x221f000 relas=30285`
+  `[loader] ... init_array ran (18 ctors)`
+  `[loader] OK: ... loaded and initialised` / `[guest exit 0]`.
+  A synthetic `loader/so_probe.c` still exercises the reloc path in isolation
+  (RELATIVE, self GLOB_DAT, JUMP_SLOT, DT_INIT_ARRAY) without the big asset.
 - The loader's ELF machinery is written (`loader/loader.c`): maps PT_LOAD
   segments, applies RELATIVE + GLOB_DAT/JUMP_SLOT/ABS relocs, runs DT_INIT_ARRAY,
   resolves the `.so`'s libc/libm/bionic imports via a host symbol table.  It
@@ -58,21 +58,24 @@ emulator (the slow, hard half) and does not reuse the native win.
 
 ## What is BROKEN / NOT YET DONE
 
-- The loader cannot yet load the REAL `libil2cpp.so` in the bench — because
-  **the 33 MB `.so` asset is gitignored and not present in this sandbox
-  instance** (`out/apk/lib/arm64-v8a/libil2cpp.so` is missing).  When present,
-  run:
-  `python3 tools/run_aarch64.py loader/loader2 /abs/path/libil2cpp.so`
-  The loader's `.so` machinery itself is verified via `loader/so_probe.c`
-  (see DONE/WORKING); the only unverified step is the real binary, which will
-  also surface TLS/IRELATIVE relocation types the loader currently skips.
-- **Asset mismatch to be aware of:** the only APK in this sandbox is
-  `Epic_Astro_Story-NTU1NTM3.apk`, and it is the OLD Java/Dalvik engine — it
-  contains `classes.dex` + `assets/*.dat` + ogg, **no native `libil2cpp.so` /
-  `libunity.so`** (that APK belongs to `EAS_OldEngine/`, a JS/Dalvik emulator,
-  not the Unity loader).  A Unity/IL2CPP Kairosoft title (e.g. Game Dev Story)
-  is required to exercise the loader against a real `.so`.  That is a
-  user-supplied APK; it is not on disk here.
+- The real `libil2cpp.so` **loads and runs init_array** now (see
+  DONE/WORKING).  What is NOT yet done: loading `libunity.so` (the engine) and
+  resolving ITS imports, calling `UnityPluginLoad` / `UnityMain`, and providing
+  the JNI/EGL/SDL surface.  `libunity.so` is in the same extracted APK
+  (`out/apk/lib/arm64-v8a/libunity.so`, 16 MB) and is the natural next target;
+  it will surface bionic/glibc ABI gaps (notably the arm64 `sigaction`/`sigset_t`
+  size difference) and the JNI-call inventory.
+- The real IL2CPP boot passed because `freestdlib.c` + `host_syms.c` now carry a
+  broad freestanding libc: allocator (incl. realloc/memalign), mem/str, printf,
+  time/syscalls, pthread/mutex/cond/sem stubs, math stubs, locale/wchar stubs,
+  and bionic extras (`__errno`, `environ`, `__sF`, `__system_property_get`,
+  `__cxa_atexit`/`__cxa_finalize`, `__stack_chk_fail`, `uname`,
+  `__android_log_print`).  These are the symbols `host_dlsym`'s table maps to;
+  add any newly-unresolved symbol there (it prints `unresolved <name>`).
+- Stage 1 runs **only libil2cpp.so's init_array** (18 ctors).  It does NOT call
+  into the game logic, and the IL2CPP runtime initialised by init_array is not
+  yet driven (no `il2cpp_runtime_invoke`/threads/Unity host).  The next step is
+  `libunity.so`.
 - No GPU / JNI / SDL yet. `loader.c` only does the ELF load. Next milestones
   (stage 2+): load BOTH `libil2cpp.so` and `libunity.so`, resolve
   `libunity.so`'s imports against glibc, call Unity's `UnityPluginLoad` /
@@ -139,6 +142,26 @@ emulator (the slow, hard half) and does not reuse the native win.
 13. `freestdlib.c` printf has no float/`%s`-with-width, and (until fixed) printed
     `%zu`/`%#zx` literally as `zu`/`#zx`.  It now strips `z/l/h/#/+` modifiers.
 
+14. **`read_all()` used to read only the first 1 MB of the .so** — fine for the
+    5 KB synthetic test, but it silently truncated the 33 MB `libil2cpp.so`, so
+    the dynamic section (PT_DYNAMIC is at file offset ~30 MB) came out as
+    garbage: relocations/init_array were skipped and the load "succeeded" with
+    `relas=0`.  Fixed: it now grows the buffer to read the whole file.  If you
+    ever see `relas=0` + no init_array on a real .so, suspect the file read.
+
+15. **Init_array ctors run with the host's real-named libc symbols resolved**
+    via `host_dlsym`'s table.  Any symbol the .so imports that isn't in the
+    table prints `unresolved <name>` and its GOT slot is zeroed — a ctor that
+    then calls it will crash with `UC_ERR_FETCH_UNMAPPED` at address 0.  Add the
+    symbol to the table + `kv_libc.h` + a freestanding implementation.
+
+16. **The loader binary is built `-fno-pie`, so its data holds absolute
+    link-time addresses.**  Two consequences: (a) the bench must map it at its
+    link base `minv` (gotcha 10); (b) `host_dlsym`'s `tab[]` entries that are
+    `void*` *variables* (`__sF`, `environ`) must use `&__sF`/`&environ` in the
+    table (the imported symbol is the *address* of the variable), or the
+    initializer isn't a compile-time constant and the link fails.
+
 ## PROJECT LAYOUT
 
 ```
@@ -164,30 +187,28 @@ GDS_Unity/
 
 ## NEXT STEPS (in order)
 
-0. The loader's `.so` machinery is now verified with a synthetic `.so`
-   (`loader/so_probe.c`, see DONE/WORKING).  To repeat:
-   `python3 -m ziglang cc -target aarch64-linux-gnu -shared -fPIC -ffreestanding
-   -nostdlib -fno-sanitize=undefined loader/so_probe.c -o /tmp/so_probe.so`
-   `python3 tools/run_aarch64.py loader/loader2 /tmp/so_probe.so`
-   Expect the `[so_probe] ctor ran ...` line and `[guest exit 0]`.
-1. Restore the real asset: run `tools/extract_apk.sh <Unity-Kairosoft.apk>` (a
-   Unity/IL2CPP title such as Game Dev Story — NOT the old-engine Epic Astro
-   Story APK present here, which has no native libs) so
-   `out/apk/lib/arm64-v8a/libil2cpp.so` exists. Then:
+0. **(DONE)** Real `libil2cpp.so` loads, init_array runs, exit 0.  The real
+   GDS APK is present at `APKs/Game+Dev+Story_2.6.9.apk` (53 MB) and extracted
+   to `GDS_Unity/out/apk/` (gitignored).  Rebuild + rerun:
+   `python3 -m ziglang cc ... loader/loader.c loader/freestdlib.c loader/host_syms.c -o loader/loader2`
    `python3 tools/run_aarch64.py loader/loader2 $(pwd)/out/apk/lib/arm64-v8a/libil2cpp.so`
-   Expect: it loads, runs init_array, prints `[loader] ... init_array ran`,
-   exits 0. First run will likely surface TLS/IRELATIVE reloc types the loader
-   currently skips — add them to the reloc loop.
-2. Load `libunity.so` too and resolve its imports; call its entry. This is the
-   bulk of the remaining work and will surface the bionic/glibc ABI gaps.
-3. Add the shim surface modeled on terraria-nextos:
+   Expect `init_array ran (18 ctors)` and `[guest exit 0]`.
+1. **Load `libunity.so` too** and resolve its imports; call its entry
+   (`UnityPluginLoad`/`UnityMain`).  It's at
+   `out/apk/lib/arm64-v8a/libunity.so` (16 MB).  The loader's `real_main` and
+   `load_object` currently take a single path; extend to load both, resolve
+   libunity's imports against the same host table, and drive the Unity player
+   loop.  This is the bulk of the remaining work and will surface the
+   bionic/glibc ABI gaps (notably arm64 `sigaction`/`sigset_t`: bionic 8 bytes
+   vs glibc 128).
+2. Add the shim surface modeled on terraria-nextos:
    - `bionic_shims.c`: FORTIFY `_chk` wrappers, `__sF`, `__system_property_get`,
      and the **bionic/glibc `sigaction`/`sigset_t` ABI difference** (bionic arm64
      sigset is 8 bytes; glibc 128 — must convert, or it overruns caller stack).
      This is a real hazard.
    - `jni_shim.c` + generated stubs: from the JNI call inventory the VM produced.
    - `egl_shim.c` / SDL2: window, input, audio.
-4. Build for the real device: the same `loader.c` compiled for `aarch64-linux-gnu`
+3. Build for the real device: the same `loader.c` compiled for `aarch64-linux-gnu`
    (glibc) instead of freestanding becomes the R36S binary. Test on-device for
    GPU/input; keep the Unicorn bench for non-GPU logic.
 
@@ -218,8 +239,12 @@ python3 tools/run_aarch64.py loader/loader2 /abs/path/to/libil2cpp.so
 
 ## COMMIT STATE
 
-- Branch `arena/019fbc18-asdf` on `github.com/jackomix/asdf`.
-- Last push: `1b3c5bc` "GDS_Unity/loader: native aarch64 ELF loader + Unicorn
-  test bench". Subsequent local edits to the harness/freestdlib are NOT yet
-  pushed (see note 7 about module availability).
-- `out/` and any `*.so`/APK binaries are gitignored by design.
+- Session branch `arena/019fc860-asdf`.  (Note: the Unity/IL2CPP GDS APKs were
+  committed on `arena/019fbc18-asdf` under `APKs/`; that branch's `APKs/`
+  directory was NOT on `main`.  `git fetch origin '+refs/heads/*:refs/remotes/origin/*'`
+  pulls it; `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`
+  recovers the 53 MB APK.)
+- Latest commit on `arena/019fc860-asdf`: loader loads real libil2cpp.so, runs
+  init_array, exits 0 (see commit message).
+- `out/`, `*.so`, and APK binaries are gitignored by design; only source is
+  committed.  The extracted libs live in `GDS_Unity/out/apk/` (not committed).

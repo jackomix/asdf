@@ -278,7 +278,7 @@ def main():
         _ic[0] += 1
         if _ic[0] % 20000000 == 0:
             print('[bench] %dM instrs, pc=%#x' % (_ic[0] // 1000000, addr), file=sys.stderr)
-        if _ic[0] > 400000000:
+        if _ic[0] > 2000000000:
             print('[bench] instruction cap hit at pc=%#x' % addr, file=sys.stderr)
             uc.emu_stop()
 

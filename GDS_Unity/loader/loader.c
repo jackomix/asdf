@@ -58,10 +58,22 @@ static void *xmmap(uint8_t *hint, size_t len, int prot) {
 static void *read_all(const char *path, size_t *out_len) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { printf( "[loader] open %s: %m\n", path); exit(2); }
-    uint8_t *buf = malloc(1 << 20);
-    ssize_t got = 0; size_t total = (size_t)1 << 20;
-    while (got < (ssize_t)total) {
-        ssize_t r = read(fd, buf + got, total - got);
+    /* The real .so is tens of MB (libil2cpp.so is 33 MB), so grow the buffer
+     * dynamically instead of fixing it at 1 MB (which silently truncated the
+     * file and made the dynamic section come out as garbage). */
+    size_t cap = 1 << 20;
+    uint8_t *buf = malloc(cap);
+    ssize_t got = 0;
+    for (;;) {
+        if (got >= (ssize_t)cap) {
+            cap <<= 1;
+            uint8_t *nb = malloc(cap);
+            if (got) memcpy(nb, buf, got);
+            /* leak old buf; this is a one-shot loader, memory is reclaimed on
+             * exit and there are at most a couple of .so files. */
+            buf = nb;
+        }
+        ssize_t r = read(fd, buf + got, cap - got);
         if (r <= 0) break;
         got += r;
     }
