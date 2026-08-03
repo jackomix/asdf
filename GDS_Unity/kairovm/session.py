@@ -17,6 +17,7 @@ class Session(object):
         self.pkg = DEFAULT_PKG
         self.rootfs = os.path.join(apk, '_rootfs')
         self.quit = False
+        self._type_image = None
         self.m, self.host, self.li = build(apk, verbose=verbose, echo_log=echo_log)
         self.m.watch = False
         self.rt = Il2CppRuntime(self.m)
@@ -64,12 +65,33 @@ class Session(object):
             raise KeyError('%s: %s.%s' % (image, ns, name))
         return k
 
+    def type_image(self, full_name):
+        """Assembly that declares `full_name`, straight from the metadata.
+
+        Asking il2cpp_class_from_name for a type image by image is not safe:
+        a few of the shipped assemblies fault inside the runtime's name
+        comparison, and one bad guess takes the whole VM down.  The metadata
+        already says where every type lives, so use it.
+        """
+        if self._type_image is None:
+            self._type_image = {}
+            m = self.meta
+            if m is not None:
+                for i in range(m.count('images')):
+                    im = m.image_def(i)
+                    nm = m.string(im.nameIndex)
+                    for ti in range(im.typeStart, im.typeStart + im.typeCount):
+                        self._type_image[m.type_name(ti)] = nm
+        return self._type_image.get(full_name)
+
     def find_class(self, ns, name):
-        for img in self.images.values():
-            k = self.rt.class_from_name(img, ns, name)
+        full = '%s.%s' % (ns, name) if ns else name
+        img_name = self.type_image(full)
+        if img_name and img_name in self.images:
+            k = self.rt.class_from_name(self.images[img_name], ns, name)
             if k:
                 return k
-        raise KeyError('%s.%s' % (ns, name))
+        raise KeyError(full)
 
     def method(self, klass, name, argc=-1):
         mm = self.rt.method_from_name(klass, name, argc)

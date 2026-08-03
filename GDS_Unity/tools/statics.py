@@ -24,16 +24,18 @@ PRIMS = {
 }
 
 
-def dump(g, spec):
-    rt, m = g.rt, g.m
+def resolve(g, spec):
     ns, _, name = spec.rpartition('.')
-    k = None
-    for img in g.s.images.values():
-        k = rt.class_from_name(img, ns, name)
-        if k:
-            break
-    if not k:
+    try:
+        return g.s.find_class(ns, name)
+    except KeyError:
         print('[statics] %s: not found' % spec)
+        return 0
+
+
+def dump(g, spec, k):
+    rt, m = g.rt, g.m
+    if not k:
         return
     rt.runtime_class_init(k)
     sf = m.read64(k + 0xb8)
@@ -68,16 +70,23 @@ def main():
     ap.add_argument('--apk', default='out/apk')
     ap.add_argument('--platform', type=int, default=11)
     ap.add_argument('--awake', action='store_true')
+    ap.add_argument('--frames', type=int, default=0)
     ap.add_argument('types', nargs='+')
     args = ap.parse_args()
 
     g = Game(args.apk, 640, 480, verbose=1, platform=args.platform)
     g.create_app()
-    if args.awake:
+    # resolve up front: name lookups are not safe to make late in a run
+    klasses = [(t, resolve(g, t)) for t in args.types]
+    if args.awake or args.frames:
         g.awake()
         g.post_frame()
-    for t in args.types:
-        dump(g, t)
+        g.start()
+        g.post_frame()
+    for _ in range(args.frames):
+        g.frame()
+    for t, k in klasses:
+        dump(g, t, k)
 
 
 if __name__ == '__main__':

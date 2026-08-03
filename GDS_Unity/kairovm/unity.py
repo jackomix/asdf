@@ -93,10 +93,16 @@ class Texture(UObj):
         self.wrap = 0
 
 
+#  VertexAttributeFormat -> bytes per component
+VA_SIZE = {0: 4, 1: 2, 2: 1, 3: 1, 4: 2, 5: 2, 6: 1, 7: 1, 8: 2, 9: 2,
+           10: 4, 11: 4}
+
+
 class Mesh(UObj):
     def __init__(self, host, managed=0):
         UObj.__init__(self, host, 'Mesh', managed, 'Mesh')
         self.channels = {}
+        self.layout = {}         # channel -> (dim, format, bytes-per-vertex)
         self.indices = {}
         self.topology = {}
 
@@ -1691,8 +1697,9 @@ def _isdebug(h, this, a):
 
 
 # =========================================================== immediate mode
-GL_MODE = {0: 'triangles', 1: 'triangle_strip', 2: 'quads', 3: 'lines',
-           4: 'line_strip'}
+# UnityEngine.GL mirrors the OpenGL primitive numbers, not a 0..n enum.
+GL_MODE = {1: 'lines', 2: 'line_strip', 4: 'triangles', 5: 'triangle_strip',
+           7: 'quads'}
 
 
 @icall('UnityEngine.GL::Begin(System.Int32)')
@@ -1991,7 +1998,8 @@ def _meshclear(h, this, a):
 def _meshsetchannel(h, this, a):
     m = _mesh(h, this)
     channel, fmt, dim, arr, count = a[0], a[1], a[2], a[3], a[4]
-    esz = 4 * dim
+    esz = dim * VA_SIZE.get(fmt, 4)
+    m.layout[channel] = (dim, fmt, esz)
     m.channels[channel] = h.m.read(h.array_data(arr), count * esz) if arr else b''
 
 
@@ -2006,7 +2014,8 @@ def _meshsetindices(h, this, a):
 
 @icall('UnityEngine.Mesh::get_vertexCount()')
 def _meshvcount(h, this, a):
-    return len(_mesh(h, this).channels.get(0, b'')) // 12
+    m = _mesh(h, this)
+    return len(m.channels.get(0, b'')) // max(1, m.layout.get(0, (3, 0, 12))[2])
 
 
 @icall('UnityEngine.Mesh::get_subMeshCount()')

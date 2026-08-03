@@ -38,14 +38,21 @@ def describe(h, p):
     return ' '.join(bits)
 
 
-def wrap(name, fn, deref):
+def wrap(name, fn, deref, stack=0, first=None):
     def w(h, this, a):
         r = fn(h, this, a)
+        if first is not None:
+            first[name] = first.get(name, 0) + 1
+            if first[name] > first['limit']:
+                return r
         print('[icall] %s' % name)
         print('        this = %s' % describe(h, this))
         for i, x in enumerate(a):
             print('        a%-3d = %s' % (i, describe(h, x)))
         print('        ->     %s' % describe(h, r if isinstance(r, int) else 0))
+        if stack:
+            for line in h.m.recent_methods(stack):
+                print('        at %s' % line)
         for off in deref:
             for i, x in enumerate(a):
                 if isinstance(x, int) and x:
@@ -65,15 +72,20 @@ def main():
     ap.add_argument('--platform', type=int, default=11)
     ap.add_argument('--out-offsets', default='0',
                     help='byte offsets to read back from pointer args after the call')
+    ap.add_argument('--stack', type=int, default=0,
+                    help='also print N frames of the managed call history')
+    ap.add_argument('--limit', type=int, default=0,
+                    help='only log the first N hits per signature')
     ap.add_argument('match', nargs='+', help='icall signature substrings')
     args = ap.parse_args()
 
     deref = [int(x, 0) for x in args.out_offsets.split(',') if x]
+    first = {'limit': args.limit} if args.limit else None
     hit = []
     for table in (U.IMPL, U.SHORT):
         for k in list(table):
             if any(mm.lower() in k.lower() for mm in args.match):
-                table[k] = wrap(k, table[k], deref)
+                table[k] = wrap(k, table[k], deref, args.stack, first)
                 hit.append(k)
     print('[trace] wrapping %d handlers:' % len(hit))
     for k in hit:
