@@ -292,24 +292,44 @@ int setvbuf(void *fp, char *b, int m, unsigned long s) { (void)fp;(void)b;(void)
 int fscanf(void *fp, const char *fmt, ...) { (void)fp;(void)fmt; return 0; }
 int fprintf_real(int fd, const char *fmt, ...); /* see below */
 
-/* ---- printf (no float) -> write syscall ---- */
+/* ---- printf (no float) -> write syscall.  Every byte also goes to an optional
+ * log file (kv_logfd) so a device test produces loader.log regardless of how the
+ * shell captures stdout. ---- */
+static int kv_logfd = -1;
+
+/* Open a log file to mirror all loader output into.  Returns 0 on success. */
+int kv_log_open(const char *path) {
+    int fd = open(path, 0x441);   /* O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400 */
+    if (fd < 0) return -1;
+    kv_logfd = fd;
+    return 0;
+}
+
+static void kv_outc(int c) {
+    raw_syscall(SYS_write, 1, (long)&c, 1, 0, 0, 0);
+    if (kv_logfd >= 0) raw_syscall(SYS_write, kv_logfd, (long)&c, 1, 0, 0, 0);
+}
+static void kv_outstr(const char *s) {
+    raw_syscall(SYS_write, 1, (long)s, (long)strlen(s), 0, 0, 0);
+    if (kv_logfd >= 0) raw_syscall(SYS_write, kv_logfd, (long)s, (long)strlen(s), 0, 0, 0);
+}
 static void putdec(long v, int neg) {
     char buf[24]; int i = 0;
     unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
     do { buf[i++] = '0' + (u % 10); u /= 10; } while (u);
     if (neg) buf[i++] = '-';
-    while (i) { char c = buf[--i]; raw_syscall(SYS_write, 1, (long)&c, 1, 0, 0, 0); }
+    while (i) { char c = buf[--i]; kv_outc(c); }
 }
 static void puthex(unsigned long v, int alt) {
     char buf[18]; int i = 0; const char *hx = "0123456789abcdef";
     do { buf[i++] = hx[v & 0xf]; v >>= 4; } while (v);
-    if (alt) { raw_syscall(SYS_write, 1, (long)"0x", 2, 0, 0, 0); }
-    while (i) { char c = buf[--i]; raw_syscall(SYS_write, 1, (long)&c, 1, 0, 0, 0); }
+    if (alt) kv_outstr("0x");
+    while (i) { char c = buf[--i]; kv_outc(c); }
 }
 int printf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     for (const char *s = fmt; *s; s++) {
-        if (*s != '%') { raw_syscall(SYS_write, 1, (long)s, 1, 0, 0, 0); continue; }
+        if (*s != '%') { kv_outc(*s); continue; }
         s++;
         /* flags + length modifiers (%#x, %zu, %ld, %lx ...): skip them */
         int alt = 0;
@@ -318,13 +338,13 @@ int printf(const char *fmt, ...) {
             if (*s == '#') alt = 1;
             s++;
         }
-        if (*s == 's') { char *t = va_arg(ap, char *); if (!t) t = "(null)"; while (*t) raw_syscall(SYS_write,1,(long)t++,1,0,0,0); }
+        if (*s == 's') { char *t = va_arg(ap, char *); if (!t) t = "(null)"; kv_outstr(t); }
         else if (*s == 'd' || *s == 'i') { long v = va_arg(ap, long); putdec(v, v < 0); }
         else if (*s == 'p') { void *p = va_arg(ap, void *); puthex((unsigned long)p, 1); }
         else if (*s == 'x' || *s == 'X' || *s == 'u') { unsigned long v = va_arg(ap, unsigned long); puthex(v, alt); }
-        else if (*s == 'c') { int c = va_arg(ap, int); raw_syscall(SYS_write,1,(long)&c,1,0,0,0); }
-        else if (*s == '%') { raw_syscall(SYS_write,1,(long)"%",1,0,0,0); }
-        else { raw_syscall(SYS_write,1,(long)s,1,0,0,0); }
+        else if (*s == 'c') { int c = va_arg(ap, int); kv_outc(c); }
+        else if (*s == '%') { kv_outc('%'); }
+        else { kv_outc(*s); }
     }
     va_end(ap);
     return 0;
@@ -334,7 +354,7 @@ void perror(const char *s) { if (s) printf("%s: error\n", s); }
 void exit(int code) { raw_syscall(SYS_exit, code, 0, 0, 0, 0, 0); for (;;) {} }
 void _Exit(int code) { exit(code); }
 void _exit(int code) { exit(code); }
-void abort(void) { raw_syscall(SYS_write, 1, (long)"abort()\n", 8, 0, 0, 0); raw_syscall(SYS_exit, 134, 0,0,0,0,0); for (;;) {} }
+void abort(void) { kv_outstr("abort()\n"); raw_syscall(SYS_exit, 134, 0,0,0,0,0); for (;;) {} }
 
 /* TLS errno: the .so reads *__errno() (bionic exports __errno as a function).
  * Give it a stable slot. */

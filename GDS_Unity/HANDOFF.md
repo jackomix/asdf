@@ -299,10 +299,14 @@ Install on the R36S:
 2. Unzip its contents into `/roms/ports/` (creates `/roms/ports/gamedevstory/`).
 3. In EmulationStation: Ports → Game Dev Story (or rescan ROMs first).
 
-The launcher (`Game Dev Story.sh`) sources PortMaster's control.txt, cd's to
-the game folder, and tees everything to `gamedevstory/log.txt`.  **Send back
-that `log.txt`** - it shows: which libs loaded, init_array ctor counts,
-JNI_OnLoad result, il2cpp_init result, and any memory fault / abort.
+The launcher (`Game Dev Story.sh`) locates the game folder and runs `loader2`
+inside it.  `loader2` **self-logs to `gamedevstory/gamedevstory/loader.log`**
+(open()d directly, so it is written regardless of how the shell captures
+output).  **Send back that `loader.log`** - it shows: which libs loaded,
+init_array ctor counts, JNI_OnLoad result, il2cpp_init result, and any memory
+fault / abort.  The first line is
+`[loader] === Game Dev Story native loader ===`, so you can tell at a glance
+whether loader2 even started.
 
 Port structure (matches PortMaster-New conventions):
 ```

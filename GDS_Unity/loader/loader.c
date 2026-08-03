@@ -25,6 +25,7 @@
  * needs.  Declared here so loader.c can drive the Unity boot. */
 void *kv_jni_java_vm(void);
 void *kv_jni_env(void);
+int kv_log_open(const char *path);
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -391,6 +392,11 @@ int real_main(int argc, char **argv) {
      *   loader2 libil2cpp.so libunity.so libmain.so
      */
     const char *argv0 = argc > 0 && argv[0] ? argv[0] : "loader2";
+    /* Mirror all output into a log file next to the executable, so a device
+     * test always produces a diagnostic log even if the shell can't capture it.
+     */
+    kv_log_open(kv_abspath(argv0, "loader.log"));
+    printf("[loader] === Game Dev Story native loader ===\n");
     const char *libs[3];
     int libc = 0;
     if (argc >= 4) {

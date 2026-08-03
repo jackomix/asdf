@@ -1,45 +1,37 @@
 #!/bin/bash
+# Game Dev Story - PortMaster launcher for the R36S.
+# Runs loader2, which loads libil2cpp/libunity/libmain and boots the game.
+# loader2 writes its own loader.log next to itself (in gamedevstory/).
 
-XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+# --- Locate the game directory robustly (works with or without PortMaster) ---
+GAMEDIR="$(cd "$(dirname "$0")" && pwd)"
+GAMEDIR="$GAMEDIR/gamedevstory"
+cd "$GAMEDIR" || { echo "cannot cd to $GAMEDIR" >&2; sleep 5; exit 1; }
 
-if [ -d "/opt/system/Tools/PortMaster/" ]; then
+# --- Use PortMaster's control/input setup if available, else carry on ---
+controlfolder=""
+if [ -d "/opt/system/Tools/PortMaster" ]; then
   controlfolder="/opt/system/Tools/PortMaster"
-elif [ -d "/opt/tools/PortMaster/" ]; then
-  controlfolder="/opt/tools/PortMaster"
-elif [ -d "$XDG_DATA_HOME/PortMaster/" ]; then
-  controlfolder="$XDG_DATA_HOME/PortMaster"
-else
+elif [ -d "/roms/ports/PortMaster" ]; then
   controlfolder="/roms/ports/PortMaster"
+elif [ -d "/storage/roms/ports/PortMaster" ]; then
+  controlfolder="/storage/roms/ports/PortMaster"
+fi
+if [ -n "$controlfolder" ] && [ -f "$controlfolder/control.txt" ]; then
+  source "$controlfolder/control.txt"
+  [ -f "$controlfolder/mod_${CFW_NAME}.txt" ] && source "$controlfolder/mod_${CFW_NAME}.txt"
+  get_controls 2>/dev/null
 fi
 
-source "$controlfolder/control.txt"
-[ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
+# --- Ensure uinput is usable for future input mapping ---
+chmod 666 /dev/uinput 2>/dev/null
 
-get_controls
+echo "=== Game Dev Story: launching loader2 from $GAMEDIR ==="
+echo "=== This also writes loader.log in $GAMEDIR ==="
+./loader2 2>&1
 
-GAMEDIR="/$directory/ports/gamedevstory"
-CONFDIR="$GAMEDIR/conf/"
-
-mkdir -p "$CONFDIR"
-cd "$GAMEDIR"
-
-> "$GAMEDIR/log.txt" && exec > >(tee "$GAMEDIR/log.txt") 2>&1
-
-export XDG_DATA_HOME="$CONFDIR"
-
-# The game files (loader + libs + data) live in the gamedevstory/ subdir,
-# matching the PortMaster convention of a port folder containing its files.
-cd "$GAMEDIR/gamedevstory"
-
-export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
-
-# --- Launch ---
-# Game Dev Story is Android/Unity IL2CPP.  loader2 is our native aarch64 loader
-# that supplies the Android-underneath (bionic shims, JNI, EGL stubs) and runs
-# the game's ARM64 machine code natively on the R36S.
-$ESUDO chmod 666 /dev/uinput 2>/dev/null
-./loader2 2>&1 | tee -a "$GAMEDIR/log.txt"
-
-# Clean up input helpers if we use them (placeholder until input shim is done)
-pm_finish
-printf "\033c" >> /dev/tty1
+echo "=== Game Dev Story exited (code $?) ==="
+echo "If it crashed, send $GAMEDIR/loader.log to the developer."
+sleep 3
+printf "\033c" >> /dev/tty1 2>/dev/null
+exit 0
