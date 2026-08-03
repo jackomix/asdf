@@ -114,7 +114,7 @@ ok "Device is online and reachable"
 
 # SSH options used by later steps: NOT BatchMode (so password login works),
 # but tolerant of ArkOS host-key changes.
-SSHOPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5)
+SSHOPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=5)
 
 # ---- 2. get the port zip ----
 step "Fetching gamedevstory.zip"
@@ -143,15 +143,27 @@ fi
 SIZE=$(du -h "$ZIP" | cut -f1)
 ok "zip ready ($SIZE)"
 
-# ---- 3. upload ----
+# ---- 3. upload (retry loop - the R36S's flaky Wi-Fi / changing host key can
+#      make scp fail on the first attempt; keep retrying until it succeeds or
+#      the overall timeout runs out) ----
 step "Uploading to $HOST:$PORTS_DIR  (this is the big 38 MB transfer)"
 echo "   (be patient - 38 MB over handheld Wi-Fi can take a minute or two;"
-echo "    scp shows a progress bar below. If it stalls past ${XFER_TIMEOUT}s,"
-echo "    the R36S Wi-Fi may have dropped and a device restart helps.)"
-# scp's own progress bar goes to stderr; keep stderr attached so you SEE it.
-if ! timeout "$XFER_TIMEOUT" scp -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip"; then
-  fail "Upload failed/timed out. The R36S may have gone offline."
-  echo "  ${C_YEL}Tip: restart the R36S and re-run.${C_RST}"
+echo "    scp shows a progress bar below. A failed attempt is retried"
+echo "    automatically up to ${XFER_TIMEOUT}s.)"
+
+SCP_BASE="scp -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+start=$(date +%s)
+uploaded=0
+while [ $(( $(date +%s) - start )) -lt "$XFER_TIMEOUT" ]; do
+  if $SCP_BASE "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip"; then
+    uploaded=1; break
+  fi
+  warn "scp failed - retrying in 3s..."
+  sleep 3
+done
+if [ "$uploaded" != "1" ]; then
+  fail "Upload failed after retries. The R36S Wi-Fi may be too flaky."
+  echo "  ${C_YEL}Tip: restart the R36S and re-run, or use a wired/USB network.${C_RST}"
   exit 1
 fi
 ok "uploaded"
