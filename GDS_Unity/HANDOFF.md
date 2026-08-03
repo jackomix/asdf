@@ -282,33 +282,38 @@ python3 tools/run_aarch64.py loader/loader2 \
 ## DEVICE TEST (R36S) - READ THIS FIRST if handing off to a live test
 
 The loader is a **standalone AArch64 ET_EXEC with no dynamic dependencies** -
-it runs natively on the R36S (no glibc/pkg install needed).  Build the device
-package with:
+it runs natively on the R36S (no glibc/pkg install needed).  It's packaged as a
+**proper PortMaster port** so it shows up in EmulationStation under Ports.
+
+Build the PortMaster package:
 
 ```
 cd GDS_Unity
-bash loader/build.sh                    # builds loader/loader2
-rm -rf /tmp/gds_pkg && mkdir -p /tmp/gds_pkg
-cp loader/loader2 loader/dev_run.sh /tmp/gds_pkg/
-cp out/apk/lib/arm64-v8a/libil2cpp.so \
-   out/apk/lib/arm64-v8a/libunity.so \
-   out/apk/lib/arm64-v8a/libmain.so /tmp/gds_pkg/
-cp -r out/apk/assets/bin/Data /tmp/gds_pkg/data
-cd /tmp/gds_pkg && zip -r GameDevStory_R36S.zip .
+bash loader/build.sh                # builds loader/loader2
+bash tools/extract_apk.sh ../APKs/"Game Dev Story_2.6.9.apk"   # -> out/apk
+bash tools/make_port.sh             # builds GameDevStory_PortMaster.zip
 ```
 
-Copy `GameDevStory_R36S.zip` (or the folder) to the R36S SD card, e.g.
-`/roms/ports/gamedevstory/`, unzip, and run:
+Install on the R36S:
+1. Copy `GameDevStory_PortMaster.zip` to the R36S SD card.
+2. Unzip its contents into `/roms/ports/` (creates `/roms/ports/gamedevstory/`).
+3. In EmulationStation: Ports → Game Dev Story (or rescan ROMs first).
 
-```
-cd /roms/ports/gamedevstory
-./dev_run.sh
-```
+The launcher (`Game Dev Story.sh`) sources PortMaster's control.txt, cd's to
+the game folder, and tees everything to `gamedevstory/log.txt`.  **Send back
+that `log.txt`** - it shows: which libs loaded, init_array ctor counts,
+JNI_OnLoad result, il2cpp_init result, and any memory fault / abort.
 
-`dev_run.sh` runs `./loader2` and tees everything to `loader.log`.  **Send back
-`loader.log`** - it shows: which libs loaded, init_array ctor counts, JNI_OnLoad
-result, il2cpp_init result, and any memory fault / abort.  The log is the
-comprehensive diagnostic needed to iterate.
+Port structure (matches PortMaster-New conventions):
+```
+gamedevstory/
+  Game Dev Story.sh     launcher
+  port.json             PM metadata (arch: aarch64)
+  README.md
+  gameinfo.xml          ES metadata
+  screenshot.png / cover.png
+  gamedevstory/         game files: loader2 + libil2cpp/libunity/libmain.so + data/
+```
 
 Known bench-only limitation (should NOT happen on the device): under Unicorn the
 IL2CPP GC's deep runtime-internal calls can fault on the artificial stack/heap
