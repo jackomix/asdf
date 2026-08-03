@@ -32,7 +32,7 @@ extern void *stderr;
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.7.0-glibc"
+#define GDS_BUILD_VERSION "0.8.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -144,13 +144,18 @@ void *loader_lookup_export(const char *wanted) {
 }
 
 void *kv_egl_route(const char *name);   /* egl_shim.c: surface symbols -> shim */
+void *kv_bionic_route(const char *name); /* bionic_bridge.c: bionic pthread/signal ABI */
 static void *resolve(const char *sym) {
-    /* The EGL/ANativeWindow/sensor/looper surface libunity imports must bind to
-     * our SDL-backed shim (egl_shim.c), NOT to dlsym: glibc has no EGL and the
-     * real libEGL (dlopen'd RTLD_GLOBAL) wants an Android ANativeWindow, which
-     * doesn't exist here.  The shim turns those calls into real SDL2 GL ops. */
     if (sym) {
+        /* EGL/ANativeWindow/sensor surface (egl_shim.c) and the bionic
+         * pthread/signal ABI bridge (bionic_bridge.c) must bind to our shims,
+         * NOT to glibc: glibc has no EGL, and glibc's sigset_t (128 bytes) /
+         * pthread object sizes don't match bionic's (8-byte sigset), so a raw
+         * passthrough overruns the .so's bionic-sized buffers and corrupts the
+         * heap. */
         void *r = kv_egl_route(sym);
+        if (r) return r;
+        r = kv_bionic_route(sym);
         if (r) return r;
     }
     return dlsym(0, sym);
@@ -444,16 +449,42 @@ int real_main(int argc, char **argv);
  *   slot 6 (off 0x30) stack lo
  *   slot 7 (off 0x38) stack hi
  */
+/* ---- Bionic TLS guard pad ---- *
+ * libil2cpp/libunity are bionic binaries: they read the bionic thread-info
+ * slots directly off tpidr_el0 (thread id @+0x08, stack guard @+0x28, stack
+ * lo @+0x30, stack hi @+0x38).  Under glibc, tpidr_el0 points at glibc's TLS,
+ * which has a different layout - so those reads get garbage, and the GC can
+ * make bad allocations.  We CANNOT overwrite tpidr_el0 (that breaks glibc's
+ * TLS -> pc=0 crash).  Instead, reserve a 256-byte TLS variable that, being
+ * the first TLS var in this executable, lands right after the glibc TCB at
+ * tpidr_el0+0x28 - exactly where bionic reads its slots - and pre-fill the
+ * bionic slots inside it (same trick as terraria-nextos g_bionic_guard_pad). */
+__attribute__((aligned(16))) static _Thread_local unsigned char kv_bionic_pad[256] = {1};
+
 static void kv_setup_tls(void) {
-    /* The freestanding loader had to synthesize a bionic-style TLS block and
-     * point tpidr_el0 at it via `msr`, because there was no libc.  This glibc
-     * build MUST NOT do that: glibc owns tpidr_el0 (errno, stdio, locale,
-     * stack-protector, thread-local storage all hang off it).  Clobbering it
-     * breaks the very next glibc call (jumps to pc=0).  Keep glibc's TLS.
-     * (libunity's init_array reads bionic thread-info slots off tpidr_el0; if
-     * that becomes a problem, replicate terraria-nextos's TLS guard-pad layout
-     * instead of overwriting the register.) */
-    printf("[loader] using glibc TLS (tpidr_el0 owned by glibc)\n");
+    /* Keep glibc's tpidr_el0 (do NOT msr it - that broke glibc).  The bionic
+     * slots that libil2cpp reads are at tp+0x08/+0x28/+0x30/+0x38; our
+     * 256-byte TLS pad must cover the ones after the TCB.  Initialize the
+     * bionic stack-guard + stack bounds within it. */
+    unsigned long tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    unsigned long pad_lo = (unsigned long)kv_bionic_pad;
+    unsigned long pad_hi = pad_lo + sizeof(kv_bionic_pad);
+    /* bionic stack-guard slot @ tp+0x28, stack lo/hi @ tp+0x30/+0x38 */
+    if (tp + 0x38 + 8 <= pad_hi && tp + 0x28 >= pad_lo) {
+        unsigned long sp;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        unsigned long hi = (sp + 0x400000) & ~0xffffUL;
+        unsigned long lo = (sp - 0x800000) & ~0xffffUL;
+        *(unsigned long *)(tp + 0x28) = 0x0BADC0DEDEADBEEFUL;   /* stack guard */
+        *(unsigned long *)(tp + 0x30) = lo;
+        *(unsigned long *)(tp + 0x38) = hi;
+        printf("[loader] bionic TLS slots set in guard pad (tp=%#lx pad=[%#lx..%#lx])\n",
+               tp, pad_lo, pad_hi);
+    } else {
+        printf("[loader] WARNING: bionic TLS slots (tp+0x28=%#lx) outside guard pad [%#lx..%#lx]\n",
+               tp + 0x28, pad_lo, pad_hi);
+    }
 }
 
 void kv_egl_dlopen(void);   /* glibc_shims.c: load real Mali GPU drivers */

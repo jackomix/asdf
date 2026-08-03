@@ -342,7 +342,37 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.7.0-glibc) - egl_shim (SDL-backed GLES2) added
+## LATEST STATUS (build 0.8.0-glibc) - bionic bridge (pthread/signal ABI) + TLS guard pad
+
+After 0.7.0 reached graphics init, it died with `malloc(): invalid size
+(unsorted)` during libil2cpp's init_array.  Verified the relocation phase is
+clean (host x86 probe on the real libil2cpp.so: 197253 relas + 538 jmprels,
+malloc OK after) - so the corruption is a **bionic/glibc ABI mismatch** in the
+sync/signal layer that a ctor triggers.
+
+Two fixes added (both modeled on terraria-nextos):
+- `loader/bionic_bridge.c` - routes the .so's pthread/semaphore/signal imports
+  to bionic->glibc shims.  The critical one: **sigset_t is 8 bytes in arm64
+  bionic but 128 in glibc**, so libil2cpp calling glibc's
+  sigemptyset/sigaction/pthread_sigmask on an 8-byte buffer wrote 128 bytes ->
+  heap corruption.  Bridge translates 8B<->128B sigsets, and pthread mutex/cond/
+  rwlock/sem use the "slot" trick (store a pointer to a real glibc object in the
+  bionic object's first word) so glibc never overruns bionic-sized objects.
+- **bionic TLS guard pad** - libil2cpp reads bionic thread-info slots off
+  tpidr_el0 (stack guard @+0x28, stack lo/hi @+0x30/+0x38).  We can't msr
+  tpidr_el0 (broke glibc -> pc=0).  Instead a 256-byte TLS variable
+  (kv_bionic_pad, verified at TLS offset 0, size 0x100) lands right after the
+  glibc TCB at tpidr_el0+0x28, and kv_setup_tls pre-fills the bionic slots
+  inside it - same trick as terraria's g_bionic_guard_pad.
+- Also resolved the 2 previously-unresolved symbols (pthread_atfork,
+  android_set_abort_message) with stubs.
+
+Verified in-binary: kv_sigemptyset/kv_sigaction/kv_pthread_sigmask/
+kv_pthread_mutex_lock/kv_sem_wait/kv_bionic_route/android_set_abort_message/
+kv_pthread_atfork all exported; TLS pad at offset 0 size 256.  Needs on-device
+deploy to confirm init_array now survives.
+
+### Prior: 0.7.0 - egl_shim (SDL-backed GLES2) added
 
 The freestanding loader (0.5.0) crashed at Unity's `nativeRecreateGfxState`
 because it stubbed EGL/GL and never created a real GL context.  After studying
