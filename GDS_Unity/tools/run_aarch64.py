@@ -267,7 +267,7 @@ def main():
             uc.reg_write(UC_ARM64_REG_X0, 0)
         elif num == 215:  # access
             uc.reg_write(UC_ARM64_REG_X0, 0)
-        elif num == 257:  # openat
+        elif num == 257 or num == 56:  # openat (56=aarch64, 257=x86_64 legacy)
             uc.reg_write(UC_ARM64_REG_X0, sys_openat(uc, x0, x1, x2, x3))
         elif num == 63:  # read
             uc.reg_write(UC_ARM64_REG_X0, sys_read(uc, x0, x1, x2))
@@ -279,8 +279,6 @@ def main():
             uc.reg_write(UC_ARM64_REG_X0, 0)
         elif num == 35:  # nanosleep
             uc.reg_write(UC_ARM64_REG_X0, 0)
-        elif num == 56:  # clone
-            uc.reg_write(UC_ARM64_REG_X0, 0)  # pretend child/no thread
         elif num == 122:  # fstatat
             uc.reg_write(UC_ARM64_REG_X0, sys_fstatat(uc, x0, x1, x2, x3))
         elif num == 174:  # rt_sigprocmask

@@ -16,7 +16,7 @@
 #define SYS_mprotect   226
 #define SYS_write      64
 #define SYS_exit       93
-#define SYS_openat     257
+#define SYS_openat     56     /* aarch64 openat (was wrongly 257 = x86_64!) */
 #define SYS_read       63
 #define SYS_close      57
 #define SYS_brk        214
