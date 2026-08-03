@@ -297,9 +297,16 @@ int fprintf_real(int fd, const char *fmt, ...); /* see below */
  * shell captures stdout. ---- */
 static int kv_logfd = -1;
 
-/* Open a log file to mirror all loader output into.  Returns 0 on success. */
+/* Open a log file to mirror all loader output into.  Tries several locations so
+ * a diagnostic log is ALWAYS produced on the device regardless of cwd:
+ *   - the path given (loader's own dir, e.g. .../gamedevstory/loader.log)
+ *   - /tmp/gamedevstory_loader.log (always writable + easy to find over SSH)
+ * Returns the fd of the first that opened, or -1. */
 int kv_log_open(const char *path) {
-    int fd = open(path, 0x441);   /* O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400 */
+    int fd = -1;
+    if (path) fd = open(path, 0x441);              /* O_WRONLY|O_CREAT|O_APPEND */
+    if (fd < 0) fd = open("/tmp/gamedevstory_loader.log", 0x441);
+    if (fd < 0) fd = open("loader.log", 0x441);
     if (fd < 0) return -1;
     kv_logfd = fd;
     return 0;
