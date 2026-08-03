@@ -21,7 +21,7 @@ from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_X0, \
 
 PAGE = 0x1000
 STACK_TOP = 0x7fff0000
-STACK_SZ = 0x100000
+STACK_SZ = 0x800000  # 8 MB stack + headroom; IL2CPP runtime threads read just above top
 CODE_BASE = 0x400000  # where we load the executable
 
 
@@ -73,7 +73,7 @@ def load(path, argv):
     entry = BASE + (e_entry - minv)    # == e_entry
 
     # Stack
-    uc.mem_map(STACK_TOP - STACK_SZ, STACK_SZ + PAGE, 3)
+    uc.mem_map(STACK_TOP - STACK_SZ, STACK_SZ + 0x20000, 3)  # +128 KB headroom above top (guard/red-zone reads)
     sp = STACK_TOP
     # Build argv strings at the very top of the stack region.
     arg_bytes = []
@@ -111,7 +111,7 @@ def load(path, argv):
     # pointer).  The real kernel sets it per-thread; libunity.so's init_array
     # does `mrs x19, tpidr_el0; ldr x10, [x19, #0x28]`, so if it's 0 the first
     # TLS access faults.  Map a zeroed TLS block and point tpidr_el0 at it.
-    tls_base = 0x7fef0000 - 0x10000  # just below the stack region
+    tls_base = 0x7f7e0000  # just below the 8 MB stack region (0x7f7f0000..)
     uc.mem_map(tls_base, 0x10000, 7)
     uc.reg_write(UC_ARM64_REG_TPIDR_EL0, tls_base)
 
@@ -127,7 +127,9 @@ def main():
 
     def sys_write(uc, port, buf, size):
         if port == 1 or port == 2:
-            out.append(uc.mem_read(buf, size).decode('utf-8', 'replace'))
+            s = uc.mem_read(buf, size).decode('utf-8', 'replace')
+            out.append(s)
+            sys.stdout.write(s); sys.stdout.flush()
         return size
 
     def sys_exit(uc, code):
@@ -275,19 +277,43 @@ def main():
             uc.reg_write(UC_ARM64_REG_X0, x2)
         elif num == 222:  # mmap (guest calling svc directly, e.g. the loader's heap)
             addr, length, prot, flags, fd, off = (x0, x1, x2, x3, x4, x5)
+            prot = prot if prot else 7
+            # The GC reserves a 4 GB managed heap.  Unicorn can't back 4 GB of
+            # real RAM, so map the first page now and record a SPARSE region;
+            # the memory-fault hook maps the rest lazily (like the real kernel
+            # committing pages on demand).  Only do this for large maps; small
+            # ones map eagerly.
+            SPARSE_THRESH = 1024 * 1024 * 1024  # 1 GB: only huge GC reservations go sparse
+            def _do_map(base, ln):
+                if ln <= SPARSE_THRESH:
+                    uc.mem_map(base, ln, prot)
+                    return False
+                uc.mem_map(base, PAGE, prot)   # map one page, rest sparse
+                sp = getattr(uc, '_sparse', None)
+                if sp is None:
+                    sp = uc._sparse = []
+                sp.append((base, base + ln, prot))
+                return True
             try:
                 if not addr or (flags & 0x10):  # MAP_FIXED, or no hint
                     tgt = addr if addr else getattr(uc, '_mmap_brk', 0x500000000)
-                    uc.mem_map(tgt, length, prot if prot else 7)
+                    _do_map(tgt, length)
                     uc.reg_write(UC_ARM64_REG_X0, tgt)
                     if not addr:
                         uc._mmap_brk = (tgt + length + 0x1000)
                 else:
-                    uc.mem_map(addr, length, prot if prot else 7)
+                    _do_map(addr, length)
                     uc.reg_write(UC_ARM64_REG_X0, addr)
             except Exception as e:
-                print('[sys_mmap] %#x %#x -> %r' % (addr, length, e), file=sys.stderr)
-                uc.reg_write(UC_ARM64_REG_X0, -1)
+                # retry at a higher base once in case of overlap
+                try:
+                    tgt = getattr(uc, '_mmap_brk', 0x1000000000)
+                    _do_map(tgt, length)
+                    uc.reg_write(UC_ARM64_REG_X0, tgt)
+                    uc._mmap_brk = tgt + length + 0x1000
+                except Exception as e2:
+                    print('[sys_mmap] %#x %#x -> %r / %r' % (addr, length, e, e2), file=sys.stderr)
+                    uc.reg_write(UC_ARM64_REG_X0, -1)
         elif num == 226:  # mprotect
             try:
                 uc.mem_protect(x0, x1, x2 if x2 else 7)
@@ -315,9 +341,29 @@ def main():
     uc.hook_add(unicorn.UC_HOOK_CODE, _code)
 
     def _memerr(uc, access, addr, size, value, user):
+        # Lazy commit for sparse regions (GC heap reservation): if the faulting
+        # address lies inside a sparse range, map a CHUNK covering the whole
+        # access (plus margin) now and let the guest retry.  Zero pages are
+        # fine (bss-like).  Mapping a chunk avoids single-page re-entry storms
+        # on large heap writes.
+        sp = getattr(uc, '_sparse', None)
+        if sp:
+            for (b, e, pr) in sp:
+                if b <= addr < e:
+                    try:
+                        start = addr & ~(PAGE - 1)
+                        # map up to 4 MB at once (clamp to the region)
+                        chunk = 4 * 1024 * 1024
+                        ln = min(chunk, e - start)
+                        ln = max(ln, PAGE)
+                        uc.mem_map(start, ln, pr)
+                        return True   # handle the fault: retry the access
+                    except Exception:
+                        break
         print('[unicorn MEM %s @%#x sz %d pc=%#x]' % (
             {0: 'READ', 1: 'WRITE', 2: 'FETCH', 3: 'READ*', 4: 'WRITE*'}.get(access, access), addr, size,
             uc.reg_read(UC_ARM64_REG_PC)), file=sys.stderr)
+        return False
 
     uc.hook_add(unicorn.UC_HOOK_MEM_INVALID, _memerr)
     print('[bench] entry=%#x minv=%#x maxv=%#x mapped %#x..%#x'
@@ -327,12 +373,11 @@ def main():
     try:
         uc.emu_start(entry, entry + 0x7fffffff)
     except SystemExit as e:
-        out.append('\n%s\n' % e)
+        sys.stdout.write('\n%s\n' % e); sys.stdout.flush()
     except Exception as e:
         import traceback
-        out.append('\n[unicorn aborted] %r\n' % e)
-        out.append(traceback.format_exc())
-    sys.stdout.write(''.join(out))
+        sys.stdout.write('\n[unicorn aborted] %r\n' % e); sys.stdout.flush()
+        sys.stdout.write(traceback.format_exc()); sys.stdout.flush()
 
 
 if __name__ == '__main__':

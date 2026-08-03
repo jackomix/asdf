@@ -212,6 +212,86 @@ int fstat(int fd, void *st) {
     return 0;
 }
 
+/* ---- real stdio backed by the loader's fd syscalls ----
+ * il2cpp_init reads global-metadata.dat and the managed assemblies through
+ * fopen/fread/fseek.  Under the bench these resolve to the same openat/read/
+ * lseek syscalls the loader uses, so the extracted APK assets are reachable.
+ * FILE is a small struct holding the underlying fd + current offset + flags. */
+typedef struct { int fd; int err; int eof; int mode; } kv_FILE;
+#define KV_FOPEN_READ 1
+static kv_FILE kv_files[64];
+static int kv_nfiles = 1;  /* 0 is reserved (NULL) */
+
+static kv_FILE *kv_file_new(int fd) {
+    if (kv_nfiles >= 64) return 0;
+    kv_FILE *f = &kv_files[kv_nfiles++];
+    f->fd = fd; f->err = 0; f->eof = 0; f->mode = KV_FOPEN_READ;
+    return f;
+}
+
+void *fopen(const char *path, const char *mode) {
+    int flags = KV_FOPEN_READ;
+    if (mode && mode[0] == 'w') flags = 0x201;      /* O_WRONLY|O_CREAT|O_TRUNC */
+    int fd = open(path, flags);
+    if (fd < 0) return 0;
+    return kv_file_new(fd);
+}
+int fclose(void *fp) {
+    kv_FILE *f = fp; if (!f) return 0;
+    close(f->fd); return 0;
+}
+unsigned long fread(void *ptr, unsigned long sz, unsigned long nmemb, void *fp) {
+    kv_FILE *f = fp; if (!f) return 0;
+    long n = (long)(sz * nmemb);
+    ssize_t r = read(f->fd, ptr, (unsigned long)n);
+    if (r <= 0) { if (r == 0) f->eof = 1; else f->err = 1; return 0; }
+    return (unsigned long)r / sz;
+}
+unsigned long fwrite(const void *ptr, unsigned long sz, unsigned long nmemb, void *fp) {
+    kv_FILE *f = fp; if (!f) return 0;
+    long n = (long)(sz * nmemb);
+    ssize_t r = write(f->fd, ptr, (unsigned long)n);
+    if (r <= 0) { f->err = 1; return 0; }
+    return (unsigned long)r / sz;
+}
+int fflush(void *fp) { (void)fp; return 0; }
+int fseek(void *fp, long off, int whence) {
+    kv_FILE *f = fp; if (!f) return -1;
+    f->eof = 0;
+    return (int)lseek(f->fd, off, whence);
+}
+int fseeko(void *fp, long off, int whence) { return fseek(fp, off, whence); }
+long ftell(void *fp) {
+    kv_FILE *f = fp; if (!f) return -1;
+    return lseek(f->fd, 0, SEEK_CUR);
+}
+long ftello(void *fp) { return ftell(fp); }
+int feof(void *fp) { kv_FILE *f = fp; return f ? f->eof : 0; }
+int ferror(void *fp) { kv_FILE *f = fp; return f ? f->err : 0; }
+int clearerr(void *fp) { kv_FILE *f = fp; if (f) { f->err=0; f->eof=0; } return 0; }
+int fileno(void *fp) { kv_FILE *f = fp; return f ? f->fd : -1; }
+void *fdopen(int fd, const char *mode) { (void)mode; return kv_file_new(fd); }
+int fputc(int c, void *fp) { kv_FILE *f=fp; if(!f) return -1; unsigned char b=(unsigned char)c; return write(f->fd,&b,1)==1?c:-1; }
+int fputs(const char *s, void *fp) { kv_FILE *f=fp; if(!f) return -1; return write(f->fd,s,strlen(s))<0?-1:0; }
+char *fgets(char *b, int n, void *fp) {
+    kv_FILE *f=fp; if(!f||n<=0) return 0;
+    int i=0;
+    while (i<n-1) {
+        unsigned char c;
+        ssize_t r=read(f->fd,&c,1);
+        if (r<=0) { if (i==0) return 0; break; }
+        b[i++]=(char)c;
+        if (c=='\n') break;
+    }
+    b[i]=0;
+    if (i==0) return 0;
+    return b;
+}
+int setbuf(void *fp, char *b) { (void)fp;(void)b; return 0; }
+int setvbuf(void *fp, char *b, int m, unsigned long s) { (void)fp;(void)b;(void)m;(void)s; return 0; }
+int fscanf(void *fp, const char *fmt, ...) { (void)fp;(void)fmt; return 0; }
+int fprintf_real(int fd, const char *fmt, ...); /* see below */
+
 /* ---- printf (no float) -> write syscall ---- */
 static void putdec(long v, int neg) {
     char buf[24]; int i = 0;

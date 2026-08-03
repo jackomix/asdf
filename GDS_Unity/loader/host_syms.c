@@ -115,15 +115,7 @@ int strcoll_l(const char *a, const char *b, void *l) { (void)l; return strcmp(a,
 unsigned long strxfrm_l(char *d, const char *s, unsigned long n, void *l) { (void)d;(void)s;(void)n;(void)l; return 0; }
 int wcscoll_l(const void *a, const void *b, void *l) { (void)a;(void)b;(void)l; return 0; }
 unsigned long wcsxfrm_l(void *d, const void *s, unsigned long n, void *l) { (void)d;(void)s;(void)n;(void)l; return 0; }
-void *fopen(const char *p, const char *m) { (void)p;(void)m; return 0; }
-int fclose(void *f) { (void)f; return 0; }
-int fflush(void *f) { (void)f; return 0; }
-unsigned long fread(void *p, unsigned long s, unsigned long n, void *f) { (void)p;(void)s;(void)n;(void)f; return 0; }
-unsigned long fwrite(const void *p, unsigned long s, unsigned long n, void *f) { (void)p;(void)s;(void)n;(void)f; return 0; }
-int fputc(int c, void *f) { (void)f; return c; }
-int fseek(void *f, long o, int w) { (void)f;(void)o;(void)w; return 0; }
-int fseeko(void *f, long o, int w) { (void)f;(void)o;(void)w; return 0; }
-long ftello(void *f) { (void)f; return 0; }
+/* real fopen/fclose/fread/fwrite/fputc/fseek/fseeko/ftello live in freestdlib.c */
 int access(const char *p, int m) { (void)p;(void)m; return -1; }
 int unlink(const char *p) { (void)p; return -1; }
 int rename(const char *a, const char *b) { (void)a;(void)b; return -1; }
@@ -148,13 +140,17 @@ void *readdir(void *d) { (void)d; return 0; }
 int closedir(void *d) { (void)d; return 0; }
 int stat(const char *p, void *st) { (void)p; if (st) memset(st, 0, 144); return -1; }
 int lstat(const char *p, void *st) { (void)p; if (st) memset(st, 0, 144); return -1; }
+/* POSIX signal-set fns return int 0 on success.  bionic sigset_t is 8 bytes;
+ * glibc's is 128.  The .so passes a bionic-sized sigset; we don't actually use
+ * it for boot, so just set bit 0 and return 0 (success).  Returning the pointer
+ * (non-zero) made the runtime think sigfillset "failed". */
 int sigaction(int s, const void *a, void *o) { (void)s;(void)a;(void)o; return 0; }
 int signal(int s, void *h) { (void)s;(void)h; return 0; }
 int sigaltstack(const void *ss, void *os) { (void)ss; if (os) memset(os, 0, 24); return 0; }
-void *sigemptyset(void *s) { (void)s; return s; }
-void *sigfillset(void *s) { (void)s; return s; }
-void *sigaddset(void *s, int n) { (void)s;(void)n; return s; }
-void *sigdelset(void *s, int n) { (void)s;(void)n; return s; }
+int sigemptyset(void *s) { (void)s; return 0; }
+int sigfillset(void *s) { (void)s; return 0; }
+int sigaddset(void *s, int n) { (void)s;(void)n; return 0; }
+int sigdelset(void *s, int n) { (void)s;(void)n; return 0; }
 int sigsuspend(void *m) { (void)m; return -1; }
 int madvise(void *a, unsigned long l, int adv) { (void)a;(void)l;(void)adv; return 0; }
 int dladdr(const void *a, void *i) { (void)a;(void)i; return 0; }
@@ -359,17 +355,8 @@ char *strtok_r(char *s, const char *delim, char **save) {
 unsigned long strnlen(const char *s, unsigned long n) {
     unsigned long i=0; while (i<n && s[i]) i++; return i;
 }
-int clearerr(void *f) { (void)f; return 0; }
-int feof(void *f) { (void)f; return 0; }
-int ferror(void *f) { (void)f; return 0; }
-int fileno(void *f) { (void)f; return -1; }
-void *fdopen(int fd, const char *m) { (void)fd;(void)m; return 0; }
-char *fgets(char *b, int n, void *f) { (void)b;(void)n;(void)f; return 0; }
-int fputs(const char *s, void *f) { (void)f; if (s) printf("%s", s); return 0; }
-int fscanf(void *f, const char *fmt, ...) { (void)f;(void)fmt; return 0; }
-long ftell(void *f) { (void)f; return 0; }
-int setbuf(void *f, char *b) { (void)f;(void)b; return 0; }
-int setvbuf(void *f, char *b, int m, unsigned long s) { (void)f;(void)b;(void)m;(void)s; return 0; }
+/* real clearerr/feof/ferror/fileno/fdopen/fgets/fputs/fscanf/ftell/setbuf/setvbuf
+ * live in freestdlib.c */
 int vprintf(const char *fmt, void *a) { (void)fmt;(void)a; return 0; }
 long lseek64(int fd, long o, int w) { (void)fd;(void)o;(void)w; return 0; }
 int lldiv(long a, long b) { return (int)(a/b); }

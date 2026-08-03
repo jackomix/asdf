@@ -146,8 +146,8 @@ static Module *load_object(const char *path) {
     size_t len = 0;
     uint8_t *file = read_all(path, &len);
     Elf64_Ehdr *eh = (Elf64_Ehdr *)file;
-    if (memcmp(eh->e_ident, "\177ELF", 4) != 0) { printf("[loader] %s: not ELF\n", path); for (;;) {} }
-    if (eh->e_machine != 0xB7) { printf("[loader] %s: not aarch64\n", path); for (;;) {} }
+    if (memcmp(eh->e_ident, "\177ELF", 4) != 0) { printf("[loader] %s: not ELF\n", path); exit(2); }
+    if (eh->e_machine != 0xB7) { printf("[loader] %s: not aarch64\n", path); exit(2); }
 
     uint64_t minv = ~0ULL, maxv = 0;
     for (Elf64_Half i = 0; i < eh->e_phnum; i++) {
@@ -253,6 +253,73 @@ static void sys_exit0(void) {
     for (;;) {}
 }
 
+/* ---- Stage 2b: drive the IL2CPP runtime directly ----
+ * libil2cpp.so exports the il2cpp C embedding API.  Call it the same way
+ * kairovm/boot.py does, so the *actual game runtime* initialises and, if we can
+ * reach it, the managed entry point runs - even without a GPU (simulation
+ * logic, not rendering).  Under the bench fopen/fread resolve via the loader's
+ * fd syscalls to the extracted APK, so global-metadata.dat + assemblies load.
+ */
+typedef void *(*kv_f1)(void);
+typedef void *(*kv_f2)(void *, void *);
+typedef void *(*kv_f3)(void *, void *, void *);
+typedef int   (*kv_fi)(void);
+typedef int   (*kv_fc)(const char *);
+typedef void *(*kv_fc2)(const char *, const char *);
+typedef void *(*kv_fv2)(void *, void *);
+
+static void *kv_il_sym(const char *name) {
+    void *p = loader_lookup_export(name);
+    if (!p) printf("[il2cpp] missing export %s\n", name);
+    return p;
+}
+
+/* Set data/config/temp dirs then il2cpp_init.  data_dir is relative to the repo
+ * root so the bench's openat (which resolves relative paths) finds the assets;
+ * on the real device this is an absolute path under the APK. */
+static int kv_il_boot(const char *data_dir) {
+    void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+    int (*init)(const char *) = kv_il_sym("il2cpp_init");
+    if (!set_data || !init) return -1;
+    if (data_dir) { printf("[il2cpp] data_dir=%s\n", data_dir); set_data(data_dir); }
+    printf("[il2cpp] calling il2cpp_init ...\n");
+    int rc = init("IL2CPP Root Domain");
+    printf("[il2cpp] il2cpp_init -> %d\n", rc);
+    return rc;
+}
+
+/* Find the game's managed entry point in the image and invoke it. */
+static void kv_il_run_entry(void) {
+    void *(*domain_get)(void) = kv_il_sym("il2cpp_domain_get");
+    void *(*asm_open)(void *, const char *) = kv_il_sym("il2cpp_domain_assembly_open");
+    void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
+    void *(*img_entry)(void *) = kv_il_sym("il2cpp_image_get_entry_point");
+    void *(*runtime_invoke)(void *, void *, void *, void **) = kv_il_sym("il2cpp_runtime_invoke");
+    void *(*method_name)(void *) = kv_il_sym("il2cpp_method_get_name");
+    if (!domain_get || !asm_open || !asm_img || !img_entry || !runtime_invoke) {
+        printf("[il2cpp] entry-point symbols unavailable, skipping\n");
+        return;
+    }
+    void *dom = domain_get();
+    if (!dom) { printf("[il2cpp] no domain\n"); return; }
+    /* Try the game's own assembly first, then the default "Assembly-CSharp". */
+    const char *asms[] = { "Assembly-CSharp", "Assembly-CSharp-firstpass", 0 };
+    void *img = 0;
+    for (int i = 0; asms[i] && !img; i++) {
+        void *a = asm_open(dom, asms[i]);
+        if (a) img = asm_img(a);
+    }
+    if (!img) { printf("[il2cpp] no game image opened\n"); return; }
+    void *mth = img_entry(img);
+    if (!mth) { printf("[il2cpp] no entry point\n"); return; }
+    printf("[il2cpp] invoking entry point (%s)\n",
+           method_name ? (const char *)method_name(mth) : "?");
+    void **exc = (void **)calloc(1, 8);
+    void *r = runtime_invoke(mth, 0, 0, exc);
+    if (exc && *exc) printf("[il2cpp] managed exception during entry: %p\n", *exc);
+    else printf("[il2cpp] entry point returned %p\n", r);
+}
+
 int real_main(int argc, char **argv);
 
 void _start(void) {
@@ -297,6 +364,14 @@ int real_main(int argc, char **argv) {
         } else {
             printf("[loader] no JNI_OnLoad in %s\n", last->name);
         }
+    }
+
+    /* Stage 2b: drive the IL2CPP runtime directly so the game's own managed
+     * code runs (simulation), not just init_array + JNI_OnLoad.  The data dir
+     * is relative to the repo root so the bench resolves it; adjust for device. */
+    if (loader_lookup_export("il2cpp_init")) {
+        kv_il_boot("out/apk/assets/bin/Data/Managed");
+        kv_il_run_entry();
     }
     return 0;
 }

@@ -50,6 +50,26 @@ int    fprintf(int fd, const char *fmt, ...);
 int    snprintf(char *s, unsigned long n, const char *fmt, ...);
 int    sprintf(char *s, const char *fmt, ...);
 void   perror(const char *s);
+void  *fopen(const char *path, const char *mode);
+int    fclose(void *fp);
+int    fflush(void *fp);
+unsigned long fread(void *ptr, unsigned long sz, unsigned long nmemb, void *fp);
+unsigned long fwrite(const void *ptr, unsigned long sz, unsigned long nmemb, void *fp);
+int    fputc(int c, void *fp);
+int    fputs(const char *s, void *fp);
+char  *fgets(char *b, int n, void *fp);
+int    fseek(void *fp, long off, int whence);
+int    fseeko(void *fp, long off, int whence);
+long   ftell(void *fp);
+long   ftello(void *fp);
+int    feof(void *fp);
+int    ferror(void *fp);
+int    clearerr(void *fp);
+int    fileno(void *fp);
+void  *fdopen(int fd, const char *mode);
+int    fscanf(void *fp, const char *fmt, ...);
+int    setbuf(void *fp, char *b);
+int    setvbuf(void *fp, char *b, int m, unsigned long s);
 
 /* process / sys */
 void   exit(int code);
