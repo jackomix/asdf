@@ -445,7 +445,8 @@ class Machine(object):
                 trace.append(n)
                 seq[0] += 1
                 if address in watching:
-                    print('[watch] %6d  %s' % (seq[0], n))
+                    print('[watch] %6d  t%d %s'
+                          % (seq[0], self.current.id if self.current else 0, n))
                 lvl = logging.get(address)
                 if lvl is not None:
                     s = gstr(uc.reg_read(reg0)) or gstr(uc.reg_read(reg1))
@@ -787,6 +788,30 @@ class Machine(object):
                 woke += 1
         return woke
 
+    def wake_earliest_timer(self, exclude=None):
+        """Run the clock forward to the next timed wait and wake it.
+
+        The guest's sleeps are wall-clock, ours are not: a frame of emulated
+        engine code takes seconds of host time, so a loader thread that pauses
+        for 16 ms between work items would only ever get one slice per frame.
+        When nothing else can run there is no reason to sit and wait, so the
+        VM jumps its clock to the earliest deadline - the same trick a
+        discrete-event simulator uses, and invisible to the guest.
+        """
+        best = None
+        for t in self.threads:
+            if t is exclude or t is self.current:
+                continue
+            if t.state == 'blocked' and t.wake_at:
+                if best is None or t.wake_at < best.wake_at:
+                    best = t
+        if best is None:
+            return False
+        best.state = 'ready'
+        best.blocked_on = None
+        best.wake_at = 0.0
+        return True
+
     def wake_object(self, obj, n=1, all_=False):
         woke = 0
         for t in self.threads:
@@ -818,7 +843,14 @@ class Machine(object):
             t = order[(i + k) % len(order)]
             if t.state == 'ready':
                 return t
-        # Nothing runnable: hand a spurious wake to a *different* blocked
+        # Nothing runnable.  A thread parked on a timer is owed a wake by the
+        # kernel, so give it one early rather than inventing a spurious wake.
+        if self.wake_earliest_timer():
+            for k in range(1, len(order) + 1):
+                t = order[(i + k) % len(order)]
+                if t.state == 'ready':
+                    return t
+        # Still nothing: hand a spurious wake to a *different* blocked
         # thread if there is one (futex / condvar semantics permit this),
         # otherwise resume the caller.
         for k in range(1, len(order) + 1):
@@ -882,7 +914,10 @@ class Machine(object):
         n = 0
         for _ in range(rounds):
             if not self.has_other_runnable():
-                break
+                # every peer is parked on a timer: let the clock jump instead
+                # of stalling the loader until the next real 50 ms tick.
+                if not self.wake_earliest_timer():
+                    break
             self.current.state = 'ready'
             self._park()
             n += 1

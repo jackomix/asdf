@@ -26,7 +26,7 @@ class Game(object):
 
     def __init__(self, apk='out/apk', width=640, height=480, verbose=1,
                  log_all=False, install=True, platform=11, watch=(),
-                 throws=False):
+                 throws=False, trace_depth=8192, trace=None):
         self.apk = apk
         self.verbose = verbose
         self.s = Session(apk, verbose=verbose)
@@ -38,11 +38,21 @@ class Game(object):
         self.h.prepare()
         if install:
             self.h.install(apk, self.s.meta)
-        self.m.enable_method_trace(watch=watch or ())
+        # The method trace is a Unicorn block hook spanning the game's whole
+        # 8 MB of code, so it fires on every basic block the engine executes -
+        # priceless while debugging, and by far the most expensive thing in
+        # the VM otherwise.  Only arm it when something is going to read it.
+        if trace is None:
+            trace = bool(watch) or bool(throws)
+        self.tracing = bool(trace)
+        if self.tracing:
+            self.m.enable_method_trace(watch=watch or (), depth=trace_depth)
         if throws:
             self.m.enable_exception_trace(native=12 if int(throws) > 1 else 0)
         self.app = 0                 # managed main.Main
         self.app_class = 0
+        self.thread_rounds = 64      # background-thread slices per frame
+        self._exec_ui = None         # IApplication::ExecuteUIMethods
         self.behaviours = []         # (native, managed, class) started
         self.errors = []
         self._begin_gui = None       # UnityEngine.GUIUtility::BeginGUI
@@ -121,6 +131,7 @@ class Game(object):
         h.gl = []
         h.render_passes = []             # offscreen camera passes, this frame
         h.draw_calls = 0
+        self.pump_background()
         self._invoke(self.app_class, 'Update', self.app)
         self.pump_coroutines()
         self._invoke(self.app_class, 'LateUpdate', self.app, quiet=True)
@@ -137,6 +148,37 @@ class Game(object):
         h.keys_down.clear()
         h.keys_up.clear()
         return h.gl
+
+    def pump_background(self, rounds=None):
+        """Run the engine's loader threads and drain its UI-thread queue.
+
+        BootForm::Run and the ResourceManager workers do their job in small
+        steps, each one handed to the UI thread through
+        IApplication.RunOnUiThread; the worker then blocks until that step
+        has run.  On a phone the UI thread empties the queue every display
+        frame, so a hand-off costs 16 ms.  An emulated frame costs a great
+        deal more than that, so instead of rationing the loader to one step
+        per frame the player loop lets it run as far as it can and drains the
+        queue after every step - the engine's own ExecuteUIMethods, called
+        the way Unity's Update would call it, just more often.
+        """
+        m = self.m
+        if self._exec_ui is None:
+            self._exec_ui = self.rt.method_from_name(
+                self.app_class, 'ExecuteUIMethods', 0) or 0
+        n = 0
+        for _ in range(self.thread_rounds if rounds is None else rounds):
+            stepped = m.pump_threads(1)
+            n += stepped
+            if self._exec_ui:
+                try:
+                    self.rt.invoke(self._exec_ui, self.app, [])
+                except GuestError as e:
+                    print('[game] ExecuteUIMethods raised: %s' % e)
+                    self._exec_ui = 0
+            if not stepped:
+                break
+        return n
 
     def begin_gui(self):
         """Open an IMGUI frame the way Unity's own player loop does.
