@@ -338,7 +338,10 @@ int remove(const char *p) { (void)p; return -1; }
 
 /* ---- more libc stubs ---- */
 int _ctype_probe;  /* placeholder */
-void _ctype_(void) {}
+/* `_ctype_` is now defined as a real data symbol in glibc_shims.c (the
+ * bionic char-class table pointer — see comments there).  Do NOT redefine
+ * it here as a function stub: that produces a wrong GOT binding and made
+ * libunity crash inside nativeRender during string/asset processing. */
 int puts(const char *s) { if (s) printf("%s\n", s); return 0; }
 float logf(float x) { (void)x; return 0.0f; }
 float ldexpf(float a, int e) { (void)a;(void)e; return 0.0f; }

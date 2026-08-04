@@ -466,51 +466,44 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.29.0-glibc) - Crash handler: alt-stack + backtrace walk
+## LATEST STATUS (build 0.30.0-glibc) - mining the reference ports
 
-0.28 segfaulted inside the first `nativeRender` and exited 139 with **no crash line in the log**.  Diagnosis of why no crash line: `kv_install_crash_handler` set `sa.sa_flags = SA_SIGINFO | SA_ONSTACK` but never called `sigaltstack()`.  Per `sigaction(2)`:
+0.29's deploy showed **exit 139 with NO `[loader] === CRASH ===` block** despite our handler being installed.  Same silent death as 0.28.  We then cloned the two reference ports locally:
 
-> If `SA_ONSTACK` is set and no alternate stack is configured, the behavior is implementation-defined; on Linux with no alt stack, a SIGSEGV that the handler can't deliver against the current stack runs the default action instead (exit 139 with no handler invocation).
-
-Most plausible: the segfault site is inside a leaf with very little stack left (or a chicken-and-egg in the GC second-chance stack), the kernel tries to push a signal frame, finds no room and no alt stack, and kills with default SIGSEGV — exactly the silent exit 139 we observe.
-
-Fix in `loader/glibc_shims.c`:
-1. **`sigaltstack()` allocated before `sigaction`.**  `kv_altstack_buf` is a 32 KB static buffer (`SIGSTKSZ * 4`), passed via `stack_t` to `sigaltstack.MasterThesis`. Handler can now run even on a blown stack.
-2. **Backtrace walk added.**  On crash, the handler prints:
-   - `si_addr` + `FAR` (faulting address from mcontext @ ucontext+0xB8)
-   - `pc` (ucontext+0x1C0), `sp` (+0x1B0), `fp`/x29 (+0x1A8), `lr`/x30 (+0x1B8)
-     — note: previous code read x30 at **0x168 (wrong, regs[22])**; mcontext regs[30] is at +0x1B8
-   - The mapping / module the pc lives in (via `/proc/self/maps` parse) AND pc-offset within it — this is what makes the log directly reportable to function symbols in the corresponding lib*.so
-   - A 32-frame x29-chain backtrace, each `{lr, fp}` pair, using `/proc/self/mem` `lseek`+`read` instead of direct deref so a broken fp chain never crashes the handler
-3. **Also catch SIGFPE** in addition to SEGV/BUS/ILL (some Unity aborts come through integer div), and reset-on-deliver (`SA_RESETHAND`) so a recursive fault in the handler kills cleanly.
-4. `sigemptyset(&sa.sa_mask)` so we don't mask other signals during handler.
-
-### Source exploration while planning the fix
-Read `loader/jni_shim.c` 160-380 + `loader/egl_shim.c` symbol map.  Two things noticed that **may or may not be the actual crash cause** — worth keeping in mind for 0.30 once 0.29 reveals the real PC:
-
-- **Two competing `ANativeWindow_*` impls.**  `host_syms.c:209-224` defines stub `ANativeWindow_*` returning `&kv_fbdev_win` (640x480).  `egl_shim.c:418-428` ALSO defines them returning `&g_anw_w` (`egl_shim_screen_w/h()`).  Whichever wins in `resolve()` is what Unity gets.  If the stub wins while the EGL surface layer expects the egl_shim's window handle (or vice versa), `nativeRecreateGfxState` could store a window ptr that the EGL side can't match later.  **Needs `resolve()` order check in `loader_glibc_main.c`** — but only fix if 0.29's crash log points near surface code.
-- `nativeRender` signature: `unsigned char (*render)(void *env, void *thiz)`.  The boot path calls `render(env, thizp)` — only 2 args.  If libunity's `nativeRender` is registered with a sig like `(Lcom/.../UnityPlayer;)V` expecting a different `thiz` layout (e.g. reads `[thiz+0x148]` requiring at least 0x150 writable bytes), the zeroed 0x200 `static unsigned char thiz[0x200]` is sized for that.  Still — if Unity derefs a method pointer pulled from `thiz`'s vtable, the zeroed buffer yields jumps to 0.  Plausible crash mode.
-
-### What to do now
-1. Deploy 0.29 and read the fresh `loader.log`.  Expect:
-   ```
-   [loader] build: 0.29.0-glibc
-   ...
-   [unity] nativeRender loop...
-   [loader] === CRASH sig=11 or sig=10 or sig=8 ===
-   [loader]   si_addr=<addr> FAR=<addr>
-   [loader]   pc=<addr> sp=<addr> fp=<addr> lr=<addr>
-   [loader]   pc in [<range>) <path>  (pc-offset=0x<offset>)
-   [loader] backtrace (x29 chain):
-   [loader]   #0 lr=<addr> (fp=<addr>)
-   ...
-   ```
-2. With the real faulting PC + the module + offset, disassemble that offset in the offending `.so` (`aarch64-linux-gnu-objdump -d libX.so | grep -A5 "^X:<offset>"`) to identify the exact faulting instruction + the surrounding function.  That becomes the 0.30 surgical fix.
-
-### Deploy (unchanged deploy script, version-checked)
 ```
-curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+/Users/jacko/Documents/astro/ref/terraria-nextos/      # NextOs-Ports/terraria-nextos
+/Users/jacko/Documents/astro/ref/horizonchase-nextos/ # NextOs-Ports/horizonchase-nextos
 ```
+
+and mined them end-to-end.  **Decisive learnings** (all absent from our code, all cited in the HANDOFF's "REFERENCE PORTS" section near the top but never actually implemented here):
+
+1. **256KB alt stack**, not 32KB.  Both refs: `static char altstk[256 * 1024]`.  Our 32KB was too small to host a handler that opens `/proc/self/maps` and walks frame chains - when the kernel tried to push the signal frame + run the handler, the alt stack overflowed, the kernel re-faulted, and it ran default SIGSEGV (silent exit 139).  (_terraria-nextos/src/main.c:4343, horizonchase-nextos/src/main.c:5994_)
+
+2. **Catch SIGABRT, SIGTRAP, SIGSYS in addition to SEGV/BUS/ILL/FPE.**  Both refs `sigaction(SIGABRT/SIGTRAP/SIGSYS, &sa, 0)`.  Without these, BRK instructions, seccomp traps and Unity's `abort()` go to default action - silent. (_terrania/main.c:4347-4349, horizonchase/main.c:5998-6000_)
+
+3. **Re-arm `on_crash` AFTER `egl_shim_create_window`.**  Both refs do this (terrania/main.c:4997-5006, horizonchase/main.c:6713-6720) with an explicit comment: **"SDL_Init(VIDEO) of kmsdrm and/or the Mali blob reinstall SIGSEGV default - our dump never runs."**  This was the smoking gun: our `kv_install_crash_handler` ran in `main()` BEFORE `egl_shim_create_window()`, so by the time `nativeRender` was called the Mali driver had overwritten our `on_crash` with its default.  Added `kv_install_crash_handler()` re-call in `kv_unity_boot` right between the egl-shim window setup and the first native call.
+
+4. **Override `abort`/`raise`/`tgkill`/`exit`/`_exit`** GOT entries with logging wrappers - `set_import("abort", my_abort)` etc (_terrania/main.c:4374-4378, horizonchase/main.c:6026-6030_).  Without this, Unity detecting an internal error calls libc `abort()` directly, the libc kill path runs BEFORE our SIGABRT handler sees the signal, and the process exits silently (139 exit, no log line).
+   Implementation: `kv_engine_abort` writes `[loader] === ENGINE ABORT caller=%p ===`, then triggers `*(volatile int*)0=0` so the crash handler dumps a real PC.  `kv_engine_raise`/`tgkill` forward via `raise()` (caught by our handler).  `kv_engine_exit` logs and exits with the requested code so the silent `_exit(139)` becomes **`[loader] === ENGINE exit(139) caller=0x...`** in the log.
+
+5. **`_ctype_` must be a real bionic char-class TABLE POINTER, not an empty stub.**  Both refs: `static unsigned char g_ctype_table[257]; const unsigned char *g_ctype_ptr = g_ctype_table;`  and the import resolves to the pointer-to-table, not to a function.  (_terrania/main.c:3790-3826_)
+   
+   Our old `_ctype_(void){}` stub in `host_syms.c:341` and `glibc_shims.c` was the LIKELY ROOT CRASH CAUSE: libunity reads `_ctype_` as `ldr [got] -> ptr; ldr [ptr] -> table`.  When the GOT bound to a function's entry point (code), the second `ldr` returned unmapped bytes - in asset/string processing inside `nativeRender`, the engine eventually **fed that garbage into a load and SIGSEGV'd**. Terraranextos documents the exact symptom: "crash libunity+0xe449d4 no asset loading" - the crash site of the missing-`_ctype_` bug.
+   Fix in `glibc_shims.c`: declare `unsigned char g_kv_ctype_table[257]; const unsigned char * const _ctype_ = g_kv_ctype_table;` plus `_tolower_tab_`/`_toupper_tab_` siblings, and `kv_ctype_init()` (called from `main` before any ctor runs) fills them with proper bionic bits (`_U=1 _L=2 _N=4 _S=8 _P=0x10 _C=0x20 _X=0x40 _B=0x80`).
+   Also removed the conflicting stub `_ctype_()` in `host_syms.c`.
+
+6. **`__stack_chk_fail` returns instead of aborting.**  Both refs override `__stack_chk_fail` to return (terrania/main.c:3765) because Unity's tagged-canary `operator-new` can mis-fire on certain `nativeRecreateGfxState` paths; killing the boot.  Returning lets the caller carry on.  Our `freestdlib.c:__stack_chk_fail` writes a line then `abort()`s - which previously took the abort path the ref ports avoid.  New `kv_stack_chk_fail` in glibc_shims.c writes a `[loader] __stack_chk_fail #%d caller=%p (continuing)` line and returns.  Routed via `kv_bionic_route` so the .so's own `__stack_chk_fail` import binds here in the glibc build.
+
+### Expected deploy result of 0.30
+
+If the `_ctype_` hypothesis is right, the `nativeRender loop...` will advance past the cmdline-inject line and we'll see either EGL calls from Unity or the next crash - but WITH a real `[loader] === CRASH ===` block now (because the handler is correctly re-armed post-SDL + alt-stack is 256KB + abort/raise/_exit routes log).
+
+If the silent-exit 139 returns: the route table didn't bind.  Verify via log for `[loader] === ENGINE ABORT ... ===` or `[loader] === ENGINE exit(N) ... ===` - those tell us which path the engine took to terminate.
+
+### Prior: 0.29 - sigaltstack + crash backtrace
+
+0.28 segfaulted inside first `nativeRender`, exited 139 with **no crash line in log**.  Diagnosed as `SA_ONSTACK` without `sigaltstack()` - kernel had no alt stack to push signal frame.  0.29 added sigaltstack + the rich crash handler.  But the silent exit persisted - alt stack was 32KB (too small - see 0.30 fix above) AND either Unity's `abort` (not SIGSEGV) was the actual termination path AND SDL/Mali had re-installed the default SIGSEGV handler over ours AND `_ctype_` empty-stub crashed before any real fault dump landed.
+
 
 ---
 

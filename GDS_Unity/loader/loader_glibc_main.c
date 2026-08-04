@@ -49,7 +49,7 @@ struct timespec { long tv_sec; long tv_nsec; };
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.29.0-glibc"
+#define GDS_BUILD_VERSION "0.30.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -542,6 +542,14 @@ static void kv_unity_boot(void) {
      * context Unity's graphics init derefs garbage and SIGSEGVs. */
     egl_shim_create_window();
     egl_shim_ensure_current();
+    /* terraria-nextos RE-ARMS on_crash here: SDL_Init(VIDEO) on kmsdrm and the
+     * Mali blob's libEGL.so loader both install their OWN default SIGSEGV
+     * handler during window/context creation, OVERWRITING ours.  Without this
+     * re-install, a segfault in nativeRecreateGfxState or nativeRender goes to
+     * the SDL/Mali default action (exit 139, silent), not our on_crash dumper.
+     * Even though we set ours in main(), we have to set it again RIGHT here,
+     * between GPU init and the graphics-heavy native calls. */
+    kv_install_crash_handler();
 
     void *fn;
     if ((fn = kv_jni_find_native("initJni"))) {
@@ -641,7 +649,12 @@ static void kv_setup_tls(void) {
 }
 
 void kv_egl_dlopen(void);   /* glibc_shims.c: load real Mali GPU drivers */
+void kv_ctype_init(void);  /* glibc_shims.c: fill bionic _ctype_/_tolower_tab_/_toupper_tab_ */
 int main(int argc, char **argv) {
+    kv_ctype_init();            /* fill tables BEFORE any libunity/libil2cpp ctor runs
+                                 * (ctors read these via the GOT).  Without this the
+                                 * old empty-function stub crashes the loader in
+                                 * nativeRender during string processing. */
     kv_install_crash_handler();
     kv_setup_tls();
     kv_egl_dlopen();        /* dlopen libEGL/libGLESv2/SDL2 RTLD_GLOBAL */

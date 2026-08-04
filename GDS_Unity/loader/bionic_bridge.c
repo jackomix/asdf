@@ -357,10 +357,20 @@ long kv_sysconf(int name) {
     return sysconf(name);
 }
 
-/* bionic-only symbol glibc lacks.  Called when bionic aborts; log it. */
+ /* bionic-only symbol glibc lacks.  Called when bionic aborts; log it. */
 void android_set_abort_message(const char *m) {
   fprintf(stderr, "[abort] %s\n", m ? m : "");
 }
+
+/* Forward decls for engine-abort/exit overrides - implemented in glibc_shims.c.
+ * Routing the engine's abort/raise/tgkill/exit GOT entries through these
+ * functions converts a silent exit-139 into a [loader] === ENGINE ... === log
+ * line + caller address (otherwise no handler fires). */
+void kv_engine_abort(void);
+int kv_engine_raise(int sig);
+int kv_engine_tgkill(int tgid, int tid, int sig);
+void kv_engine_exit(int code);
+void kv_stack_chk_fail(void);
 
 /* ---- route table: .so imports that must bind to this bridge ---- */
 void *kv_bionic_route(const char *name) {
@@ -403,6 +413,22 @@ void *kv_bionic_route(const char *name) {
     {"syscall", kv_syscall},
     {"statfs", kv_statfs}, {"statfs64", kv_statfs},
     {"android_set_abort_message", android_set_abort_message},
+    /* abort/raise/tgkill/exit/setjmp overrrides - terraria-nextos & horizonchase
+     * BOTH route these to logging wrappers.  Without the overrides, Unity's
+     * engine calls libc abort()/raise(SIGABRT)/tgkill(SIGABRT)/exit() when it
+     * detects an internal error, which terminates the process through a path
+     * our crash handler doesn't catch (abort() raises SIGABRT but glibc may
+     * block handler installation via the legacy signal() path BEFORE our
+     * sigaction; OR Unity calls _exit() directly, bypassing signals entirely).
+     * Result: silent exit 139 with no [loader] CRASH line.  By routing these
+     * GOT entries to our wrappers we (a) log the caller, (b) optionally
+     * proceed instead of dying. */
+    {"abort",  (void *)kv_engine_abort},
+    {"raise",  (void *)kv_engine_raise},
+    {"tgkill", (void *)kv_engine_tgkill},
+    {"exit",   (void *)kv_engine_exit},
+    {"_exit",  (void *)kv_engine_exit},
+    {"__stack_chk_fail", (void *)kv_stack_chk_fail},
     {0, 0}
   };
   for (int i = 0; m[i].n; i++) if (strcmp(m[i].n, name) == 0) return m[i].f;

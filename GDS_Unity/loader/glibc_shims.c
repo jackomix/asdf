@@ -180,7 +180,13 @@ static void kv_sighandler(int sig, void *info, void *ucontext) {
     _exit(139);
 }
 
-static char kv_altstack_buf[SIGSTKSZ * 4] __attribute__((aligned(16)));
+/* 256KB alt stack — same size as both reference ports use (terraria-nextos
+ * and horizonchase-nextos).  Our previous 32KB (SIGSTKSZ*4) was too small
+ * for a handler that walks /proc/self/maps and /proc/self/mem, and SA_ONSTACK
+ * without a large-enough stack re-faults on push → silent exit 139 with no
+ * handler invocation.  256KB comfortably holds the handler even on a blown
+ * main stack. */
+static char kv_altstack_buf[256 * 1024] __attribute__((aligned(16)));
 void kv_install_crash_handler(void) {
     /* Without an alternate signal stack, a segfault that fires while the
      * stack pointer is near the stack guard / on a tiny stack cannot deliver
@@ -201,10 +207,80 @@ void kv_install_crash_handler(void) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
     /* Don't block other signals during the handler - we want to die. */
     sigemptyset(&sa.sa_mask);
+    /* Match the signal set of both reference ports: catch SIGSEGV, SIGBUS,
+     * SIGABRT (Unity abort() path), SIGILL, SIGFPE, SIGTRAP, SIGSYS.
+     * Without SIGABRT/SIGTRAP/SIGSYS, BRK/seccomp/abort kill silently. */
     sigaction(SIGSEGV, &sa, 0);
-    sigaction(SIGBUS, &sa, 0);
-    sigaction(SIGILL, &sa, 0);
-    sigaction(SIGFPE, &sa, 0);
+    sigaction(SIGBUS,  &sa, 0);
+    sigaction(SIGABRT, &sa, 0);
+    sigaction(SIGILL,  &sa, 0);
+    sigaction(SIGFPE,  &sa, 0);
+    sigaction(SIGTRAP, &sa, 0);
+    sigaction(SIGSYS,  &sa, 0);
+}
+
+/* ------------------ engine abort/exit path overrides (0.30) ------------------
+ * Both reference ports override the GOT entries for abort/raise/tgkill/exit
+ * to log the caller and (optionally) proceed instead of terminating. Without
+ * this, an internal-engine error during nativeRender silently exit()s the
+ * process - no SIGSEGV/SIGABRT ever fires, so our crash handler can't dump a
+ * PC.  Routing these through here turns the silent-exit case into a clear
+ * [ENGINE-ABORT] log line + caller address, which is the diagnostic we need
+ * for "exit 139 with no [loader] === CRASH ===" failures.
+ *
+ * `kv_stack_chk_fail` returns instead of aborting: Unity's operator-new tags
+ * canaries that, on certain nativeRecreateGfxState paths, mis-fire; aborting
+ * kills the boot.  Returning lets the caller carry on (the canary mismatch is
+ * a false-alarm under our foreign-libc model). */
+#include <stdlib.h>
+#include <signal.h>
+void kv_stack_chk_fail(void) {
+    static int n = 0;
+    if (n++ < 8) {
+        /* __builtin_return_address is not async-safe but stderr-write is */
+        char buf[160]; int m = 0;
+        m += sprintf(buf + m, "[loader] __stack_chk_fail #%d caller=%p (continuing)\n",
+                     n, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+    }
+    /* RETURN.  Do NOT abort/raise - let the caller continue. */
+}
+void kv_engine_abort(void) {
+    char buf[160]; int m = 0;
+    m += sprintf(buf + m, "[loader] === ENGINE ABORT caller=%p ===\n",
+                 __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    /* Fall into the crash handler explicitly so we get a backtrace dump -
+     * trap by writing 0 (SIGSEGV on alt stack).  This gets us a real PC
+     * instead of silently dying. */
+    *(volatile int *)0 = 0;
+    /* if that for some reason continues (it shouldn't), exit 139 */
+    _exit(134);
+}
+int kv_engine_raise(int sig) {
+    char buf[160]; int m = 0;
+    m += sprintf(buf + m, "[loader] === ENGINE raise(sig=%d) caller=%p ===\n",
+                 sig, __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    /* Forward to real raise so the crash handler runs (it catches SIGABRT etc). */
+    return raise(sig);
+}
+int kv_engine_tgkill(int tgid, int tid, int sig) {
+    char buf[200]; int m = 0;
+    m += sprintf(buf + m, "[loader] === ENGINE tgkill(tgid=%d tid=%d sig=%d) caller=%p ===\n",
+                 tgid, tid, sig, __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    /* Forward via syscall - if sig is 0 (just a probe), returning 0 fine. */
+    if (sig == 0) return 0;
+    /* Otherwise route to raise so the handler dump fires on the calling thread. */
+    return raise(sig);
+}
+void kv_engine_exit(int code) {
+    char buf[160]; int m = 0;
+    m += sprintf(buf + m, "[loader] === ENGINE exit(%d) caller=%p ===\n",
+                 code, __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    _exit(code);
 }
 
 /* --- bionic-only symbols that glibc lacks but the .so imports.
@@ -215,7 +291,50 @@ int __system_property_read(void *e, char *n, char *v) { (void)e;(void)n; if (v) 
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) { (void)prio;(void)tag;(void)fmt; return 0; }
 int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) { (void)prio;(void)tag;(void)fmt;(void)ap; return 0; }
 int __android_log_write(int prio, const char *tag, const char *msg) { (void)prio;(void)tag;(void)msg; return 0; }
-void _ctype_(void) {}
+/* _ctype_ — bionic exports this as `const unsigned char*` pointing at a
+ * 257-byte char-class table indexed as `_ctype_[(int)c+1]` by isalpha/
+ * isdigit/tolower/etc.  libunity reads it as `ldr [_ctype_ GOT]; ldr [x0]`
+ * — if `_ctype_` resolves to NULL (or an empty function stub) the second
+ * `ldr [x0]` faults and crashes inside nativeRender during asset/string
+ * processing (terraria-nextos documents this exact symptom:
+ * "crash libunity+0xe449d4 no asset loading").
+ *
+ * Bits (bionic): _U=1 _L=2 _N=4 _S=8 _P=0x10 _C=0x20 _X=0x40 _B=0x80.
+ * Slot 0 = EOF (c=-1).  Slot [c+1] = bits for c.
+ *
+ * The bionic `_ctype_` symbol IS the pointer-to-table itself.  We export
+ * our own pointer to our own table as a real data symbol; host_syms.c binds
+ * the GOT slot to it. */
+#include <ctype.h>
+unsigned char g_kv_ctype_table[257];
+const unsigned char *g_kv_ctype_ptr = g_kv_ctype_table;
+unsigned char g_kv_tolower_table[257], g_kv_toupper_table[257];
+const unsigned char *g_kv_tolower_ptr = g_kv_tolower_table;
+const unsigned char *g_kv_toupper_ptr = g_kv_toupper_table;
+/* Public symbols the loader/route table resolves for libunity/libil2cpp.
+ * Bionic libunity imports `_ctype_` as `const unsigned char*` (a data
+ * symbol — pointer to the table).  Same for `_tolower_tab_`/`_toupper_tab_`. */
+const unsigned char * const _ctype_  = g_kv_ctype_table;
+const unsigned char * const _tolower_tab_ = g_kv_tolower_table;
+const unsigned char * const _toupper_tab_ = g_kv_toupper_table;
+void kv_ctype_init(void) {
+    g_kv_ctype_table[0] = 0;
+    g_kv_tolower_table[0] = 0; g_kv_toupper_table[0] = 0;
+    for (int c = 0; c < 256; c++) {
+        unsigned char b = 0;
+        if (isupper(c)) b |= 0x01;          /* _U */
+        if (islower(c)) b |= 0x02;          /* _L */
+        if (isdigit(c)) b |= 0x04;          /* _N */
+        if (isspace(c)) b |= 0x08;          /* _S */
+        if (ispunct(c)) b |= 0x10;          /* _P */
+        if (iscntrl(c)) b |= 0x20;          /* _C */
+        if (isxdigit(c) && !isdigit(c)) b |= 0x40;  /* _X (hex-letter only) */
+        if (c == ' ')  b |= 0x80;           /* _B (blank printable) */
+        g_kv_ctype_table[c + 1] = b;
+        g_kv_tolower_table[c + 1] = (unsigned char)tolower(c);
+        g_kv_toupper_table[c + 1] = (unsigned char)toupper(c);
+    }
+}
 void _ZTH15gDeferredAction(void) {}
 
 /* --- load the real GPU drivers so Unity's dlsym(RTLD_DEFAULT) finds real GL.
