@@ -424,7 +424,21 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.20.0-glibc) - watchdog thread dump (native-block diagnosis)
+## LATEST STATUS (build 0.21.0-glibc) - watchdog fixed (struct dirent layout was wrong)
+
+0.20's watchdog fired but found ZERO threads - that was a BUG in the diagnostic,
+not a healthy sign: my struct dirent didn't match glibc's aarch64 layout (missing
+d_off/d_reclen), so readdir returned entries with d_name at the wrong offset and
+everything was skipped as "."/"..".  Fixed the struct; also now read each thread's
+/proc/self/task/<tid>/stat state (R running/S sleeping/D) so we can tell a CPU
+spin (R, no syscall) from a futex/cond block (S).
+
+The boot still hangs inside the first nativeRender (byte-identical log) after
+GetMethodID(setMessage) - the dialog methods are resolved but never called, i.e.
+Unity is blocked in native code below JNI.  0.21's dump will finally show whether
+the main thread is spinning or futex-waiting, and what worker threads exist.
+
+### Prior: 0.20.0 - watchdog thread dump (native-block diagnosis)
 
 CRITICAL INSIGHT from 0.19.0's log: it is **byte-identical to 0.17/0.18** despite
 the varargs fix + runOnUiThread dispatch + dialog auto-fire all being real and in
