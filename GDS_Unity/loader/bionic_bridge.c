@@ -228,7 +228,22 @@ static int kv_cond_poll_wait(void **cslot, void **mslot) {
     int r = pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), &ts);
     return (r == ETIMEDOUT) ? 0 : r;   /* timeout -> spurious wakeup */
 }
-int kv_pthread_cond_wait(void **cslot, void **mslot) { return kv_cond_poll_wait(cslot, mslot); }
+int kv_pthread_cond_wait(void **cslot, void **mslot) {
+    /* If called on the MAIN thread: return 0 immediately.
+     * Main thread (Unity's) is stuck in pthread_cond_wait waiting for a
+     * worker-thread signal that never comes (because the Android looper
+     * and job worker pool aren't wired up native-side).  Returning 0
+     * spurious-wakes main; Unity loops back, checks its predicate, and
+     * either re-waits (no harm, we still return 0) or actually advances
+     * (the predicate was satisfied by some other thread, e.g. GC).
+     * This unblocks the innate nativeRender first-frame deadlock.
+     *
+     * For non-main threads: keep the 2ms poll so worker idle-wait doesn't
+     * spin-loop burn CPU. */
+    cond_get(cslot); mtx_get(mslot);   /* ensure cond/mtx objects exist for later signal */
+    if (kv_is_main_thread()) return 0;
+    return kv_cond_poll_wait(cslot, mslot);
+}
 int kv_pthread_cond_timedwait(void **cslot, void **mslot, const struct timespec *ts) {
     /* honor the caller's absolute deadline, but cap it so we still poll */
     struct timespec now; clock_gettime(CLOCK_REALTIME, &now);

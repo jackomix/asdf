@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.38.4-glibc"
+#define GDS_BUILD_VERSION "0.39.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -752,21 +752,11 @@ static void kv_unity_boot(void) {
     }
     printf("[unity] nativeRender loop...\n");
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
-    /* Spawn a "fixer" thread that polls il2cpp until the domain/assemblies are
-     * ready, then invokes JobsUtility.set_JobWorkerCount(0) etc from a SEPARATE
-     * thread.  The main thread deadlocks inside the FIRST nativeRender (it
-     * spawns Unity's worker pool which never gets woken because the Android
-     * looper isn't running); we run the il2cpp_runtime_invoke from a sibling
-     * thread that doesn't touch the render path.  This is the same approach as
-     * terraria-nextos' ter_jobworkers0(), just called from a fixer thread
-     * instead of an eglSwapBuffers hook (because eglSwapBuffers never returns
-     * for us). */
-    {
-        kv_pthread_t fixer;
-        if (pthread_create(&fixer, 0, (void *(*)(void *))kv_set_job_workers_zero, 0) == 0)
-            pthread_detach(fixer);
-        else printf("[jobfix] could not spawn fixer thread\n");
-    }
+    /* 0.38: pthread_cond_wait now returns 0 immediately for the main thread,
+     * unblocking Unity's infinite wait on the never-spawned worker pool.
+     * Sibling-thread fixer (set_JobWorkerCount) was abandoned because
+     * il2cpp_thread_attach from a sibling triggers the Unity assertion
+     * "Threads explicit registering is not previously enabled" and aborts. */
     for (int f = 0; f < 1000000; f++) {
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
@@ -917,7 +907,7 @@ int real_main(int argc, char **argv) {
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
 
     /* Stage 1.5: GOT route audit - print GOT slot values for key symbols. */
-    static const char *audit_syms[] = {"pthread_create","sysconf","sem_wait","sem_post","syscall","sched_getaffinity"};
+    static const char *audit_syms[] = {"pthread_create","sysconf","sem_wait","sem_post","syscall","sched_getaffinity","pthread_cond_wait","pthread_cond_timedwait"};
     for (Module *m = m_il2cpp; m; m = (m == m_il2cpp) ? m_unity : (m == m_unity ? m_main : 0)) {
         if (!m) break;
         for (int set = 0; set < 2; set++) {
