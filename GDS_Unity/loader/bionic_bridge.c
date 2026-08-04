@@ -216,7 +216,7 @@ int kv_pthread_cond_broadcast(void **slot) { return pthread_cond_broadcast(cond_
  * shorter so it stays responsive; workers poll longer to avoid burning CPU. */
 #define KV_COND_POLL_MAIN_NS 2000000L    /* 2 ms for the main thread */
 #define KV_COND_POLL_WORK_NS 5000000L    /* 5 ms for worker threads */
-static int kv_is_main_thread(void) {
+int kv_is_main_thread(void) {
     return (int)syscall(SYS_gettid) == (int)getpid();
 }
 static int kv_cond_poll_wait(void **cslot, void **mslot) {
@@ -313,7 +313,7 @@ int kv_pthread_join(pthread_t t, void **r) { return pthread_join(t, r); }
 pthread_t kv_pthread_self(void) { return pthread_self(); }
 int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), void *arg) {
   static int n; long tid = syscall(178);
-  if (++n <= 30) printf("[kv_pthread_create] n=%d tid=%ld start=%p arg=%p\n", n, tid, (void*)start, (void*)arg);
+  if (++n <= 300) printf("[kv_pthread_create] n=%d tid=%ld start=%p arg=%p\n", n, tid, (void*)start, (void*)arg);
   (void)attr; return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }

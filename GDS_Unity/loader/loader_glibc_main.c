@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.39.1-glibc"
+#define GDS_BUILD_VERSION "0.39.2-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -234,6 +234,7 @@ void *loader_lookup_export(const char *wanted) {
 void *kv_egl_route(const char *name);
 void *kv_bionic_route(const char *name);
 void *kv_fs_route(const char *name);
+int kv_is_main_thread(void);
 
 void *kv_dlsym(void *handle, const char *name) {
     if (name) {
@@ -621,6 +622,18 @@ static void *kv_set_job_workers_zero(void *unused) {
      * mono_class_get_checked gets a NULL MonoClass* and SIGSEGVs (0.32, 0.38a).
      * Poll for up to 30s — the crash handler won't catch us if we disappear. */
     printf("[jobfix] waiting for il2cpp_init...\n");
+    /* On the MAIN thread: drive il2cpp_init directly (idempotent with Unity's
+     * own later call inside nativeRender).  This guarantees dom_get() returns
+     * a valid domain and we have a thread context attached. */
+    if (kv_is_main_thread()) {
+        void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+        if (set_data) set_data("./data");
+        void *(*set_cfg)(const char *) = kv_il_sym("il2cpp_set_config_dir");
+        if (set_cfg) set_cfg("etc");
+        void *(*set_temp)(const char *) = kv_il_sym("il2cpp_set_temp_dir");
+        if (set_temp) set_temp("/tmp");
+        if (il_init_void) { int r = il_init_void(); printf("[jobfix] main-thread il2cpp_init -> %d\n", r); fflush(stdout); }
+    }
     for (int tries = 0; tries < 600; tries++) {
         if (il_init_void) { int r = il_init_void(); if (r == 0) break; }
         else if (dom_get && dom_get()) break;
@@ -629,24 +642,17 @@ static void *kv_set_job_workers_zero(void *unused) {
     printf("[jobfix] il2cpp_init done, scanning assemblies for JobsUtility\n");
     fflush(stdout);
     /* Stage A.5: il2cpp_thread_attach is REQUIRED before cls_from_name can
-     * safely run on this (non-main) thread — without it, Mono's per-thread
-     * class-lookup context is NULL and mono_class_get_checked derefs garbage
-     * (the 0.38b crash at pc=0xcfccd4 happened here even though il2cpp_init
-     * had returned successfully).  terraria-nextos calls dom_get() directly
-     * but ONLY from the MAIN thread (ter_before_present) — its thread is
-     * already attached to Unity's domain.  Our sibling thread is NOT
-     * attached, so even dom_get() crashes inside Mono's lazy setup.
-     * il2cpp_thread_attach(NULL) attaches the current thread to the default
-     * domain.  This MUST happen before any other il2cpp call. */
-    printf("[jobfix] calling thread_attach(NULL)...\n"); fflush(stdout);
-    if (thread_attach) {
-        void *t = thread_attach(NULL);
-        printf("[jobfix] thread_attach(NULL) -> %p\n", t); fflush(stdout);
-    } else {
-        printf("[jobfix] WARNING no il2cpp_thread_attach symbol\n"); fflush(stdout);
+     * safely run on a NON-MAIN thread.  Haupt-thread is auto-attached by
+     * Unity's own il2cpp_init (which we drove above).  Sibling threads must
+     * call il2cpp_thread_attach(NULL) — but that triggers Unity's assertion
+     * "Threads explicit registering is not previously enabled" and aborts.
+     * So we DON'T run this from the sibling thread; we run from main only. */
+    if (!kv_is_main_thread()) {
+        printf("[jobfix] not main thread - skipping class scan to avoid mono assertion\n");
+        fflush(stdout);
+        return 0;
     }
-    /* tiny settle delay to be safe in case attach races with main's init. */
-    struct timespec settle = {0, 100000000}; nanosleep(&settle, 0);
+    printf("[jobfix] main thread - proceeding to class scan\n"); fflush(stdout);
     /* Stage B: scan assemblies, find JobsUtility, invoke setters. */
     for (int tries = 0; tries < 200 && !kv_jobworkers_done; tries++) {
         void *domain = dom_get();
@@ -752,11 +758,20 @@ static void kv_unity_boot(void) {
     }
     printf("[unity] nativeRender loop...\n");
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
-    /* 0.38: pthread_cond_wait now returns 0 immediately for the main thread,
+    /* 0.39: pthread_cond_wait now returns 0 immediately for the main thread,
      * unblocking Unity's infinite wait on the never-spawned worker pool.
      * Sibling-thread fixer (set_JobWorkerCount) was abandoned because
      * il2cpp_thread_attach from a sibling triggers the Unity assertion
-     * "Threads explicit registering is not previously enabled" and aborts. */
+     * "Threads explicit registering is not previously enabled" and aborts.
+     *
+     * 0.39.2: ALSO attempt inline kv_set_job_workers_zero on the MAIN thread
+     * BEFORE entering the render loop.  This works because main thread IS
+     * automatically registered with il2cpp_domain via Unity's own (soon to
+     * run) il2cpp_init — but Unity's init runs INSIDE nativeRender, so we
+     * can't prempt it.  Instead, call il2cpp_init explicitly from main here;
+     * it's idempotent (the second call by Unity inside nativeRender is safe).
+     * After this, dom_get / cls_from_name work on main thread. */
+    kv_set_job_workers_zero(0);
     for (int f = 0; f < 1000000; f++) {
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
