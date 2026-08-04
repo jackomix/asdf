@@ -19,7 +19,7 @@ PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fc860-asdf}"
 # The loader build version the deployed zip MUST contain.  Bump alongside
 # loader.c's GDS_BUILD_VERSION so the deploy refuses stale/cached zips.
-GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.38.3-glibc}"
+GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.38.4-glibc}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 ZIP="$HERE/gamedevstory.zip"

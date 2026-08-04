@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.38.3-glibc"
+#define GDS_BUILD_VERSION "0.38.4-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -632,15 +632,16 @@ static void *kv_set_job_workers_zero(void *unused) {
      * safely run on this (non-main) thread — without it, Mono's per-thread
      * class-lookup context is NULL and mono_class_get_checked derefs garbage
      * (the 0.38b crash at pc=0xcfccd4 happened here even though il2cpp_init
-     * had returned successfully).  terraria-nextos does this in
-     * ter_jobworkers0() (main.c:431). */
+     * had returned successfully).  terraria-nextos calls dom_get() directly
+     * but ONLY from the MAIN thread (ter_before_present) — its thread is
+     * already attached to Unity's domain.  Our sibling thread is NOT
+     * attached, so even dom_get() crashes inside Mono's lazy setup.
+     * il2cpp_thread_attach(NULL) attaches the current thread to the default
+     * domain.  This MUST happen before any other il2cpp call. */
+    printf("[jobfix] calling thread_attach(NULL)...\n"); fflush(stdout);
     if (thread_attach) {
-        printf("[jobfix] calling dom_get()...\n"); fflush(stdout);
-        void *dom = dom_get();
-        printf("[jobfix] dom_get()=%p\n", dom); fflush(stdout);
-        printf("[jobfix] calling thread_attach(dom)...\n"); fflush(stdout);
-        void *t = thread_attach(dom);
-        printf("[jobfix] thread_attach(domain=%p) -> %p\n", dom, t); fflush(stdout);
+        void *t = thread_attach(NULL);
+        printf("[jobfix] thread_attach(NULL) -> %p\n", t); fflush(stdout);
     } else {
         printf("[jobfix] WARNING no il2cpp_thread_attach symbol\n"); fflush(stdout);
     }
