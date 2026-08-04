@@ -94,10 +94,35 @@ static void fs_load_real(void) {
     g_inited = 1;
 }
 
+/* ---- command-line injection: force single-threaded rendering ---- */
+/* Unity renders on a separate GfxDeviceWorker thread.  On Android the Java
+ * Activity drives that worker; our loader only calls nativeRender on the main
+ * thread, so the worker never runs and GL is never exercised (zero egl calls
+ * in the log).  Terraria fixes this by injecting -force-gfx-direct + -force-gles20
+ * into the process cmdline, which Unity reads from /proc/self/cmdline, forcing
+ * rendering onto the main thread.  We intercept open() of ".../cmdline" and
+ * return a synthetic file with those args. */
+static int kv_cmdline_fd(void) {
+    char buf[256]; int n = 0;
+    n += sprintf(buf + n, "GameDevStory") + 1;
+    n += sprintf(buf + n, "-force-gfx-direct") + 1;
+    n += sprintf(buf + n, "-force-gles20") + 1;
+    FILE *t = tmpfile();
+    if (!t) return -1;
+    fwrite(buf, 1, (size_t)n, t); fflush(t);
+    int fd = dup(fileno(t)); fclose(t); lseek(fd, 0, SEEK_SET);
+    printf("[fs] injected cmdline: -force-gfx-direct -force-gles20\n");
+    return fd;
+}
+
 /* ---- intercepted entry points ---- */
 int kv_open(const char *p, int flags, ...) {
     fs_load_real();
     if (!r_open) return -1;
+    if (p && strstr(p, "cmdline")) {
+        int fd = kv_cmdline_fd();
+        if (fd >= 0) return fd;
+    }
     va_list ap; va_start(ap, flags);
     mode_t mode = va_arg(ap, mode_t);
     va_end(ap);
@@ -120,6 +145,10 @@ int kv_open64(const char *p, int flags, ...) {
 FILE *kv_fopen(const char *p, const char *mode) {
     fs_load_real();
     if (!r_fopen) return NULL;
+    if (p && strstr(p, "cmdline")) {
+        int fd = kv_cmdline_fd();
+        if (fd >= 0) return fdopen(fd, "r");
+    }
     char buf[512];
     const char *r = fs_redirect(p, buf, sizeof buf);
     if (r) return r_fopen(r, mode);

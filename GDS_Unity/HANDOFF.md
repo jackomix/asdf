@@ -342,7 +342,25 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.14.0-glibc) - fs-redirect (Android data paths -> local data/dir)
+## LATEST STATUS (build 0.15.0-glibc) - inject -force-gfx-direct (single-threaded rendering)
+
+0.14.0 fs-redirect didn't change the log (identical, still stuck at AlertDialog,
+zero EGL calls).  So Unity's data reads are going through the JNI AssetManager
+shim (already working), not open().  The REAL problem is likely the
+GfxDeviceWorker: Unity renders on a separate worker thread that the Android
+Java Activity drives.  Our loader only calls nativeRender on the main thread,
+so the worker never runs -> main blocks waiting for it -> zero EGL calls ->
+boot hang before the render loop.
+
+Terraria fixes this by injecting -force-gfx-direct + -force-gles20 into
+/proc/self/cmdline, forcing Unity to render on the main thread.  Added to
+fs_redirect.c: kv_open/kv_fopen intercept ".../cmdline" and return a synthetic
+file with those args.
+
+Next on-device: expect the boot to reach real egl calls (MakeCurrent/SwapBuffers)
+and nativeRender frame liveness.
+
+### Prior: 0.14.0 - fs-redirect (Android data paths -> local data/dir)
 
 0.13.0 statfs shim did NOT stop the AlertDialog.  The 0.12 diagnostics revealed the
 real cause: Unity NEVER calls our EGL shim (no eglInitialize/MakeCurrent/SwapBuffers)
