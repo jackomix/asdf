@@ -32,7 +32,7 @@ extern void *stderr;
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.13.0-glibc"
+#define GDS_BUILD_VERSION "0.14.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -40,6 +40,7 @@ void *kv_jni_java_vm(void);
 void *kv_jni_env(void);
 void *kv_jni_find_native(const char *name);
 void kv_set_asset_dir(const char *dir);
+void kv_fs_set_data_dir(const char *dir);   /* fs_redirect.c */
 int kv_log_open(const char *path);
 void kv_install_crash_handler(void);
 
@@ -145,17 +146,20 @@ void *loader_lookup_export(const char *wanted) {
 
 void *kv_egl_route(const char *name);   /* egl_shim.c: surface symbols -> shim */
 void *kv_bionic_route(const char *name); /* bionic_bridge.c: bionic pthread/signal ABI */
+void *kv_fs_route(const char *name);     /* fs_redirect.c: open/fopen/stat -> data dir */
 static void *resolve(const char *sym) {
     if (sym) {
-        /* EGL/ANativeWindow/sensor surface (egl_shim.c) and the bionic
-         * pthread/signal ABI bridge (bionic_bridge.c) must bind to our shims,
-         * NOT to glibc: glibc has no EGL, and glibc's sigset_t (128 bytes) /
-         * pthread object sizes don't match bionic's (8-byte sigset), so a raw
-         * passthrough overruns the .so's bionic-sized buffers and corrupts the
-         * heap. */
+        /* EGL/ANativeWindow/sensor surface (egl_shim.c), the bionic pthread/
+         * signal ABI bridge (bionic_bridge.c), and the fs-redirect shim
+         * (fs_redirect.c) must bind to our shims, NOT to glibc: glibc has no
+         * EGL, glibc's sigset_t (128 bytes) doesn't match bionic's (8 bytes),
+         * and Unity's open/fopen/stat use Android paths (assets/bin/Data/...)
+         * that only exist under our local data/ dir. */
         void *r = kv_egl_route(sym);
         if (r) return r;
         r = kv_bionic_route(sym);
+        if (r) return r;
+        r = kv_fs_route(sym);
         if (r) return r;
     }
     return dlsym(0, sym);
@@ -540,6 +544,7 @@ int real_main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     kv_set_asset_dir(kv_abspath(argv0, "data"));
+    kv_fs_set_data_dir(kv_abspath(argv0, "data"));
     printf("[loader] === Game Dev Story native loader ===\n");
     printf("[loader] build: %s\n", GDS_BUILD_VERSION);
     const char *libs[3];

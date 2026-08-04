@@ -342,7 +342,28 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.13.0-glibc) - statfs shim (Not enough storage dialog) + stale-kill fix
+## LATEST STATUS (build 0.14.0-glibc) - fs-redirect (Android data paths -> local data/dir)
+
+0.13.0 statfs shim did NOT stop the AlertDialog.  The 0.12 diagnostics revealed the
+real cause: Unity NEVER calls our EGL shim (no eglInitialize/MakeCurrent/SwapBuffers)
+and nativeRender's first call never returns - it's stuck building the dialog before
+reaching GL.
+
+Root cause (via Terraria's my_open/asset_redirect): libunity.so imports open/fopen/
+stat/lstat/access (confirmed by nm) and reads its data files (unity_app_guid,
+globalgamemanagers, level0, global-metadata.dat, sharedassets*) via DIRECT syscalls
+using Android paths (assets/bin/Data/...).  Our extracted data is at data/, so those
+opens fail -> Unity thinks unity_app_guid is empty -> tries to re-extract from the
+missing APK -> storage dialog -> boot hang.
+
+Fix (0.14.0): new loader/fs_redirect.c intercepts open/open64/fopen/stat/lstat/access
+and rewrites Android data paths onto <asset_dir>/<rel> (same as terraria).  Wired
+into resolve() and kv_fs_set_data_dir() called in real_main.
+
+Next on-device: with data files findable, Unity's extraction check should see the
+guid/resources are present, skip the dialog, and proceed to the render loop.
+
+### Prior: 0.13.0 - statfs shim (Not enough storage dialog) + stale-kill fix
 
 Confirmed the user's modal theory: GDS's libunity.so contains the string
 "Not enough storage space to install required resources." (vaddr 0xbdbe5),
