@@ -466,7 +466,27 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.30.0-glibc) - mining the reference ports
+## LATEST STATUS (build 0.31.0-glibc) - filter sigaction/sigaltstack
+
+0.30 deployed with all 6 fixes (256KB alt stack, SIGABRT/TRAP/SYS catch, abort/raise/tgkill/exit overrides, `_ctype_` table pointer, `__stack_chk_fail` returns, re-arm post-egl).  **Result: same silent exit 139, identical log ending at `[fs] injected cmdline`** (frame 0 of nativeRender).
+
+Diagnosis:
+
+1. `nm -D libunity.so` confirmed libunity imports `exit`, `raise`, `__stack_chk_fail`, `_ctype_`, `sigaction`, `sigaltstack` (NO `abort`/`_exit`/`tgkill` directly).
+2. **Unity installs its OWN sigaction + sigaltstack during its init/first-render path**, OVERWRITING ours. Our re-arm after `egl_shim_create_window` worked - briefly. But Unity re-installs again INSIDE `nativeRender` (we can see this in the crash point: boot passes nativeRecreateGfxState, gets through initJni, reaches nativeRender frame 0, dies silently = SIGSEGV went to Unity's own handler with default action).
+3. Same diagnose as terraria-nextos bionic_shims.c:117 (comment CUP_NOSIGH): **"não deixa o engine instalar handler de sinais de crash -> nosso handler pega o fault ORIGINAL"**.  Both refs filter Unity's `sigaction` calls to no-op pretense for crash signals {4,5,6,7,8,11}.
+
+Fix in `loader/bionic_bridge.c`:
+
+- `kv_sigaction` now intercepts calls for crash-signals (`SIGILL=4, SIGTRAP=5, SIGABRT=6, SIGBUS=7, SIGFPE=8, SIGSEGV=11, SIGSYS`) — returns 0 (pretend-success) WITHOUT calling the real `sigaction`.  Our `on_crash` stays as the actual handler.
+- `kv_sigaltstack_noop` added: Unity's `sigaltstack` calls return 0 pretense; we keep OUR 256KB alt stack installed (so the handler push never overflow-faults again).
+- `kv_sigaltstack_noop` routed via `kv_bionic_route` table entry `{sigaltstack, kv_sigaltstack_noop}`.
+
+If the crash was Unity SIGSEGV → its own overwriting handler → silent exit 139 pipeline, 0.31's filter cuts that pipeline: now SIGSEGV goes to OUR handler → expect `[loader] === CRASH sig=11 ===` block with PC + backtrace on next deploy.
+
+If still silent: the crash takes a path not via `sigaction` (e.g., kernel-level - oops or seccomp) and our route didn't bind (the GOT entries for `sigaction`/`sigaltstack` weren't actually re-routed). Next debug step = verify `kv_sigaction` got called at least once by adding a counter print on first entry.
+
+### Prior: 0.30 - mine reference ports
 
 0.29's deploy showed **exit 139 with NO `[loader] === CRASH ===` block** despite our handler being installed.  Same silent death as 0.28.  We then cloned the two reference ports locally:
 

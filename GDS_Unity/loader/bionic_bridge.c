@@ -85,8 +85,51 @@ int kv_sigsuspend(const kv_bionic_sigset_t *set) {
 
 /* bionic sigaction: {flags(int), handler(ptr), mask(8B), restorer(ptr)} */
 struct kv_bionic_sigaction { int bsa_flags; void *bsa_handler; unsigned long bsa_mask; void *bsa_restorer; };
+
+/* Block Unity from replacing our alt stack (we sized ours for our handler).
+ * Pretend-success: return 0, do nothing.  (Real sigaltstack still in effect.) */
+int kv_sigaltstack_noop(const void *ss, void *old_ss) {
+  (void)ss;
+  if (old_ss) memset(old_ss, 0, sizeof(stack_t));   /* report empty as "no alt stack" */
+  return 0;
+}
+/* List of crash/abort signals we MUST keepOurHandler on.  Unity's engine (and
+ * the Mali driver, and the IL2CPP GC) install their own handlers on these
+ * during boot, OVERWRITING ours - then any SIGSEGV/SIGABRT goes to their
+ * default-action path which terminates the process silently (exit 139, no
+ * [loader] === CRASH line).  Both reference ports (terraria-nextos
+ * bionic_shims.c:117 and horizonchase-nextos) block these installs outright
+ * by pretend-success: when Unity calls sigaction(sig, ...) on one of these
+ * we return 0 and DON'T call the real sigaction.  Faking "installed" lets
+ * Unity proceed, but our on_crash stays as the actual handler.
+ *
+ * Signal numbers:
+ *   4 SIGILL, 5 SIGTRAP, 6 SIGABRT, 7 SIGBUS, 8 SIGFPE, 11 SIGSEGV
+ * (aarch64 Linux same as glibc.) */
+static int kv_is_crash_sig(int sig) {
+  return sig == 4 || sig == 5 || sig == 6 || sig == 7 || sig == 8 || sig == 11
+#ifdef SIGSYS
+      || sig == SIGSYS
+#endif
+      ;
+}
 int kv_sigaction(int sig, const struct kv_bionic_sigaction *act,
                  struct kv_bionic_sigaction *oldact) {
+  /* Block Unity from installing its own handler on crash signals.
+   * Pretend-success (return 0) so the caller thinks it won. */
+  if (kv_is_crash_sig(sig)) {
+    if (oldact) {
+      /* Report our currently-installed handler as the "old" so callers that
+       * save+restore will only ever restore OUR handler, not Unity's. */
+      struct sigaction cur; memset(&cur, 0, sizeof cur);
+      sigaction(sig, NULL, &cur);
+      oldact->bsa_flags = cur.sa_flags;
+      oldact->bsa_handler = (cur.sa_flags & SA_SIGINFO) ? (void *)cur.sa_sigaction : (void *)cur.sa_handler;
+      oldact->bsa_mask = 0;
+      oldact->bsa_restorer = NULL;
+    }
+    return 0;
+  }
   struct sigaction ga, go; struct sigaction *pga = NULL, *pgo = NULL;
   if (act) {
     memset(&ga, 0, sizeof ga);
@@ -413,6 +456,13 @@ void *kv_bionic_route(const char *name) {
     {"syscall", kv_syscall},
     {"statfs", kv_statfs}, {"statfs64", kv_statfs},
     {"android_set_abort_message", android_set_abort_message},
+    /* sigaltstack override - Unity calls real sigaltstack during its init to
+     * install ITS OWN alt stack, replacing ours (which is sized for our
+     * crash handler).  If their (typically smaller) alt stack is then used
+     * when our handler fires, the handler push-overflow-re-faults and the
+     * kernel runs default SIGSEGV -> silent exit 139.  We no-op Unity's
+     * sigaltstack (pretend success) so OUR 256KB alt stack stays installed. */
+    {"sigaltstack", kv_sigaltstack_noop},
     /* abort/raise/tgkill/exit/setjmp overrrides - terraria-nextos & horizonchase
      * BOTH route these to logging wrappers.  Without the overrides, Unity's
      * engine calls libc abort()/raise(SIGABRT)/tgkill(SIGABRT)/exit() when it
