@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.38.0-glibc"
+#define GDS_BUILD_VERSION "0.38.1-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -597,6 +597,11 @@ static void kv_start_watchdog(void) {
 static int kv_jobworkers_done = 0;
 static void *kv_set_job_workers_zero(void *unused) {
     (void)unused;
+    int (*il_init_void)(void) = (int (*)(void))kv_il_sym("il2cpp_init");
+    /* Unity's il2cpp_init returns int (0=ok), but il2cpp_domain_get returns
+     * void* — we just check non-NULL.  il2cpp_init may already be in flight by
+     * Unity's main thread under nativeRender; calling it again from a sibling
+     * thread is safe (it's idempotent and guarded). */
     void *(*dom_get)(void) = kv_il_sym("il2cpp_domain_get");
     void *(*dom_asms)(void *, size_t *) = kv_il_sym("il2cpp_domain_get_assemblies");
     void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
@@ -607,23 +612,34 @@ static void *kv_set_job_workers_zero(void *unused) {
         printf("[jobfix] IL2CPP symbols unavailable, skipping\n");
         return 0;
     }
-    /* Poll for up to ~30s waiting for il2cpp_init to complete.  The domain is
-     * NULL until the first call to il2cpp_init (which runs inside the first
-     * nativeRender).  After init, the Unity.Jobs.LowLevel.Unsafe assembly is
-     * loaded and JobsUtility is found.  We must call set_JobWorkerCount AFTER
-     * init because earlier (during pre-init) il2cpp_class_from_name returns
-     * NULL and the resulting mono_class_get_checked deref crashes (see 0.32). */
-    for (int tries = 0; tries < 600 && !kv_jobworkers_done; tries++) {
+    /* Stage A: Wait until il2cpp_init succeeds.  Calling il2cpp_init from a
+     * sibling thread is safe; it returns immediately if already initialized
+     * (Unity calls it from nativeRender on main thread).  This guarantees the
+     * runtime + metadata is fully loaded BEFORE we call class_from_name —
+     * without this gate, the lookup races with the in-flight init and
+     * mono_class_get_checked gets a NULL MonoClass* and SIGSEGVs (0.32, 0.38a).
+     * Poll for up to 30s — the crash handler won't catch us if we disappear. */
+    printf("[jobfix] waiting for il2cpp_init...\n");
+    for (int tries = 0; tries < 600; tries++) {
+        if (il_init_void) { int r = il_init_void(); if (r == 0) break; }
+        else if (dom_get && dom_get()) break;
+        struct timespec ts = {0,50000000}; nanosleep(&ts, 0);
+    }
+    printf("[jobfix] il2cpp_init done, scanning assemblies for JobsUtility\n");
+    /* Stage B: scan assemblies, find JobsUtility, invoke setters. */
+    for (int tries = 0; tries < 200 && !kv_jobworkers_done; tries++) {
         void *domain = dom_get();
         if (!domain) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
         size_t na = 0;
         void **asms = (void **)dom_asms(domain, &na);
         if (!asms || !na) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
+        int found_class = 0;
         for (size_t i = 0; i < na; i++) {
             void *img = asm_img(asms[i]);
             if (!img) continue;
             void *cls = cls_from_name(img, "Unity.Jobs.LowLevel.Unsafe", "JobsUtility");
             if (!cls) continue;
+            found_class = 1;
             int zero = 0;
             void *params[1] = { &zero };
             void *exc = NULL;
@@ -647,9 +663,14 @@ static void *kv_set_job_workers_zero(void *unused) {
                 return 0;
             }
         }
+        if (found_class) {
+            printf("[jobfix] JobsUtility found but no setter invoked — giving up\n");
+            kv_jobworkers_done = 1;
+            return 0;
+        }
         struct timespec ts = {0,50000000}; nanosleep(&ts,0);
     }
-    if (!kv_jobworkers_done) printf("[jobfix] gave up after 600 polls (il2cpp never ready)\n");
+    if (!kv_jobworkers_done) printf("[jobfix] gave up (il2cpp never ready or JobsUtility not found)\n");
     return 0;
 }
 
