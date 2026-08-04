@@ -466,7 +466,24 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.27.0-glibc) - dlsym interception
+## LATEST STATUS (build 0.28.0-glibc) - Deadlock bypassed, now hitting Segfault (exit 139)
+
+0.28.0 successfully bypassed the `AlertDialog` deadlock! The two fixes were:
+1. **`findLibrary` returns `NULL`**: In `jni_shim.c`, returning `NULL` instead of the game directory tells Unity's `ClassLoader` that the native library is already loaded. Previously, returning a path caused Unity to attempt a `dlopen`, which failed and triggered the generic "failed to load" `AlertDialog`.
+2. **`TER_JOBWORKERS0` implemented**: Inside `loader_glibc_main.c`, we now use IL2CPP reflection to lazily invoke `JobsUtility.set_JobWorkerCount(0)` (and related setters) during the first few frames of `nativeRender`. This forces Unity to run all jobs inline on the main thread, bypassing the worker thread futex deadlock entirely.
+
+**Current Blocker (Segfault):**
+With the deadlock gone, Unity proceeds into the `nativeRender` loop. The log shows:
+```
+[unity] nativeRecreateGfxState OK
+[unity] nativeRender loop...
+[fs] injected cmdline: -force-gfx-direct -force-gles20
+```
+Immediately after this, the loader crashes with a **Segmentation fault (code 139)**.
+
+The crash happens *after* `nativeRecreateGfxState` finishes and *during* the `nativeRender` loop execution. Because Unity is now actually trying to render (or at least initialize its internal rendering pipeline on the main thread), it is likely dereferencing a bad pointer related to our fake EGL/GL context, the `thiz`/`ctx`/`surf` JNI objects we pass to `nativeRender`, or a missing JNI method.
+
+### Prior: 0.27.0 - dlsym interception
 
 0.26.0's fix (intercepting `syscall`) successfully reached the main thread, but the job worker pool STILL blocked on `syscall(SYS_futex)` with a NULL timeout! The watchdog thread dump revealed that all blocked worker threads shared the exact same PC (`0x7f8616ef6c`) as the main thread. This meant they were calling the raw GLIBC `pthread_cond_wait` directly, executing its internal `svc 0` instruction.
 
