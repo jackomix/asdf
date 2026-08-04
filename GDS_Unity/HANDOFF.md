@@ -342,7 +342,33 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.10.0-glibc) - point SDL at the Mali EGL driver
+## LATEST STATUS (build 0.13.0-glibc) - statfs shim (Not enough storage dialog) + stale-kill fix
+
+Confirmed the user's modal theory: GDS's libunity.so contains the string
+"Not enough storage space to install required resources." (vaddr 0xbdbe5),
+and the log ends right as Unity builds an AlertDialog$Builder/setTitle/setMessage
+- Unity's storage check fails, it pops the dialog, and blocks the boot (black
+screen; dialog never renders since our JNI shim has no real Java UI).
+
+Root cause found via RE: libunity.so imports `statfs@LIBC`. In the glibc build
+it resolves to real glibc statfs via dlsym, which returns -1 on an Android path
+Unity probes -> Unity concludes "not enough storage" -> dialog.
+
+Fix (0.13.0):
+- loader/bionic_bridge.c: kv_statfs() always reports abundant free space
+  (1 TiB, f_bavail*f_bsize huge) and routes "statfs"/"statfs64" imports to it.
+- launcher: fixed the stale-kill self-kill bug.  The old version killed stale
+  loader2 BEFORE launching, and the fresh loader reused the freed PID and got
+  killed (exit 137).  Now it launches first (captures $LOADER_PID), then kills
+  only OTHER loader2 instances, so the fresh loader is never killed.
+
+Also added earlier: EGL per-call counters + nativeRender frame liveness (0.12.0)
+to see if Unity reaches eglSwapBuffers/present.
+
+On-device next: with statfs returning free space, Unity's storage check should
+pass, no dialog, boot should continue into the actual game render.
+
+### Prior: 0.10.0 - point SDL at the Mali EGL driver
 
 0.9.0 confirmed the game boots fully into the player loop and SDL_Init(VIDEO)
 works (KMSDRM).  Only remaining blocker: SDL_CreateWindow still couldn't load

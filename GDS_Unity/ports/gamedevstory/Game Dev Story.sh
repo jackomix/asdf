@@ -48,22 +48,6 @@ fi
 echo "--- all checks done, launching ---"
 } >> "$LOG" 2>&1
 
-# --- Kill any stale loader2 from a previous run ---
-# A leftover loader2 holds the DRM/GL display, so a new instance boots to a
-# black screen (can't create a presentable GBM surface).  Terraria's run.sh
-# does this too.  Only kill processes running the same loader2 binary.
-{
-echo "--- killing stale loader2 ---"
-# The loader runs as ./loader2 (comm truncated to "loader2").  Kill any prior
-# instance so it can't hold the DRM/GL display (which causes a black screen).
-for p in $(pgrep -x loader2 2>/dev/null; pgrep -f '\./loader2' 2>/dev/null); do
-  if [ "$p" != "$$" ] && [ "$p" != "$PPID" ]; then
-    echo "  killing stale loader2 pid $p"
-    kill -9 "$p" 2>/dev/null || true
-  fi
-done
-} >> "$LOG" 2>&1
-
 # --- Make the firmware's graphics libs findable ---
 # Terraria's launcher does this: SDL2, libEGL/libGLESv2 (Mali) and libz live in
 # these dirs on ArkOS, and our loader dlopens them at runtime (kv_egl_dlopen +
@@ -87,7 +71,19 @@ cd "$GAMEDIR" || { echo "cannot cd $GAMEDIR" >> "$LOG"; exit 1; }
 {
 echo "=== launching ./loader2 from $(pwd) ==="
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-./loader2
+# Launch FIRST, then kill any OTHER loader2 instances (a leftover one holds the
+# DRM/GL display -> black screen).  Launching before the kill means our own
+# fresh loader can never be killed by PID reuse (which happened when the kill
+# ran first and the new loader reused the freed PID -> exit 137).
+./loader2 &
+LOADER_PID=$!
+for p in $(pgrep -x loader2 2>/dev/null); do
+  if [ "$p" != "$LOADER_PID" ] && [ "$p" != "$$" ]; then
+    echo "  killing stale loader2 pid $p"
+    kill -9 "$p" 2>/dev/null || true
+  fi
+done
+wait "$LOADER_PID"
 echo "=== loader2 exited with code $? ==="
 } >> "$LOG" 2>&1
 

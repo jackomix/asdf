@@ -27,6 +27,33 @@
 #include <semaphore.h>
 #include <sched.h>
 #include <time.h>
+#include <dlfcn.h>
+#include <sys/vfs.h>
+
+/* ---- statfs shim: defeat Unity's "Not enough storage space" dialog ----
+ * libunity.so imports statfs and checks the free space on the target volume
+ * before deciding whether it can install/extract il2cpp resources.  Under glibc
+ * the real statfs can return -1 on an Android path Unity probes, which makes
+ * Unity conclude there's not enough storage and pop an AlertDialog that blocks
+ * the whole boot (the log's final AlertDialog$Builder/setMessage).  We report
+ * abundant free space so the check always passes.  Offsets below are the glibc
+ * aarch64 struct statfs layout (kernel-compatible, matches bionic). */
+int kv_statfs(const char *path, void *buf) {
+    (void)path;
+    struct statfs *s = (struct statfs *)buf;
+    if (!s) { errno = EINVAL; return -1; }
+    memset(s, 0, sizeof(struct statfs));
+    s->f_bsize = 4096;
+    s->f_blocks = (1ULL << 40) / 4096;   /* 1 TiB total */
+    s->f_bfree  = s->f_blocks;           /* all free */
+    s->f_bavail = s->f_blocks;
+    s->f_frsize = 4096;
+    s->f_files = 1000000;
+    s->f_ffree = 1000000;
+    s->f_namelen = 255;
+    s->f_flags = 0;
+    return 0;
+}
 
 /* ================= sigset_t: bionic(8B) <-> glibc(128B) ================= */
 typedef unsigned long kv_bionic_sigset_t;   /* arm64 bionic: 64-bit mask */
@@ -253,6 +280,7 @@ void *kv_bionic_route(const char *name) {
     {"pthread_condattr_setclock", kv_pthread_condattr_setclock},
     {"pthread_mutexattr_init", kv_pthread_mutexattr_init}, {"pthread_mutexattr_destroy", kv_pthread_mutexattr_destroy},
     {"pthread_mutexattr_settype", kv_pthread_mutexattr_settype},
+    {"statfs", kv_statfs}, {"statfs64", kv_statfs},
     {"android_set_abort_message", android_set_abort_message},
     {0, 0}
   };
