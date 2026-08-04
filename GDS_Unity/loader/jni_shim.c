@@ -378,11 +378,16 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
      * sane values instead of dereferencing 0x6000 as a JNI string handle. */
     if (strcmp(nm, "getPackageName") == 0) return kv_make_jstring("net.kairosoft.android.gamedev3en");
     if (strcmp(nm, "getPackageCodePath") == 0) return kv_make_jstring(kv_get_game_dir());
-    /* findLibrary(name) -> path to a native lib.  Our libs are already loaded
-     * natively by the loader; return the game dir so Unity's string handling
-     * gets a valid handle (and any load of a missing subpath fails gracefully
-     * rather than crashing on a raw pointer). */
-    if (strcmp(nm, "findLibrary") == 0) return kv_make_jstring(kv_get_game_dir());
+    /* findLibrary(name) -> path to a native lib.  Returning NULL tells Unity
+     * the library is already loaded in the process (which it is — our loader
+     * mapped it).  Returning a PATH causes Unity to try dlopen(path) which
+     * fails (it's not a real Android install) → AlertDialog → deadlock. */
+    if (strcmp(nm, "findLibrary") == 0) {
+        void *arg0 = args.n ? (void *)args.a[0] : 0;
+        const char *libname = arg0 ? kv_resolve_jstring((jstring)arg0) : "?";
+        printf("[jni] findLibrary(\"%s\") -> NULL (already loaded)\n", libname);
+        return NULL;
+    }
     if (strcmp(nm, "toString") == 0) return kv_make_jstring("");
     if (strcmp(nm, "getName") == 0 || strcmp(nm, "getCanonicalName") == 0 ||
         strcmp(nm, "getTypeName") == 0) return kv_make_jstring("java.lang.Object");

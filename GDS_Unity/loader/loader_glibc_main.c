@@ -49,7 +49,7 @@ struct timespec { long tv_sec; long tv_nsec; };
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.27.0-glibc"
+#define GDS_BUILD_VERSION "0.28.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -460,6 +460,68 @@ static void kv_start_watchdog(void) {
     if (pthread_create(&t, 0, kv_watchdog, 0) == 0) pthread_detach(t);
 }
 
+/* ---- TER_JOBWORKERS0: force Unity's job system to run inline ----
+ * Unity sizes its job-worker pool from the CPU count, but under our loader the
+ * workers deadlock (they call glibc's internal futex which we can't intercept).
+ * The horizonchase-nextos port solves this by calling
+ *   JobsUtility.set_JobWorkerCount(0)
+ *   JobsUtility.SetJobQueueMaximumActiveThreadCount(0)
+ *   JobsUtility.SetJobQueueMaximumWarpThreadCount(0)
+ * via il2cpp_runtime_invoke after the runtime is initialized.  This tells Unity
+ * to run all jobs inline on the calling thread — no workers needed.
+ *
+ * We call this lazily from the nativeRender loop because il2cpp_init runs
+ * inside the first nativeRender call, so the domain/assemblies aren't available
+ * until after at least one render frame. */
+static int kv_jobworkers_done = 0;
+static void kv_set_job_workers_zero(void) {
+    if (kv_jobworkers_done) return;
+    void *(*dom_get)(void) = kv_il_sym("il2cpp_domain_get");
+    void *(*dom_asms)(void *, size_t *) = kv_il_sym("il2cpp_domain_get_assemblies");
+    void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
+    void *(*cls_from_name)(void *, const char *, const char *) = kv_il_sym("il2cpp_class_from_name");
+    void *(*cls_method)(void *, const char *, int) = kv_il_sym("il2cpp_class_get_method_from_name");
+    void *(*rt_invoke)(void *, void *, void **, void **) = kv_il_sym("il2cpp_runtime_invoke");
+    if (!dom_get || !dom_asms || !asm_img || !cls_from_name || !cls_method || !rt_invoke) {
+        printf("[jobfix] IL2CPP symbols unavailable, skipping\n");
+        kv_jobworkers_done = 1;
+        return;
+    }
+    void *domain = dom_get();
+    if (!domain) return;  /* domain not ready yet — retry next frame */
+    size_t na = 0;
+    void **asms = (void **)dom_asms(domain, &na);
+    if (!asms || !na) return;  /* assemblies not loaded yet */
+    for (size_t i = 0; i < na; i++) {
+        void *img = asm_img(asms[i]);
+        if (!img) continue;
+        void *cls = cls_from_name(img, "Unity.Jobs.LowLevel.Unsafe", "JobsUtility");
+        if (!cls) continue;
+        int zero = 0;
+        void *params[1] = { &zero };
+        void *exc = NULL;
+        const char *setters[] = {
+            "set_JobWorkerCount",
+            "SetJobQueueMaximumActiveThreadCount",
+            "SetJobQueueMaximumWarpThreadCount"
+        };
+        int any = 0;
+        for (unsigned s = 0; s < sizeof(setters)/sizeof(setters[0]); s++) {
+            void *m = cls_method(cls, setters[s], 1);
+            if (!m) continue;
+            exc = NULL;
+            rt_invoke(m, NULL, params, &exc);
+            printf("[jobfix] %s(0) invoked (exc=%p)\n", setters[s], exc);
+            any = 1;
+        }
+        if (any) {
+            printf("[jobfix] job workers set to 0 — jobs will run inline\n");
+            kv_jobworkers_done = 1;
+            return;
+        }
+    }
+}
+
 static void kv_unity_boot(void) {
     void *env = kv_jni_env();
     /* Give Unity real, zeroed thiz/ctx/surf objects instead of tiny fake
@@ -508,6 +570,11 @@ static void kv_unity_boot(void) {
     printf("[unity] nativeRender loop...\n");
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
     for (int f = 0; f < 1000000; f++) {
+        /* Try to set job workers to 0 on the first few frames (IL2CPP
+         * initializes lazily inside nativeRender, so domain/assemblies
+         * may not exist until after the first frame completes). */
+        if (!kv_jobworkers_done && f < 30) kv_set_job_workers_zero();
+
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
         /* Periodic liveness: confirms nativeRender is actually looping (and not
