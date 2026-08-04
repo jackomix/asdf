@@ -466,7 +466,7 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.35.0-glibc) - ptrace PC dump + persistent deadlock confirmed
+## LATEST STATUS (build 0.36.0-glibc) - fix ptrace waitpid __WALL
 
 0.34 deployed, 3 watchdog dumps captured. Findings:
 
@@ -496,6 +496,23 @@ Each watchdog dump (~12s after render loop starts) will print per-thread:
 `pc` will fall in libunity (`0x20222f000..0x203269000`) or libil2cpp (`0x200000000..0x20221f000`). Cross-reference with `aarch64-elf-objdump -T libunity.so` dynamic symbol table + `objdump -d` disasm to find the function the main thread is parked inside (most likely `pthread_cond_wait` or `std::condition_variable::wait` inside Unity's `JobSystem::Exec` waiting for the worker queue signal).
 
 Once identified, next version intercepts that function in `bionic_bridge.c` route table OR patches the GOT slot in libunity.
+
+### 0.35 result - ptrace attach silent (no pc lines)
+
+Watchdog dumps #0..#2 ran the syscall/kstack block but the ptrace block printed ZERO lines — no `user: pc=...`, no `PTRACE_ATTACH failed`, nothing. The for-loop went through every tid, all threads had `tid_l > 0`, so we DID call ptrace. Means `ptrace(PTRACE_ATTACH)` returned non-zero (silently falls through the if). Or the printf is buffered and the program is struggling to flush mid-loop. But `0.34` watchdog flushed `=== end dump #N ===` fine each round, so flush isn't the issue.
+
+No-yama on R36S (verified `cat /proc/sys/kernel/yama/ptrace_scope` returns ENOENT). So permissions aren't the problem.
+
+**Real cause**: `waitpid(tid, &status, 0)` blocks forever waiting for SIGSTOP. For ptrace-attach to a SIBLING thread (same process, not a child pid), glibc `waitpid(2)` with default flags refuses to wait for clone/non-fork children — returns ECHILD, ptrace attach never observes the stop, the `waitpid` either returns immediately (ECHILD), OR the conditional never enters the GETREGSET block.
+
+Fix per Linux man-page `ptrace(2)`: "**Use the `__WALL` flag** with `waitpid(2)` for ptrace-attached threads" (since they are CLONE_CHILDREN from kernel perspective, not fork children).
+
+### 0.36 - add __WALL flag + error reporting
+
+- `waitpid((int)tid_l, &status, __WALL)` instead of `0`
+- Added `else` printf on `PTRACE_ATTACH` failure path so silence → visibility if attach really does fail
+- Added explicit `GETREGSET failed` and `waitpid failed` printf branches — previously silent fall-through
+- `__WALL = 0x40000000` declared locally (no glibc header included)
 
 0.33 fix worked: `nativeRender` now enters (jobfix no longer pre-probe kills it).  Log shows the player loop STARTED:
 ```

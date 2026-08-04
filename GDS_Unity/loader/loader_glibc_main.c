@@ -63,11 +63,21 @@ extern long ptrace(long req, long pid, void *addr, void *data);
 #define PTRACE_DETACH 17
 #define PTRACE_GETREGSET 0x4204
 struct iovec { void *iov_base; unsigned long iov_len; };
+/* waitpid flags - Linux-specific.  When attaching to a SIBLING thread (same
+ * process, NOT a child), waitpid requires __WALL or __WCLONE, otherwise it
+ * returns ECHILD and the dump never happens.  Same-process PTRACE_ATTACH
+ * makes the tracee a "clone child" relative to the tracer. */
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+#ifndef __WCLONE
+#define __WCLONE 0x80000000
+#endif
 
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.35.0-glibc"
+#define GDS_BUILD_VERSION "0.36.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -503,10 +513,13 @@ static void *kv_watchdog(void *arg) {
          * yama/ptrace_scope < 1 required (we run as the same user - self-attach). */
         long tid_l = strtol(de->d_name, 0, 10);
         if (tid_l > 0 && ptrace(PTRACE_ATTACH, tid_l, 0, 0) == 0) {
-            /* PTRACE_ATTACH is async - the kernel sends a SIGSTOP; wait for it. */
+            /* PTRACE_ATTACH is async - the kernel sends a SIGSTOP; wait for it.
+             * __WALL is REQUIRED for same-process sibling thread attach: without
+             * it waitpid returns ECHILD (the tracee is a "clone" child, not a
+             * fork child) and we never observe the stop. */
             int status = 0;
             extern int waitpid(int, int *, int);
-            if (waitpid((int)tid_l, &status, 0) >= 0) {
+            if (waitpid((int)tid_l, &status, __WALL) >= 0) {
                 struct user_regs_struct regs; struct iovec iov = { &regs, sizeof regs };
                 if (ptrace(PTRACE_GETREGSET, tid_l, (void *)1 /*NT_PRSTATUS*/, &iov) == 0) {
                     printf("[watchdog] tid=%s user: pc=%lx lr=%lx sp=%lx\n",
@@ -515,9 +528,15 @@ static void *kv_watchdog(void *arg) {
                            de->d_name, regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3]);
                     printf("[watchdog] tid=%s        x19=%lx x20=%lx x21=%lx x22=%lx\n",
                            de->d_name, regs.regs[19], regs.regs[20], regs.regs[21], regs.regs[22]);
+                } else {
+                    printf("[watchdog] tid=%s PTRACE_GETREGSET failed\n", de->d_name);
                 }
+            } else {
+                printf("[watchdog] tid=%s waitpid(__WALL) failed\n", de->d_name);
             }
             ptrace(PTRACE_DETACH, tid_l, 0, 0);
+        } else if (tid_l > 0) {
+            printf("[watchdog] tid=%s PTRACE_ATTACH failed\n", de->d_name);
         }
     }
     closedir(d);
