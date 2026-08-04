@@ -466,11 +466,44 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.31.0-glibc) - filter sigaction/sigaltstack
+## LATEST STATUS (build 0.32.0-glibc) - real PC via ucontext struct access
 
-0.30 deployed with all 6 fixes (256KB alt stack, SIGABRT/TRAP/SYS catch, abort/raise/tgkill/exit overrides, `_ctype_` table pointer, `__stack_chk_fail` returns, re-arm post-egl).  **Result: same silent exit 139, identical log ending at `[fs] injected cmdline`** (frame 0 of nativeRender).
+0.31 deployed the `sigaction`/`sigaltstack` filter.  **First time ever, the crash handler fired**:
 
-Diagnosis:
+```
+[loader] === CRASH sig=11 ===
+[loader]   si_addr=0x135 FAR=0x0
+[loader]   pc=0x20000000 sp=0x7fd1dfef80 fp(x29)=0x200d11c24 lr(x30)=0x200cfccd4
+[loader] backtrace (x29 chain):
+[loader]   #0 lr=0x361800483944d668 (fp=0x200d11c24)
+```
+
+Decoding:
+- `sig=11` = SIGSEGV - that's a real fault.
+- `si_addr=0x135` / `FAR=0x0` - classic **NULL pointer + 0x135 field offset** pattern.  Some pointer is NULL, code did `ldr [ptr, #0x135]`.
+- `lr=0x200cfccd4` lies inside libil2cpp's mapped range `0x200000000..0x20221f000` (offset `0xcfccd4`) - so the call site is in libil2cpp.
+- `fp=0x200d11c24` is also libil2cpp.
+- BUT `pc=0x20000000` is **only 8 hex digits** while our mapped libs all start at `0x20xxxxxxx` (9 hex digits) - 0x20000000 is unmapped, and the backtrace lr=`0x361800483944d668` is obviously garbage.
+
+Diagnosis: my hand-computed byte offsets for mcontext fields were WRONG for this glibc build.  I read `pc@ucontext+0x1C0`, `x30@ucontext+0x1B8` etc; the actual aarch64 glibc `ucontext_t` layout depends on `stack_t` size inside `ucontext_t` (which can vary by build), so my byte offsets produced garbage.  The reference ports (terraria-nextos, horizonchase-nextos) just use the **struct field access**: `uc->uc_mcontext.pc`, `uc->uc_mcontext.regs[30]`, etc - that's the correct approach and compiler-checked.
+
+Fix in `loader/glibc_shims.c`:
+- `kv_sighandler` now does `ucontext_t *uc = (ucontext_t *)ucontext; unsigned long pc = uc->uc_mcontext.pc;` and `.regs[30]` for lr, `.sp` for sp, `.fault_address` for FAR, `.regs[29]` for fp.
+- Dumped `x0..x28` in a 3-per-line grid so we can see arg values at crash site.
+- Bumped crash handler buf from 640 → 4096 bytes (the maps-parse block + backtrace + x0..x28 fits).
+- Removed the (silently failing) byte-offset k_si_addr / si_addr cross-check.
+
+### Expected 0.32 result
+
+A real, sane `pc=0x2XXXXXXX` value (9 hex digits) that maps cleanly to libil2cpp/libunity/loader/SDL/Mali's mapped range, with the `[loader]   pc in [<range>) <path>  (pc-offset=0xN)` line now printed (it was eaten by either the bad-char-in-path sprintf path or buf-truncation at 0x31).  That pc-offset, plus the x0..x28 dump + the [] backtrace, will pinpoint the exact crash site + function.
+
+### What we already know about the crash from 0.31
+
+Even with garbage pc: the **faulting NULL+0x135 access** likely means a Unity-internal structure pointer is NULL when libil2cpp's `nativeRender` enters its first real work.  The lr=0x200cfccd4 (inside libil2cpp, offset ~0xcfccd4) is the call site - that single value DID get read correctly (regs[30] is the lower-address +), at minimum we can disassemble around that offset with `aarch64-linux-gnu-objdump -d libil2cpp.so` once we have a real toolchain.  But the lr value tells us we're in libil2cpp code that called something which dereferenced NULL+0x135.
+
+### Prior: 0.31 - filter sigaction/sigaltstack
+
+0.30 silent exit again (same byte-identical log).  nm on libunity.so:
 
 1. `nm -D libunity.so` confirmed libunity imports `exit`, `raise`, `__stack_chk_fail`, `_ctype_`, `sigaction`, `sigaltstack` (NO `abort`/`_exit`/`tgkill` directly).
 2. **Unity installs its OWN sigaction + sigaltstack during its init/first-render path**, OVERWRITING ours. Our re-arm after `egl_shim_create_window` worked - briefly. But Unity re-installs again INSIDE `nativeRender` (we can see this in the crash point: boot passes nativeRecreateGfxState, gets through initJni, reaches nativeRender frame 0, dies silently = SIGSEGV went to Unity's own handler with default action).

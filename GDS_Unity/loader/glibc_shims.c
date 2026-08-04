@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <errno.h>
 
 /* bionic strlcpy: glibc may not expose it; provide it here. */
@@ -70,42 +71,30 @@ int kv_log_open(const char *path) {
     return 0;
 }
 static void kv_sighandler(int sig, void *info, void *ucontext) {
-    /* Must be async-signal-safe: no printf/malloc.  Use write+sprintf only.
-     *
-     * NOTE on aarch64 glibc ucontext layout (verified empirically):
-     *   uc_mcontext @ offsetof(ucontext_t, uc_mcontext) = 0xB8 on aarch64 glibc.
-     *   mcontext_t = { unsigned long fault_address; unsigned long regs[31];
-     *                  unsigned long sp; unsigned long pc; unsigned long pstate; }
-     * So:
-     *   fault_address @ mcontext + 0    = ucontext + 0xB8 + 0    = 0xB8
-     *   regs[i]       @ mcontext + 8 + i*8  = ucontext + 0xC0 + i*8
-     *   sp            @ mcontext + 8 + 31*8 = ucontext + 0x1B0
-     *   pc            @ mcontext + 8 + 32*8 = ucontext + 0x1C0
-     *   x29 (fp)      = regs[29] = ucontext + 0xC0 + 29*8 = 0x1A8
-     *   x30 (lr)      = regs[30] = ucontext + 0xC0 + 30*8 = 0x1B8
-     *
-     * Older code read x30 at 0x168 (wrong: that's regs[22]) and pc at 0x1C0
-     * (still correct: pc is @ ucontext + 0x1C0).  Fixed below. */
-    unsigned char *u = (unsigned char *)ucontext;
-    unsigned long far = 0, pc = 0, sp = 0, x29 = 0, x30 = 0;
-    if (u) {
-        for (int i = 0; i < 8; i++) far |= ((unsigned long)u[0xB8 + i]) << (8 * i);
-        for (int i = 0; i < 8; i++) pc  |= ((unsigned long)u[0x1C0 + i]) << (8 * i);
-        for (int i = 0; i < 8; i++) sp  |= ((unsigned long)u[0x1B0 + i]) << (8 * i);
-        for (int i = 0; i < 8; i++) x29 |= ((unsigned long)u[0x1A8 + i]) << (8 * i);
-        for (int i = 0; i < 8; i++) x30 |= ((unsigned long)u[0x1B8 + i]) << (8 * i);
-    }
-    /* si_addr in siginfo (overlaps the FAR for SIGSEGV) - useful cross-check.
-     * NOTE: si_addr is a glibc macro - shadow it with our own name. */
-    unsigned char *p = (unsigned char *)info;
-    unsigned long k_si_addr = 0;
-    if (p) for (int i = 0; i < 8; i++) k_si_addr |= ((unsigned long)p[16 + i]) << (8 * i);
+    /* Use the real struct access (like terraria-nextos/horizonchase-nextos do:
+     * `uc->uc_mcontext.pc, .regs[30]` etc) instead of byte offsets.  Our
+     * previous hand-computed offsets (pc@ucontext+0x1C0 etc) were WRONG for
+     * this glibc build and we got garbage PC values - exactly the bug that
+     * made 0.31 print pc=0x20000000 (truncated/garbage) for a real crash. */
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    unsigned long pc  = uc ? uc->uc_mcontext.pc        : 0;
+    unsigned long far = uc ? uc->uc_mcontext.fault_address : 0;
+    unsigned long sp  = uc ? uc->uc_mcontext.sp        : 0;
+    unsigned long x29 = uc ? uc->uc_mcontext.regs[29] : 0;
+    unsigned long x30 = uc ? uc->uc_mcontext.regs[30] : 0;
+    (void)info;
 
-    char buf[640]; int n = 0;
+    char buf[4096]; int n = 0;
     n += sprintf(buf + n, "[loader] === CRASH sig=%d ===\n", sig);
-    n += sprintf(buf + n, "[loader]   si_addr=0x%lx FAR=0x%lx\n", k_si_addr, far);
+    n += sprintf(buf + n, "[loader]   FAR=0x%lx\n", far);
     n += sprintf(buf + n, "[loader]   pc=0x%lx sp=0x%lx fp(x29)=0x%lx lr(x30)=0x%lx\n",
                  pc, sp, x29, x30);
+    /* Dump x0..x28 in a 3-per-line grid so we can see arg values + aux regs. */
+    if (uc) for (int i = 0; i < 29; i++) {
+        n += sprintf(buf + n, " x%-2d=0x%lx", i, (unsigned long)uc->uc_mcontext.regs[i]);
+        if (i % 3 == 2) { buf[n++] = '\n'; }
+    }
+    if (n > 0 && buf[n-1] != '\n') buf[n++] = '\n';
 
     /* Find the owner module for `pc` so we can compute fn-relative offsets,
      * which is what we actually need to map the crash to a function.  Walk our
