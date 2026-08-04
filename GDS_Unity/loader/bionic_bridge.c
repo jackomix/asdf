@@ -281,6 +281,53 @@ int kv_pthread_mutexattr_init(void *a) { (void)a; return 0; }
 int kv_pthread_mutexattr_destroy(void *a) { (void)a; return 0; }
 int kv_pthread_mutexattr_settype(void *a, int t) { (void)a; (void)t; return 0; }
 
+/* ---- syscall shim: raw futex + sched_getaffinity (horizonchase/terraria) ----
+ * Unity's JOB SYSTEM calls raw `syscall(SYS_futex, FUTEX_WAIT, ...)` DIRECTLY,
+ * bypassing pthread_cond/sem.  That is why the worker threads in every thread
+ * dump futex-wait with timeout=NULL (0x0) - my pthread_cond/sem polling shims
+ * never reach them.  Horizonchase's TER_FUTEXPOLL solves this by intercepting
+ * syscall() and injecting a short timeout into any FUTEX_WAIT without one, so
+ * the waiter wakes periodically, re-checks its predicate, and can make progress.
+ * Also intercept SYS_sched_getaffinity to force 1 CPU at the syscall level. */
+#ifndef SYS_futex
+#define SYS_futex 98
+#endif
+#ifndef SYS_sched_getaffinity
+#define SYS_sched_getaffinity 123
+#endif
+static long kv_futexpoll_ms = 2;   /* 2 ms poll slice for raw futex waits */
+extern long syscall(long n, ...);
+static long kv_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    /* force 1 CPU at the syscall level (job workers = num_cpus - 1) */
+    if (n == SYS_sched_getaffinity && a3) {
+        long r = syscall(n, a1, a2, a3, a4, a5, a6);
+        if (r > 0) { memset((void *)a3, 0, (size_t)a2); *(unsigned long *)a3 = 1UL; }
+        return r > 0 ? r : (memset((void *)a3, 0, 8), *(unsigned long *)a3 = 1UL, 8);
+    }
+    if (n == SYS_futex) {
+        int op = (int)a2 & 0x7f;
+        if (op == 0 /*FUTEX_WAIT*/ || op == 9 /*FUTEX_WAIT_BITSET*/) {
+            /* FUTEX_WAIT: (uaddr, op, val, timeout). FUTEX_WAIT_BITSET: (uaddr,
+             * op, val, timeout, bitset).  a4 = timeout (0 = infinite). */
+            long t4 = a4;
+            struct timespec ts;
+            if (a4 == 0) {   /* infinite wait -> inject poll timeout */
+                int clk = ((int)a2 & 256 /*FUTEX_CLOCK_REALTIME*/) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+                if (op == 0) { ts.tv_sec = 0; ts.tv_nsec = kv_futexpoll_ms * 1000000L; }
+                else {
+                    clock_gettime(clk, &ts);
+                    ts.tv_sec += kv_futexpoll_ms / 1000;
+                    ts.tv_nsec += (kv_futexpoll_ms % 1000) * 1000000L;
+                    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                }
+                t4 = (long)&ts;
+            }
+            return syscall(n, a1, a2, a3, t4, a5, a6);
+        }
+    }
+    return syscall(n, a1, a2, a3, a4, a5, a6);
+}
+
 /* ---- job-system inline fix: report a single CPU ----
  * Unity sizes its job-worker pool as (num_cpus - 1).  On Android the workers are
  * driven by a Java/looper that doesn't exist under our loader, so jobs dispatched
@@ -351,6 +398,7 @@ void *kv_bionic_route(const char *name) {
     {"pthread_mutexattr_settype", kv_pthread_mutexattr_settype},
     {"sched_getaffinity", kv_sched_getaffinity}, {"sched_setaffinity", kv_sched_setaffinity},
     {"sysconf", kv_sysconf},
+    {"syscall", kv_syscall},
     {"statfs", kv_statfs}, {"statfs64", kv_statfs},
     {"android_set_abort_message", android_set_abort_message},
     {0, 0}

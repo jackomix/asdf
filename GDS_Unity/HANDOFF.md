@@ -424,7 +424,24 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.25.0-glibc) - 1-CPU shim v3: + opendir/readdir /sys/cpu
+## LATEST STATUS (build 0.26.0-glibc) - syscall shim: raw futex poll + sched_getaffinity
+
+0.25's dump: workers STILL futex-wait with NULL timeout (0x0); the opendir shim
+NEVER fired (so Unity doesn't count cores that way).  Studying horizonchase-nextos
+(same author, Unity) revealed the missing piece: Unity's JOB SYSTEM calls raw
+`syscall(SYS_futex, FUTEX_WAIT, ...)` DIRECTLY, bypassing pthread_cond/sem.  That
+is exactly why workers futex-wait with timeout=NULL - my pthread/cond/sem polling
+shims never reach them.  Horizonchase's TER_FUTEXPOLL intercepts syscall() and
+injects a short timeout into any FUTEX_WAIT without one.
+
+Fix (0.26.0) in bionic_bridge.c: kv_syscall intercepts:
+- SYS_futex (98): any FUTEX_WAIT(0)/WAIT_BITSET(9) with timeout=NULL gets a 2ms
+  poll timeout injected -> worker wakes, re-checks its queue, can make progress.
+- SYS_sched_getaffinity (123): forces 1-CPU mask at the syscall level too.
+Both libil2cpp.so and libunity.so import syscall (verified via nm), so this
+reaches the raw futex path the worker pool uses.
+
+### Prior: 0.25.0 - 1-CPU shim v3: + opendir/readdir /sys/cpu
 
 Three external models reviewed 0.24's dump.  Decisive findings (cross-checked
 against nm imports):
