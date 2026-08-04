@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.39.3-glibc"
+#define GDS_BUILD_VERSION "0.39.4-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -598,7 +598,7 @@ static void kv_start_watchdog(void) {
 static int kv_jobworkers_done = 0;
 static void *kv_set_job_workers_zero(void *unused) {
     (void)unused;
-    int (*il_init_void)(void) = (int (*)(void))kv_il_sym("il2cpp_init");
+    int (*il_init_void)(const char *) = (int (*)(const char *))kv_il_sym("il2cpp_init");
     /* Unity's il2cpp_init returns int (0=ok), but il2cpp_domain_get returns
      * void* — we just check non-NULL.  il2cpp_init may already be in flight by
      * Unity's main thread under nativeRender; calling it again from a sibling
@@ -632,10 +632,10 @@ static void *kv_set_job_workers_zero(void *unused) {
         if (set_cfg) set_cfg("etc");
         void *(*set_temp)(const char *) = kv_il_sym("il2cpp_set_temp_dir");
         if (set_temp) set_temp("/tmp");
-        if (il_init_void) { int r = il_init_void(); printf("[jobfix] main-thread il2cpp_init -> %d\n", r); fflush(stdout); }
+        if (il_init_void) { int r = il_init_void("IL2CPP Root Domain"); printf("[jobfix] main-thread il2cpp_init -> %d\n", r); fflush(stdout); }
     }
     for (int tries = 0; tries < 600; tries++) {
-        if (il_init_void) { int r = il_init_void(); if (r == 0) break; }
+        if (il_init_void) { int r = il_init_void("IL2CPP Root Domain"); if (r == 1) break; }
         else if (dom_get && dom_get()) break;
         struct timespec ts = {0,50000000}; nanosleep(&ts, 0);
     }
