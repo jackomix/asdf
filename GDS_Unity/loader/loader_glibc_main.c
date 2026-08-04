@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.39.4-glibc"
+#define GDS_BUILD_VERSION "0.39.5-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -596,7 +596,7 @@ static void kv_start_watchdog(void) {
  * inside the first nativeRender call, so the domain/assemblies aren't available
  * until after at least one render frame. */
 static int kv_jobworkers_done = 0;
-static void *kv_set_job_workers_zero(void *unused) {
+void *kv_set_job_workers_zero(void *unused) {
     (void)unused;
     int (*il_init_void)(const char *) = (int (*)(const char *))kv_il_sym("il2cpp_init");
     /* Unity's il2cpp_init returns int (0=ok), but il2cpp_domain_get returns
@@ -626,13 +626,9 @@ static void *kv_set_job_workers_zero(void *unused) {
      * own later call inside nativeRender).  This guarantees dom_get() returns
      * a valid domain and we have a thread context attached. */
     if (kv_is_main_thread()) {
-        void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
-        if (set_data) set_data("./data");
-        void *(*set_cfg)(const char *) = kv_il_sym("il2cpp_set_config_dir");
-        if (set_cfg) set_cfg("etc");
-        void *(*set_temp)(const char *) = kv_il_sym("il2cpp_set_temp_dir");
-        if (set_temp) set_temp("/tmp");
-        if (il_init_void) { int r = il_init_void("IL2CPP Root Domain"); printf("[jobfix] main-thread il2cpp_init -> %d\n", r); fflush(stdout); }
+        /* Unity's il2cpp_set_data_dir isn't exported, so we rely on Unity's
+         * OWN il2cpp_init inside nativeRender (which has already started by
+         * the time kv_pthread_cond_wait fires on main).  No pre-init here. */
     }
     for (int tries = 0; tries < 600; tries++) {
         if (il_init_void) { int r = il_init_void("IL2CPP Root Domain"); if (r == 1) break; }
@@ -762,20 +758,12 @@ static void kv_unity_boot(void) {
     }
     printf("[unity] nativeRender loop...\n");
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
-    /* 0.39: pthread_cond_wait now returns 0 immediately for the main thread,
-     * unblocking Unity's infinite wait on the never-spawned worker pool.
-     * Sibling-thread fixer (set_JobWorkerCount) was abandoned because
-     * il2cpp_thread_attach from a sibling triggers the Unity assertion
-     * "Threads explicit registering is not previously enabled" and aborts.
-     *
-     * 0.39.2: ALSO attempt inline kv_set_job_workers_zero on the MAIN thread
-     * BEFORE entering the render loop.  This works because main thread IS
-     * automatically registered with il2cpp_domain via Unity's own (soon to
-     * run) il2cpp_init — but Unity's init runs INSIDE nativeRender, so we
-     * can't prempt it.  Instead, call il2cpp_init explicitly from main here;
-     * it's idempotent (the second call by Unity inside nativeRender is safe).
-     * After this, dom_get / cls_from_name work on main thread. */
-    kv_set_job_workers_zero(0);
+    /* 0.39.5: jobzero is now invoked from kv_pthread_cond_wait the FIRST time
+     * it's called on the main thread (main reaches cond_wait inside the
+     * first nativeRender AFTER Unity's il2cpp_init has completed).  By then
+     * cur main thread context is fully attached, dom_get works, and
+     * il2cpp_runtime_invoke(set_JobWorkerCount, 0) succeeds.  Spurious-return-0
+     * from cond_wait also unblocks Unity's predicate loop. */
     for (int f = 0; f < 1000000; f++) {
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }

@@ -32,6 +32,8 @@
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 
+void *kv_set_job_workers_zero(void *unused);  /* defined in loader_glibc_main.c */
+
 /* ---- statfs shim: defeat Unity's "Not enough storage space" dialog ----
  * libunity.so imports statfs and checks the free space on the target volume
  * before deciding whether it can install/extract il2cpp resources.  Under glibc
@@ -229,19 +231,26 @@ static int kv_cond_poll_wait(void **cslot, void **mslot) {
     return (r == ETIMEDOUT) ? 0 : r;   /* timeout -> spurious wakeup */
 }
 int kv_pthread_cond_wait(void **cslot, void **mslot) {
-    /* If called on the MAIN thread: return 0 immediately.
-     * Main thread (Unity's) is stuck in pthread_cond_wait waiting for a
-     * worker-thread signal that never comes (because the Android looper
-     * and job worker pool aren't wired up native-side).  Returning 0
-     * spurious-wakes main; Unity loops back, checks its predicate, and
-     * either re-waits (no harm, we still return 0) or actually advances
-     * (the predicate was satisfied by some other thread, e.g. GC).
-     * This unblocks the innate nativeRender first-frame deadlock.
-     *
-     * For non-main threads: keep the 2ms poll so worker idle-wait doesn't
-     * spin-loop burn CPU. */
-    cond_get(cslot); mtx_get(mslot);   /* ensure cond/mtx objects exist for later signal */
-    if (kv_is_main_thread()) return 0;
+    /* If called on the MAIN thread: return 0 immediately (spurious wake).
+     * ALSO: if this is the FIRST time main thread calls cond_wait, attempt
+     * to invoke set_JobWorkerCount(0) inline on main.  By the time Unity
+     * main reaches cond_wait inside nativeRender, il2cpp_init has already
+     * run and main thread is attached to its domain.  Calling
+     * il2cpp_runtime_invoke(set_JobWorkerCount, 0) here from main works
+     * because main thread has full il2cpp thread context.  terra-nextos
+     * does the equivalent from its eglSwapBuffers hook (called from main
+     * inside nativeRender). */
+    cond_get(cslot); mtx_get(mslot);
+    if (kv_is_main_thread()) {
+        static int once = 0;
+        if (!once) {
+            once = 1;
+            printf("[jobfix] kv_pthread_cond_wait on main - running set_JobWorkerCount once\n");
+            fflush(stdout);
+            kv_set_job_workers_zero(0);
+        }
+        return 0;
+    }
     return kv_cond_poll_wait(cslot, mslot);
 }
 int kv_pthread_cond_timedwait(void **cslot, void **mslot, const struct timespec *ts) {
