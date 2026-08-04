@@ -424,7 +424,23 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.19.0-glibc) - FIXED: CallObjectMethod dropped all varargs
+## LATEST STATUS (build 0.20.0-glibc) - watchdog thread dump (native-block diagnosis)
+
+CRITICAL INSIGHT from 0.19.0's log: it is **byte-identical to 0.17/0.18** despite
+the varargs fix + runOnUiThread dispatch + dialog auto-fire all being real and in
+the binary.  And decisively: after `GetMethodID(setMessage)` there is **NO
+CallObjectMethod(setTitle)/setMessage and NO ALERTDIALOG line** - Unity resolves
+the dialog method IDs but NEVER CALLS them.  It is blocked in **native code below
+JNI** (a pthread/cond/futex wait) before the dialog build.  That is why every JNI
+shim leaves the log frozen at the same byte.
+
+0.20 adds a watchdog thread: 12s after the nativeRender loop starts it dumps each
+thread's /proc/self/task/<tid>/syscall + wchan, showing the EXACT syscall each
+thread is blocked in (futex/cond_wait/etc).  Next deploy will reveal the real
+block point (likely a worker-thread or job-system wait, per Terraria's documented
+GfxDeviceWorker/job-system deadlock) instead of guessing.
+
+### Prior: 0.19.0 - FIXED: CallObjectMethod dropped all varargs
 
 A second model's code review caught REAL, critical bugs we had all missed:
 

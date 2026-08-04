@@ -30,9 +30,20 @@ extern void *stdout;
 extern void *stderr;
 #define _IONBF 2
 
+/* Declarations for the watchdog (manual, no <dirent.h> due to the
+ * freestanding kv_libc.h decls).  pthread_create/pthread_detach/nanosleep/
+ * snprintf are already declared in kv_libc.h.  ABI-compatible with glibc. */
+typedef struct DIR DIR;
+struct dirent { long d_ino; unsigned char d_type; char d_name[256]; };
+extern DIR *opendir(const char *path);
+extern struct dirent *readdir(DIR *dirp);
+extern int closedir(DIR *dirp);
+typedef unsigned long kv_pthread_t;   /* matches kv_libc.h */
+struct timespec { long tv_sec; long tv_nsec; };
+
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.19.0-glibc"
+#define GDS_BUILD_VERSION "0.20.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -385,6 +396,49 @@ static void kv_il_run_entry(void) {
  * uninitialized globals. */
 void egl_shim_create_window(void);   /* egl_shim.c */
 int egl_shim_ensure_current(void);
+
+/* ---- watchdog: dump all threads' blocked syscall after a timeout ----
+ * The boot hangs inside the first nativeRender with NO further JNI calls and NO
+ * crash - Unity is blocked on a native wait (pthread/futex/cond) that no JNI
+ * shim reaches.  This thread wakes after N seconds and prints each thread's
+ * /proc/self/task/<tid>/syscall (the syscall + args, e.g. futex/cond_wait) and
+ * wchan, so we can see exactly where the process is stuck. */
+static void *kv_watchdog(void *arg) {
+    (void)arg;
+    struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
+    nanosleep(&ts, 0);
+    printf("[watchdog] === thread dump (blocked syscalls) ===\n");
+    /* enumerate /proc/self/task */
+    DIR *d = opendir("/proc/self/task");
+    if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char p[128], buf[512];
+        snprintf(p, sizeof p, "/proc/self/task/%s/syscall", de->d_name);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) { buf[n] = 0; printf("[watchdog] tid=%s syscall: %s", de->d_name, buf); }
+        }
+        snprintf(p, sizeof p, "/proc/self/task/%s/wchan", de->d_name);
+        fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) { buf[n] = 0; printf("[watchdog] tid=%s wchan: %s", de->d_name, buf); }
+        }
+    }
+    closedir(d);
+    printf("[watchdog] === end dump ===\n");
+    return 0;
+}
+static void kv_start_watchdog(void) {
+    kv_pthread_t t;
+    if (pthread_create(&t, 0, kv_watchdog, 0) == 0) pthread_detach(t);
+}
+
 static void kv_unity_boot(void) {
     void *env = kv_jni_env();
     /* Give Unity real, zeroed thiz/ctx/surf objects instead of tiny fake
@@ -431,6 +485,7 @@ static void kv_unity_boot(void) {
         ((void (*)(void *, void *, int))fn)(env, thizp, 1);
     }
     printf("[unity] nativeRender loop...\n");
+    kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
     for (int f = 0; f < 1000000; f++) {
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
