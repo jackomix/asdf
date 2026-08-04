@@ -324,13 +324,44 @@ int kv_pthread_rwlock_wrlock(void **slot) { return pthread_rwlock_wrlock(rwl_get
 int kv_pthread_rwlock_unlock(void **slot) { if (!*slot) return 0; return pthread_rwlock_unlock((pthread_rwlock_t *)*slot); }
 
 /* ================= pthread thread/key/once/attr (compat on arm64) ================= */
-int kv_pthread_detach(pthread_t t) { return pthread_detach(t); }
-int kv_pthread_join(pthread_t t, void **r) { return pthread_join(t, r); }
+int kv_pthread_detach(pthread_t t) {
+  if ((uintptr_t)t == 0xdeadbeef) return 0;
+  return pthread_detach(t);
+}
+int kv_pthread_join(pthread_t t, void **r) {
+  if ((uintptr_t)t == 0xdeadbeef) { if (r) *r = 0; return 0; }
+  return pthread_join(t, r);
+}
 pthread_t kv_pthread_self(void) { return pthread_self(); }
 int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), void *arg) {
   static int n; long tid = syscall(178);
   if (++n <= 300) printf("[kv_pthread_create] n=%d tid=%ld start=%p arg=%p\n", n, tid, (void*)start, (void*)arg);
-  (void)attr; return pthread_create(t, NULL, start, arg);
+  (void)attr;
+  /* 0.39.6: Unity's JobWorker start_routine lives inside libunity (under
+   * 0.39 log it was libunity+0x508174).  It crashes immediately in
+   * mono_class_get_checked because the new thread is NOT auto-attached to
+   * il2cpp (Unity expects pthread_create to register the thread; under our
+   * loader it doesn't).  Don't spawn it — return 0 (fake success) so Unity
+   * believes the worker is alive.  Spurious return 0 from kv_pthread_cond_wait
+   * then keeps main progressing instead of waiting for the dead worker. */
+  void *att = kv_il_sym("il2cpp_thread_attach");           /* libil2cpp */
+  void *unity_send = kv_il_sym("UnitySendMessage");         /* libunity */
+  uintptr_t lo_il = (uintptr_t)att;
+  uintptr_t hi_il = lo_il + 0x221f000;                      /* libil2cpp span */
+  uintptr_t lo_un = (uintptr_t)unity_send;
+  uintptr_t hi_un = lo_un + 0x103a000;                      /* libunity span */
+  uintptr_t s = (uintptr_t)start;
+  int il2 = (att && s >= lo_il && s < hi_il);
+  int un  = (unity_send && s >= lo_un && s < hi_un);
+  if (il2 || un) {
+    printf("[kv_pthread_create] detouring Unity-internal worker spawn (start=%p mod=%s offset=0x%lx)\n",
+           (void*)s, il2?"libil2cpp":"libunity",
+           (unsigned long)(s - (il2?lo_il:lo_un)));
+    fflush(stdout);
+    if (t) *t = (pthread_t)0xdeadbeef;
+    return 0;
+  }
+  return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }
 int kv_pthread_attr_destroy(void *a) { (void)a; return 0; }
@@ -352,7 +383,10 @@ void *kv_pthread_getspecific(unsigned k) { return pthread_getspecific((pthread_k
 int kv_pthread_setspecific(unsigned k, const void *v) { return pthread_setspecific((pthread_key_t)k, v); }
 int kv_pthread_once(int *o, void (*f)(void)) { return pthread_once((pthread_once_t *)o, f); }
 int kv_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
-int kv_pthread_kill(pthread_t t, int sig) { return pthread_kill(t, sig); }
+int kv_pthread_kill(pthread_t t, int sig) {
+  if ((uintptr_t)t == 0xdeadbeef) return 0;
+  return pthread_kill(t, sig);
+}
 int kv_pthread_atfork(void (*pre)(void), void (*parent)(void), void (*child)(void)) {
   (void)pre; (void)parent; (void)child; return 0;   /* no fork() in this game */
 }
