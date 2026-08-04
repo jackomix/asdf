@@ -424,7 +424,24 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.23.0-glibc) - job-system deadlock: force 1 CPU (jobs inline)
+## LATEST STATUS (build 0.24.0-glibc) - 1-CPU shim v2: + /proc/cpuinfo + /sys/cpu
+
+0.23's dump: main thread tid 9866 now shows `syscall: running` (SPINNING - my
+polling shim works), but the worker pool STILL exists (~10 threads, 9888-9892,
+9920-9924) futex-waiting with NULL timeout (infinite pthread_cond_wait NOT going
+through my poll shim - separate wait sites).  So Unity still sized a worker pool.
+
+The sched_getaffinity/sysconf 1-CPU shims compiled (verified in binary) but did
+NOT stop worker creation - Unity reads core count from /proc/cpuinfo or
+/sys/devices/system/cpu/ directly too.  Terraria intercepts ALL THREE.
+
+0.24 adds to fs_redirect.c's kv_open/kv_fopen: when Unity opens /proc/cpuinfo or
+/sys/devices/system/cpu/{present,possible,online}, return a synthetic file
+reporting 1 CPU.  Combined with the sched_getaffinity/sysconf shims, Unity should
+now see 1 core -> 0 job workers -> jobs run inline -> main thread stops spinning
+on a worker it can never wake.
+
+### Prior: 0.23.0 - job-system deadlock: force 1 CPU (jobs inline)
 
 0.22's thread dump PROVED the polling shim was working: main thread tid 8644 was
 in futex WAIT_BITSET(0x189, CLOCK_REALTIME) WITH a timeout pointer (0x7fe57ab968) -

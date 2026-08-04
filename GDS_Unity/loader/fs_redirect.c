@@ -115,13 +115,45 @@ static int kv_cmdline_fd(void) {
     return fd;
 }
 
+/* Synthetic /proc/cpuinfo that reports a SINGLE CPU.  Unity counts "processor:"
+ * lines to size its job-worker pool (num_cpus - 1).  The sched_getaffinity/sysconf
+ * shims (bionic_bridge.c) weren't enough - Unity also reads /proc/cpuinfo directly.
+ * Reporting 1 processor -> 0 job workers -> jobs run inline (Terraria's approach). */
+static int kv_cpuinfo_fd(void) {
+    static const char cpuinfo[] =
+        "processor\t: 0\n"
+        "model name\t: ARMv8\n"
+        "CPU implementer\t: 0x41\n"
+        "CPU architecture: 8\n"
+        "CPU variant\t: 0x0\n"
+        "CPU part\t: 0xd05\n"
+        "CPU revision\t: 1\n"
+        "\n";
+    FILE *t = tmpfile();
+    if (!t) return -1;
+    fwrite(cpuinfo, 1, sizeof(cpuinfo) - 1, t); fflush(t);
+    int fd = dup(fileno(t)); fclose(t); lseek(fd, 0, SEEK_SET);
+    printf("[fs] injected /proc/cpuinfo (1 CPU)\n");
+    return fd;
+}
+/* Synthetic /sys/devices/system/cpu/{present,possible,online} = "0" (1 CPU). */
+static int kv_sys_cpu_fd(void) {
+    FILE *t = tmpfile();
+    if (!t) return -1;
+    fwrite("0\n", 1, 2, t); fflush(t);
+    int fd = dup(fileno(t)); fclose(t); lseek(fd, 0, SEEK_SET);
+    printf("[fs] injected /sys/.../cpu (1 CPU)\n");
+    return fd;
+}
+
 /* ---- intercepted entry points ---- */
 int kv_open(const char *p, int flags, ...) {
     fs_load_real();
     if (!r_open) return -1;
-    if (p && strstr(p, "cmdline")) {
-        int fd = kv_cmdline_fd();
-        if (fd >= 0) return fd;
+    if (p) {
+        if (strstr(p, "cmdline")) { int fd = kv_cmdline_fd(); if (fd >= 0) return fd; }
+        if (strstr(p, "cpuinfo")) { int fd = kv_cpuinfo_fd(); if (fd >= 0) return fd; }
+        if (strstr(p, "/sys/devices/system/cpu/")) { int fd = kv_sys_cpu_fd(); if (fd >= 0) return fd; }
     }
     va_list ap; va_start(ap, flags);
     mode_t mode = va_arg(ap, mode_t);
@@ -145,9 +177,10 @@ int kv_open64(const char *p, int flags, ...) {
 FILE *kv_fopen(const char *p, const char *mode) {
     fs_load_real();
     if (!r_fopen) return NULL;
-    if (p && strstr(p, "cmdline")) {
-        int fd = kv_cmdline_fd();
-        if (fd >= 0) return fdopen(fd, "r");
+    if (p) {
+        if (strstr(p, "cmdline")) { int fd = kv_cmdline_fd(); if (fd >= 0) return fdopen(fd, "r"); }
+        if (strstr(p, "cpuinfo")) { int fd = kv_cpuinfo_fd(); if (fd >= 0) return fdopen(fd, "r"); }
+        if (strstr(p, "/sys/devices/system/cpu/")) { int fd = kv_sys_cpu_fd(); if (fd >= 0) return fdopen(fd, "r"); }
     }
     char buf[512];
     const char *r = fs_redirect(p, buf, sizeof buf);
