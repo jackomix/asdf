@@ -293,6 +293,7 @@ int kv_pthread_detach(pthread_t t) { return pthread_detach(t); }
 int kv_pthread_join(pthread_t t, void **r) { return pthread_join(t, r); }
 pthread_t kv_pthread_self(void) { return pthread_self(); }
 int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), void *arg) {
+  static int n; if (++n <= 30) printf("[kv_pthread_create] n=%d start=%p arg=%p\n", n, (void*)start, (void*)arg);
   (void)attr; return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }
