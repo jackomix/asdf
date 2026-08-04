@@ -105,6 +105,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
                 lib = p; off = addr - lo;
                 char *nl = strchr(p, '\n'); if (!nl) nl = p + strlen(p);
                 *nl = 0;
+                printf("[wd-resolve] hit lo=%lx hi=%lx path=%s off=%lx\n", lo, hi, p, off);
             }
         next_line:;
         }
