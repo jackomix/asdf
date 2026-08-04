@@ -72,8 +72,10 @@ static void maps_refresh(void) {
     g_maps_len = off;
 }
 static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
-    /* parse "lo-hi perm offset dev inode pathname" lines; find one containing addr */
+    /* parse "lo-hi perm offset dev inode pathname" lines; find one containing addr.
+     * Returns a NUL-terminated path (in g_maps) by overwriting the trailing '\n'. */
     const char *s = g_maps; const char *best = 0; unsigned long best_off = 0;
+    char *best_eol = 0;
     while (s < g_maps + g_maps_len) {
         const char *eol = strchr(s, '\n'); if (!eol) break;
         unsigned long lo = 0, hi = 0; const char *p = s;
@@ -97,10 +99,12 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
         if (addr >= lo && addr < hi) {
             best = (q < eol) ? q : "[anon?]";
             best_off = addr - lo;
+            best_eol = (char *)eol;
         }
     skip:;
         s = eol + 1;
     }
+    if (best_eol) *best_eol = 0;   /* NUL-terminate best path (overwrite '\n') */
     if (off_out) *off_out = best_off;
     return best;
 }
@@ -484,6 +488,7 @@ static void *kv_watchdog(void *arg) {
         nanosleep(&ts, 0);
         printf("[watchdog] === thread dump #%d (blocked syscalls + wchan + kstack) ===\n", dump);
     maps_refresh();   /* snapshot /proc/self/maps once per dump, for PC resolution */
+    printf("[watchdog] captured %d bytes of /proc/self/maps\n", g_maps_len);
     DIR *d = opendir("/proc/self/task");
     if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
     struct dirent *de;
