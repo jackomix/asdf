@@ -424,7 +424,30 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.21.0-glibc) - watchdog fixed (struct dirent layout was wrong)
+## LATEST STATUS (build 0.22.0-glibc) - ROOT CAUSE FOUND: job-system deadlock, fixed with polling
+
+0.21's working thread dump gave us the answer:
+- main thread tid 7330: state=S, syscall 98 = futex(0x2f346440, FUTEX_WAIT, ...)
+- worker pool tids 7338-7344, 7370-7375: all state=S, futex FUTEX_WAIT on distinct
+  addresses (0x2f2050d0..0x2f2114a8) - each worker blocked on its own cond var.
+- tid 7376 state=R (spinning), 7377-7379 futex-wait on stack addresses.
+
+This is the CLASSIC Unity job-system deadlock (Terraria documents this exact bug):
+the main thread + a pool of workers all futex-wait on condition variables that are
+never signaled, because on Android the Java Activity/looper that drives the job
+system doesn't exist under our loader.  Every thread sleeps forever -> black screen.
+
+Fix (0.22.0) in bionic_bridge.c: make pthread_cond_wait and sem_wait POLL instead
+of blocking forever - timed wait with a short slice (2ms main / 5ms worker), return
+as a spurious wakeup on timeout so the caller re-checks its predicate in its while()
+loop and makes progress.  This is Terraria's CUP_CONDPOLL approach.  pthread_cond_
+timedwait also capped to poll.
+
+Next on-device: the job system should advance (main thread wakes, re-checks, runs
+jobs inline) instead of sleeping forever.  Expect the log to proceed past the
+AlertDialog registration and reach real egl calls / frames.
+
+### Prior: 0.21.0 - watchdog fixed (struct dirent layout was wrong)
 
 0.20's watchdog fired but found ZERO threads - that was a BUG in the diagnostic,
 not a healthy sign: my struct dirent didn't match glibc's aarch64 layout (missing

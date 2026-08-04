@@ -28,6 +28,8 @@
 #include <sched.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
 
 /* ---- statfs shim: defeat Unity's "Not enough storage space" dialog ----
@@ -162,9 +164,39 @@ int kv_pthread_cond_init(void **slot, const void *attr) { (void)attr; *slot = NU
 int kv_pthread_cond_destroy(void **slot) { if (*slot) { pthread_cond_destroy((pthread_cond_t *)*slot); free(*slot); *slot = NULL; } return 0; }
 int kv_pthread_cond_signal(void **slot) { return pthread_cond_signal(cond_get(slot)); }
 int kv_pthread_cond_broadcast(void **slot) { return pthread_cond_broadcast(cond_get(slot)); }
-int kv_pthread_cond_wait(void **cslot, void **mslot) { return pthread_cond_wait(cond_get(cslot), mtx_get(mslot)); }
+/* POLLING (breaks the job-system deadlock): on this loader the workers + main
+ * thread all futex-wait on cond/sem that may never be signaled (the Android
+ * Java Activity / looper that drives them doesn't exist).  Instead of blocking
+ * forever, wait a short slice and return as a spurious wakeup, so the caller
+ * re-checks its predicate in its while() loop and can make progress.  This is
+ * Terraria's CUP_CONDPOLL approach.  The main thread (tid == getpid) polls
+ * shorter so it stays responsive; workers poll longer to avoid burning CPU. */
+#define KV_COND_POLL_MAIN_NS 2000000L    /* 2 ms for the main thread */
+#define KV_COND_POLL_WORK_NS 5000000L    /* 5 ms for worker threads */
+static int kv_is_main_thread(void) {
+    return (int)syscall(SYS_gettid) == (int)getpid();
+}
+static int kv_cond_poll_wait(void **cslot, void **mslot) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
+    ts.tv_nsec += ns;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    int r = pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), &ts);
+    return (r == ETIMEDOUT) ? 0 : r;   /* timeout -> spurious wakeup */
+}
+int kv_pthread_cond_wait(void **cslot, void **mslot) { return kv_cond_poll_wait(cslot, mslot); }
 int kv_pthread_cond_timedwait(void **cslot, void **mslot, const struct timespec *ts) {
-  return pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), ts);
+    /* honor the caller's absolute deadline, but cap it so we still poll */
+    struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+    long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
+    struct timespec cap = *ts;
+    long capns = (cap.tv_sec - now.tv_sec) * 1000000000L + (cap.tv_nsec - now.tv_nsec);
+    if (capns < 0 || capns > ns) capns = ns;
+    struct timespec use = now;
+    use.tv_nsec += capns;
+    if (use.tv_nsec >= 1000000000L) { use.tv_sec++; use.tv_nsec -= 1000000000L; }
+    return pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), &use);
 }
 
 static sem_t *sem_get(void **slot) {
@@ -181,7 +213,17 @@ int kv_sem_init(void **slot, int pshared, unsigned value) {
 }
 int kv_sem_destroy(void **slot) { if (*slot) { sem_destroy((sem_t *)*slot); free(*slot); *slot = NULL; } return 0; }
 int kv_sem_post(void **slot) { return sem_post(sem_get(slot)); }
-int kv_sem_wait(void **slot) { return sem_wait(sem_get(slot)); }
+/* Polling sem_wait: like cond_wait, cap the wait so a sem that is never posted
+ * (Android job/looper absent) wakes the caller to re-check.  */
+int kv_sem_wait(void **slot) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
+    ts.tv_nsec += ns;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    int r = sem_timedwait(sem_get(slot), &ts);
+    return (r == ETIMEDOUT) ? EAGAIN : r;   /* timeout -> treat as would-block */
+}
 int kv_sem_trywait(void **slot) { return sem_trywait(sem_get(slot)); }
 int kv_sem_getvalue(void **slot, int *v) { return sem_getvalue(sem_get(slot), v); }
 int kv_sem_timedwait(void **slot, const struct timespec *ts) { return sem_timedwait(sem_get(slot), ts); }
