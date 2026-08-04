@@ -281,6 +281,33 @@ int kv_pthread_mutexattr_init(void *a) { (void)a; return 0; }
 int kv_pthread_mutexattr_destroy(void *a) { (void)a; return 0; }
 int kv_pthread_mutexattr_settype(void *a, int t) { (void)a; (void)t; return 0; }
 
+/* ---- job-system inline fix: report a single CPU ----
+ * Unity sizes its job-worker pool as (num_cpus - 1).  On Android the workers are
+ * driven by a Java/looper that doesn't exist under our loader, so jobs dispatched
+ * to workers never run -> the main thread + workers all futex-wait forever (the
+ * deadlock in every thread dump).  If sched_getaffinity reports ONLY CPU 0, Unity
+ * creates 0 workers and runs jobs INLINE on the main thread -> no deadlock.  This
+ * is Terraria's TER_JOBWORKERS0 / my_sched_getaffinity fix. */
+int kv_sched_getaffinity(int pid, size_t setsize, void *mask) {
+    (void)pid;
+    if (mask && setsize >= sizeof(unsigned long)) {
+        memset(mask, 0, setsize);
+        *(unsigned long *)mask = 1UL;   /* only CPU 0 */
+        return 0;
+    }
+    return -1;
+}
+int kv_sched_setaffinity(int pid, size_t setsize, const void *mask) {
+    (void)pid; (void)setsize; (void)mask; return 0;   /* no-op: keep 1 CPU */
+}
+/* sysconf: report 1 CPU for the processor-count queries Unity uses to size
+ * workers (_SC_NPROCESSORS_ONLN=0x62, _SC_NPROCESSORS_CONF=0x61). */
+long kv_sysconf(int name) {
+    if (name == 0x62 || name == 0x61) return 1;   /* 1 CPU -> 0 job workers */
+    if (name == 0x27) return 4096;                 /* _SC_PAGESIZE */
+    return sysconf(name);
+}
+
 /* bionic-only symbol glibc lacks.  Called when bionic aborts; log it. */
 void android_set_abort_message(const char *m) {
   fprintf(stderr, "[abort] %s\n", m ? m : "");
@@ -322,6 +349,8 @@ void *kv_bionic_route(const char *name) {
     {"pthread_condattr_setclock", kv_pthread_condattr_setclock},
     {"pthread_mutexattr_init", kv_pthread_mutexattr_init}, {"pthread_mutexattr_destroy", kv_pthread_mutexattr_destroy},
     {"pthread_mutexattr_settype", kv_pthread_mutexattr_settype},
+    {"sched_getaffinity", kv_sched_getaffinity}, {"sched_setaffinity", kv_sched_setaffinity},
+    {"sysconf", kv_sysconf},
     {"statfs", kv_statfs}, {"statfs64", kv_statfs},
     {"android_set_abort_message", android_set_abort_message},
     {0, 0}

@@ -424,7 +424,28 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.22.0-glibc) - ROOT CAUSE FOUND: job-system deadlock, fixed with polling
+## LATEST STATUS (build 0.23.0-glibc) - job-system deadlock: force 1 CPU (jobs inline)
+
+0.22's thread dump PROVED the polling shim was working: main thread tid 8644 was
+in futex WAIT_BITSET(0x189, CLOCK_REALTIME) WITH a timeout pointer (0x7fe57ab968) -
+i.e. it IS in my polling pthread_cond_timedwait, waking every 2ms.  But it re-checks
+and finds its predicate still false, so it sleeps again.  Polling the waiters does
+NOT create the work that produces the result.
+
+Root cause (confirmed): the main thread waits for a JOB to complete; the job is
+dispatched to a worker pool, but the workers never run it (their Java/looper driver
+doesn't exist under our loader).  This is Terraria's documented job-system break.
+
+Fix (0.23.0): report a SINGLE CPU so Unity creates 0 job workers and runs jobs
+INLINE on the main thread.  Added to bionic_bridge.c:
+- sched_getaffinity -> mask with only CPU 0 (1 core)
+- sched_setaffinity -> no-op
+- sysconf(_SC_NPROCESSORS_ONLN=0x62/_SC_NPROCESSORS_CONF=0x61) -> 1
+Terraria's TER_JOBWORKERS0 / my_sched_getaffinity approach.  libunity imports
+sched_getaffinity/sysconf (verified via nm).  Jobs should now run inline -> main
+thread stops futex-waiting on a worker it can never wake -> boot proceeds.
+
+### Prior: 0.22.0 - ROOT CAUSE FOUND: job-system deadlock, fixed with polling
 
 0.21's working thread dump gave us the answer:
 - main thread tid 7330: state=S, syscall 98 = futex(0x2f346440, FUTEX_WAIT, ...)
