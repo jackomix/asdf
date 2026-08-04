@@ -49,7 +49,7 @@ struct timespec { long tv_sec; long tv_nsec; };
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.32.0-glibc"
+#define GDS_BUILD_VERSION "0.33.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -578,13 +578,16 @@ static void kv_unity_boot(void) {
     printf("[unity] nativeRender loop...\n");
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
     for (int f = 0; f < 1000000; f++) {
-        /* Try to set job workers to 0 on the first few frames (IL2CPP
-         * initializes lazily inside nativeRender, so domain/assemblies
-         * may not exist until after the first frame completes). */
-        if (!kv_jobworkers_done && f < 30) kv_set_job_workers_zero();
-
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
+        /* Set job workers to 0 AFTER the first render completes — il2cpp_init
+         * runs inside the first nativeRender call, so calling il2cpp_class_from_name
+         * before that crashes (NULL MonoClass deref in mono_class_get_checked, see
+         * log 0.32: pc=0x200cfccd4 FAR=0x135).  Reference ports (terraria-nextos)
+         * do the equivalent from an eglSwapBuffers hook, i.e. after render+swap.
+         * Bump the delay a bit past the first frame to give the domain time to
+         * settle (assemblies list may be empty on frame 0). */
+        if (!kv_jobworkers_done && f >= 30 && f < 240) kv_set_job_workers_zero();
         /* Periodic liveness: confirms nativeRender is actually looping (and not
          * stuck inside one call).  Also tells us how fast frames are being
          * produced relative to real time. */

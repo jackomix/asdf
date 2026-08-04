@@ -466,7 +466,54 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.32.0-glibc) - real PC via ucontext struct access
+## LATEST STATUS (build 0.33.0-glibc) - jobfix crash root cause
+
+0.32 deployed the `ucontext_t` struct-access crash handler. **It worked perfectly**:
+
+```
+[loader] === CRASH sig=11 ===
+[loader]   FAR=0x135
+[loader]   pc=0x200cfccd4 sp=0x7ff0028f70 fp(x29)=0x7ff0029080 lr(x30)=0x200d11c24
+ x0 =0x0 ...
+[loader]   pc in [0x200000000..0x20221f000)   (pc-offset=0xcfccd4)
+[loader] backtrace (x29 chain):
+[loader]   #0 lr=0x101ac64 (fp=0x7ff0029080)
+[loader]   #1 lr=0x1019fe0 (fp=0x7ff00290d0)
+[loader]   #2 lr=0x1019af8 (fp=0x7ff0029190)
+[loader]   #3 lr=0x7f806e225c (fp=0x7ff00291b0)
+```
+
+Decoding with `aarch64-elf-objdump -d` on libil2cpp.so + loader2 (installed via brew):
+
+- `pc=0xcfccd4` → libil2cpp: `ldrb w8, [x0, #309]` where `x0 = x19 = 0`. Crash = NULL `MonoClass*` + offset `0x135` (309 = field flag byte). Label is `mono_class_get_checked+0x17b3c`.
+- `lr=0xd11c24` → caller `mono_class_get_checked+0x2c9a0` (small wrapper at `0xd11c14` calls the buggy fn). At `0xd11b4c` there's an explicit `mov x19, xzr` when `tbnz` bit 4 not set — that NULL x19 then propagates into `[x19+309]`.
+- `lr=0x101ac64` → loader2 `kv_unity_boot` line 584 — immediately AFTER `bl kv_set_job_workers_zero` at `0x101ac60`. Backtrace:
+  - `#0 lr=0x101ac64` = `kv_unity_boot` (return from `kv_set_job_workers_zero`)
+  - `#1 lr=0x1019fe0` = `real_main` line 754
+  - `#2 lr=0x1019af8` = `main` line 661
+  - `#3 lr=0x7f806e225c` = libc `_start`
+
+**Root cause**: We call `kv_set_job_workers_zero()` BEFORE the first `render()` call (frame `f=0` in the player loop).  But `il2cpp_init` runs inside the FIRST `nativeRender` call — so calling `il2cpp_class_from_name("Unity.Jobs.LowLevel.Unsafe", "JobsUtility")` pre-init triggers `mono_class_get_checked` on a domain with no assemblies loaded yet → returns NULL → propagates through the wrapper's `mov x19, xzr` → next op `[x19+309]` faults.
+
+`global-metadata.dat` IS present (`data/Managed/Metadata/global-metadata.dat`, verified) — metadata isn't missing; we're just probing IL2CPP domain state too early.
+
+### Reference port confirmation
+
+`/Users/jacko/Documents/astro/ref/terraria-nextos/src/main.c:2853`: ref ports call their equivalent `ter_jobworkers0()` from `ter_before_present()` — a hook on `eglSwapBuffers`, fired AFTER the first render+swap completes (IL2CPP runtime fully init'd). NOT pre-render.
+
+### Fix in 0.33 (`loader/loader_glibc_main.c`)
+
+Moved the `kv_set_job_workers_zero()` call to AFTER `render(env, thizp)` inside the player loop, gated to `f >= 30 && f < 240` (mirrors ref's 240-frame retry window + lets a few first frames settle). Same `kv_jobworkers_done` state guard.
+
+### Toolchain note
+
+Installed `aarch64-elf-binutils` (brew) for `objdump -d/-T`, `addr2line`, `nm`. libil2cpp.so is stripped but `objdump -T` gives dynamic symbol labels (the `mono_class_get_checked@@Base+0x17b3c` style offsets). loader2 has debug_info, so `addr2line` resolves source lines directly.
+
+### Next
+
+Deploy 0.33, read `loader.log`. Expect either:
+- Successful render loop (frames printing) → `kv_set_job_workers_zero` succeeds around frame 30+ → `[jobfix] set_JobWorkerCount(0) invoked (exc=...)`.
+- A NEW crash with real PC + backtrace deeper in Unity's first-frame pipeline (no longer the pre-render probing bug).
 
 0.31 deployed the `sigaction`/`sigaltstack` filter.  **First time ever, the crash handler fired**:
 
