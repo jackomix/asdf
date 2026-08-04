@@ -33,6 +33,7 @@
 #include <sys/vfs.h>
 
 void *kv_set_job_workers_zero(void *unused);  /* defined in loader_glibc_main.c */
+void *kv_il_sym(const char *name);              /* ditto */
 
 /* ---- statfs shim: defeat Unity's "Not enough storage space" dialog ----
  * libunity.so imports statfs and checks the free space on the target volume
@@ -232,22 +233,28 @@ static int kv_cond_poll_wait(void **cslot, void **mslot) {
 }
 int kv_pthread_cond_wait(void **cslot, void **mslot) {
     /* If called on the MAIN thread: return 0 immediately (spurious wake).
-     * ALSO: if this is the FIRST time main thread calls cond_wait, attempt
-     * to invoke set_JobWorkerCount(0) inline on main.  By the time Unity
-     * main reaches cond_wait inside nativeRender, il2cpp_init has already
-     * run and main thread is attached to its domain.  Calling
+     * ALSO: opportunistically invoke set_JobWorkerCount(0) on the FIRST main
+     * call where Unity's il2cpp domain is already set up.  By the time Unity
+     * main reaches cond_wait inside nativeRender, Unity's own il2cpp_init has
+     * at least created the root domain (dom_get() != NULL).  Calling
      * il2cpp_runtime_invoke(set_JobWorkerCount, 0) here from main works
-     * because main thread has full il2cpp thread context.  terra-nextos
-     * does the equivalent from its eglSwapBuffers hook (called from main
-     * inside nativeRender). */
+     * because main thread has full il2cpp thread context.
+     *
+     * terra-nextos does the equivalent from its eglSwapBuffers hook.
+     * We do it inline here because eglSwapBuffers never returns for us. */
     cond_get(cslot); mtx_get(mslot);
     if (kv_is_main_thread()) {
-        static int once = 0;
-        if (!once) {
-            once = 1;
-            printf("[jobfix] kv_pthread_cond_wait on main - running set_JobWorkerCount once\n");
-            fflush(stdout);
-            kv_set_job_workers_zero(0);
+        static int jobfix_tried = 0;
+        if (!jobfix_tried) {
+            void *(*dom_get)(void) = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
+            if (dom_get && dom_get()) {
+                jobfix_tried = 1;
+                printf("[jobfix] main cond_wait + dom_get OK - running set_JobWorkerCount once\n");
+                fflush(stdout);
+                kv_set_job_workers_zero(0);
+            }
+            /* if dom_get returns NULL: leave jobfix_tried=0, retry on next cond_wait;
+             * Unity continues its own init past us because we return 0 immediately. */
         }
         return 0;
     }

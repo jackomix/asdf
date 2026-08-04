@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.39.5-glibc"
+#define GDS_BUILD_VERSION "0.39.6-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -400,7 +400,7 @@ typedef int   (*kv_fc)(const char *);
 typedef void *(*kv_fc2)(const char *, const char *);
 typedef void *(*kv_fv2)(void *, void *);
 
-static void *kv_il_sym(const char *name) {
+void *kv_il_sym(const char *name) {
     void *p = loader_lookup_export(name);
     if (!p) printf("[il2cpp] missing export %s\n", name);
     return p;
@@ -630,10 +630,18 @@ void *kv_set_job_workers_zero(void *unused) {
          * OWN il2cpp_init inside nativeRender (which has already started by
          * the time kv_pthread_cond_wait fires on main).  No pre-init here. */
     }
+    /* Stage A: Wait for il2cpp domain to exist (Unity's own il2cpp_init runs
+     * inside nativeRender, in parallel with this polling spin).  Do NOT call
+     * il2cpp_init ourselves—rerunning it mid-Unity-init causes deadlock /
+     * corruption. Just wait for dom_get() to return non-NULL. */
+    printf("[jobfix] waiting for Unity's il2cpp_init (dom_get)...\n");
     for (int tries = 0; tries < 600; tries++) {
-        if (il_init_void) { int r = il_init_void("IL2CPP Root Domain"); if (r == 1) break; }
-        else if (dom_get && dom_get()) break;
+        if (dom_get && dom_get()) break;
         struct timespec ts = {0,50000000}; nanosleep(&ts, 0);
+    }
+    if (!dom_get || !dom_get()) {
+        printf("[jobfix] no domain after 30s — giving up\n");
+        return 0;
     }
     printf("[jobfix] il2cpp_init done, scanning assemblies for JobsUtility\n");
     fflush(stdout);
