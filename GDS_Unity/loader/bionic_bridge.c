@@ -307,6 +307,8 @@ static long kv_syscall(long n, long a1, long a2, long a3, long a4, long a5, long
     if (n == SYS_futex) {
         int op = (int)a2 & 0x7f;
         if (op == 0 /*FUTEX_WAIT*/ || op == 9 /*FUTEX_WAIT_BITSET*/) {
+            long tid = syscall(178 /*SYS_gettid*/);
+            printf("[kv_syscall] SYS_futex tid=%ld op=%d a4=%p\n", tid, op, (void*)a4);
             /* FUTEX_WAIT: (uaddr, op, val, timeout). FUTEX_WAIT_BITSET: (uaddr,
              * op, val, timeout, bitset).  a4 = timeout (0 = infinite). */
             long t4 = a4;

@@ -162,17 +162,26 @@ void *loader_lookup_export(const char *wanted) {
     return 0;
 }
 
-void *kv_egl_route(const char *name);   /* egl_shim.c: surface symbols -> shim */
-void *kv_bionic_route(const char *name); /* bionic_bridge.c: bionic pthread/signal ABI */
-void *kv_fs_route(const char *name);     /* fs_redirect.c: open/fopen/stat -> data dir */
+void *kv_egl_route(const char *name);
+void *kv_bionic_route(const char *name);
+void *kv_fs_route(const char *name);
+
+void *kv_dlsym(void *handle, const char *name) {
+    if (name) {
+        if (strcmp(name, "dlsym") == 0) return (void *)kv_dlsym;
+        void *r = kv_egl_route(name);
+        if (r) return r;
+        r = kv_bionic_route(name);
+        if (r) return r;
+        r = kv_fs_route(name);
+        if (r) return r;
+    }
+    return dlsym(handle, name);
+}
+
 static void *resolve(const char *sym) {
     if (sym) {
-        /* EGL/ANativeWindow/sensor surface (egl_shim.c), the bionic pthread/
-         * signal ABI bridge (bionic_bridge.c), and the fs-redirect shim
-         * (fs_redirect.c) must bind to our shims, NOT to glibc: glibc has no
-         * EGL, glibc's sigset_t (128 bytes) doesn't match bionic's (8 bytes),
-         * and Unity's open/fopen/stat use Android paths (assets/bin/Data/...)
-         * that only exist under our local data/ dir. */
+        if (strcmp(sym, "dlsym") == 0) return (void *)kv_dlsym;
         void *r = kv_egl_route(sym);
         if (r) return r;
         r = kv_bionic_route(sym);
