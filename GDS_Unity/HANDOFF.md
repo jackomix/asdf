@@ -466,7 +466,16 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.26.0-glibc) - syscall shim: raw futex poll + sched_getaffinity
+## LATEST STATUS (build 0.27.0-glibc) - dlsym interception
+
+0.26.0's fix (intercepting `syscall`) successfully reached the main thread, but the job worker pool STILL blocked on `syscall(SYS_futex)` with a NULL timeout! The watchdog thread dump revealed that all blocked worker threads shared the exact same PC (`0x7f8616ef6c`) as the main thread. This meant they were calling the raw GLIBC `pthread_cond_wait` directly, executing its internal `svc 0` instruction.
+
+Why did they bypass our `kv_pthread_cond_wait` and `kv_syscall` shims? Unity's C++ Engine core (main thread) resolves functions via the ELF PLT, which we intercepted correctly. However, Unity's IL2CPP Job System resolves platform primitives dynamically at runtime using `dlsym(handle, "pthread_cond_wait")` or `dlsym(handle, "syscall")`. 
+Because we were not intercepting `dlsym` in `loader_glibc_main.c`, IL2CPP received pointers to the real, unshimmed GLIBC functions and used them directly.
+
+Fix (0.27.0): Added `kv_dlsym` to `loader_glibc_main.c`. `dlsym` calls are now intercepted, and `kv_dlsym` feeds the requested symbol back through our `kv_bionic_route` and `kv_egl_route` tables before falling back to glibc's `dlsym`. Now, when IL2CPP requests `"pthread_cond_wait"` or `"syscall"`, it receives our shimmed polling functions.
+
+### Prior: 0.26.0 - syscall shim: raw futex poll + sched_getaffinity
 
 0.25's dump: workers STILL futex-wait with NULL timeout (0x0); the opendir shim
 NEVER fired (so Unity doesn't count cores that way).  Studying horizonchase-nextos
