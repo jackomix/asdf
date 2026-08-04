@@ -341,6 +341,16 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
         strcmp(nm, "getCanonicalPath") == 0) {
         return kv_make_jstring(".");
     }
+    /* Return real strings instead of a fake object pointer (0x6000) for
+     * string-returning methods, so GetStringUTFChars/GetStringUTFLength return
+     * sane values instead of dereferencing 0x6000 as a JNI string handle. */
+    if (strcmp(nm, "getPackageName") == 0) return kv_make_jstring("net.kairosoft.android.gamedev3en");
+    if (strcmp(nm, "getPackageCodePath") == 0) return kv_make_jstring(".");
+    /* findLibrary(name) -> path to a native lib.  Our libs are already loaded
+     * natively by the loader; return the data dir so Unity's string handling
+     * gets a valid handle (and any load of a missing subpath fails gracefully
+     * rather than crashing on a raw pointer). */
+    if (strcmp(nm, "findLibrary") == 0) return kv_make_jstring(".");
     if (strcmp(nm, "toString") == 0) return kv_make_jstring("");
     if (strcmp(nm, "getName") == 0 || strcmp(nm, "getCanonicalName") == 0 ||
         strcmp(nm, "getTypeName") == 0) return kv_make_jstring("java.lang.Object");
@@ -378,6 +388,15 @@ static jboolean kv_CallBool(JNIEnv env, jobject o, jmethodID m, ...) {
     if (strcmp(nm, "hasNext") == 0) return 0;        /* Scanner: no more tokens */
     if (strcmp(nm, "isFinishing") == 0) return 0;
     if (strcmp(nm, "isDestroyed") == 0) return 0;
+    /* KEY: Play Asset Delivery.  playCoreApiMissing() returning FALSE (the
+     * default 0) tells Unity the Play Core API is PRESENT, so it takes the
+     * Play Asset Delivery path: init() PlayAssetDeliveryUnityWrapper, query
+     * getAssetPackState/getObbDirs, and when no real Play Core answers it
+     * falls through to an AlertDialog and blocks forever on a button we never
+     * fire.  Returning TRUE ("Play Core is missing") makes Unity use the
+     * filesystem fallback, where our already-extracted data/ lives.  This is
+     * the highest-confidence fix for the boot-time AlertDialog. */
+    if (strcmp(nm, "playCoreApiMissing") == 0) return 1;
     return 0;
 }
 static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) {

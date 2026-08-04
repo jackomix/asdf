@@ -424,7 +424,31 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.16.0-glibc) - trace the dialog flow
+## LATEST STATUS (build 0.17.0-glibc) - Play Asset Delivery bypass (playCoreApiMissing=true)
+
+0.16's JNI trace confirmed the trigger sequence:
+`GetMethodID(playCoreApiMissing, ()Z)` then `findLibrary` CallObjectMethod, then
+immediately `FindClass(android/content/DialogInterface$OnClickListener)` +
+`AlertDialog$Builder` -> setTitle/setMessage -> hang.
+
+Diagnosis (from a second model, high confidence): `playCoreApiMissing()` returning
+FALSE (the shim's default) tells Unity the Play Core API is PRESENT, so Unity takes
+the **Play Asset Delivery** path (init PlayAssetDeliveryUnityWrapper, query
+getAssetPackState/getObbDirs).  With no real Play Core behind it, Unity falls
+through to an AlertDialog and blocks forever on a button the shim never fires.
+
+Fix (0.17.0) in jni_shim.c:
+- kv_CallBool: `playCoreApiMissing -> return 1` (Play Core is MISSING) so Unity
+  uses the filesystem fallback, where our already-extracted data/ lives.
+- kv_CallObjectMethodV: return real jstrings for getPackageName
+  (net.kairosoft.android.gamedev3en), getPackageCodePath ("."), findLibrary (".")
+  instead of the raw 0x6000 fake-object pointer (which GetStringUTFChars would
+  treat as a string handle and dereference badly).
+
+Next on-device: with Play Core reported missing, Unity should skip the PAD dialog
+and proceed to the render loop (real egl calls + frames).
+
+### Prior: 0.16.0 - trace the dialog flow
 
 0.13/0.14/0.15 (statfs, fs-redirect, cmdline-inject) each left the log byte-identical:
 Unity builds an AlertDialog inside the first nativeRender and never reaches GL (zero
