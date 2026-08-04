@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.37.0-glibc"
+#define GDS_BUILD_VERSION "0.38.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -595,8 +595,8 @@ static void kv_start_watchdog(void) {
  * inside the first nativeRender call, so the domain/assemblies aren't available
  * until after at least one render frame. */
 static int kv_jobworkers_done = 0;
-static void kv_set_job_workers_zero(void) {
-    if (kv_jobworkers_done) return;
+static void *kv_set_job_workers_zero(void *unused) {
+    (void)unused;
     void *(*dom_get)(void) = kv_il_sym("il2cpp_domain_get");
     void *(*dom_asms)(void *, size_t *) = kv_il_sym("il2cpp_domain_get_assemblies");
     void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
@@ -605,42 +605,52 @@ static void kv_set_job_workers_zero(void) {
     void *(*rt_invoke)(void *, void *, void **, void **) = kv_il_sym("il2cpp_runtime_invoke");
     if (!dom_get || !dom_asms || !asm_img || !cls_from_name || !cls_method || !rt_invoke) {
         printf("[jobfix] IL2CPP symbols unavailable, skipping\n");
-        kv_jobworkers_done = 1;
-        return;
+        return 0;
     }
-    void *domain = dom_get();
-    if (!domain) return;  /* domain not ready yet — retry next frame */
-    size_t na = 0;
-    void **asms = (void **)dom_asms(domain, &na);
-    if (!asms || !na) return;  /* assemblies not loaded yet */
-    for (size_t i = 0; i < na; i++) {
-        void *img = asm_img(asms[i]);
-        if (!img) continue;
-        void *cls = cls_from_name(img, "Unity.Jobs.LowLevel.Unsafe", "JobsUtility");
-        if (!cls) continue;
-        int zero = 0;
-        void *params[1] = { &zero };
-        void *exc = NULL;
-        const char *setters[] = {
-            "set_JobWorkerCount",
-            "SetJobQueueMaximumActiveThreadCount",
-            "SetJobQueueMaximumWarpThreadCount"
-        };
-        int any = 0;
-        for (unsigned s = 0; s < sizeof(setters)/sizeof(setters[0]); s++) {
-            void *m = cls_method(cls, setters[s], 1);
-            if (!m) continue;
-            exc = NULL;
-            rt_invoke(m, NULL, params, &exc);
-            printf("[jobfix] %s(0) invoked (exc=%p)\n", setters[s], exc);
-            any = 1;
+    /* Poll for up to ~30s waiting for il2cpp_init to complete.  The domain is
+     * NULL until the first call to il2cpp_init (which runs inside the first
+     * nativeRender).  After init, the Unity.Jobs.LowLevel.Unsafe assembly is
+     * loaded and JobsUtility is found.  We must call set_JobWorkerCount AFTER
+     * init because earlier (during pre-init) il2cpp_class_from_name returns
+     * NULL and the resulting mono_class_get_checked deref crashes (see 0.32). */
+    for (int tries = 0; tries < 600 && !kv_jobworkers_done; tries++) {
+        void *domain = dom_get();
+        if (!domain) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
+        size_t na = 0;
+        void **asms = (void **)dom_asms(domain, &na);
+        if (!asms || !na) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
+        for (size_t i = 0; i < na; i++) {
+            void *img = asm_img(asms[i]);
+            if (!img) continue;
+            void *cls = cls_from_name(img, "Unity.Jobs.LowLevel.Unsafe", "JobsUtility");
+            if (!cls) continue;
+            int zero = 0;
+            void *params[1] = { &zero };
+            void *exc = NULL;
+            const char *setters[] = {
+                "set_JobWorkerCount",
+                "SetJobQueueMaximumActiveThreadCount",
+                "SetJobQueueMaximumWarpThreadCount"
+            };
+            int any = 0;
+            for (unsigned s = 0; s < sizeof(setters)/sizeof(setters[0]); s++) {
+                void *m = cls_method(cls, setters[s], 1);
+                if (!m) continue;
+                exc = NULL;
+                rt_invoke(m, NULL, params, &exc);
+                printf("[jobfix] %s(0) invoked (exc=%p)\n", setters[s], exc);
+                any = 1;
+            }
+            if (any) {
+                printf("[jobfix] job workers set to 0 — jobs will run inline\n");
+                kv_jobworkers_done = 1;
+                return 0;
+            }
         }
-        if (any) {
-            printf("[jobfix] job workers set to 0 — jobs will run inline\n");
-            kv_jobworkers_done = 1;
-            return;
-        }
+        struct timespec ts = {0,50000000}; nanosleep(&ts,0);
     }
+    if (!kv_jobworkers_done) printf("[jobfix] gave up after 600 polls (il2cpp never ready)\n");
+    return 0;
 }
 
 static void kv_unity_boot(void) {
@@ -698,17 +708,26 @@ static void kv_unity_boot(void) {
     }
     printf("[unity] nativeRender loop...\n");
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
+    /* Spawn a "fixer" thread that polls il2cpp until the domain/assemblies are
+     * ready, then invokes JobsUtility.set_JobWorkerCount(0) etc from a SEPARATE
+     * thread.  The main thread deadlocks inside the FIRST nativeRender (it
+     * spawns Unity's worker pool which never gets woken because the Android
+     * looper isn't running); we run the il2cpp_runtime_invoke from a sibling
+     * thread that doesn't touch the render path.  This is the same approach as
+     * terraria-nextos' ter_jobworkers0(), just called from a fixer thread
+     * instead of an eglSwapBuffers hook (because eglSwapBuffers never returns
+     * for us). */
+    {
+        kv_pthread_t fixer;
+        if (pthread_create(&fixer, 0, (void *(*)(void *))kv_set_job_workers_zero, 0) == 0)
+            pthread_detach(fixer);
+        else printf("[jobfix] could not spawn fixer thread\n");
+    }
     for (int f = 0; f < 1000000; f++) {
         unsigned char keep = render(env, thizp);
         if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
-        /* Set job workers to 0 AFTER the first render completes — il2cpp_init
-         * runs inside the first nativeRender call, so calling il2cpp_class_from_name
-         * before that crashes (NULL MonoClass deref in mono_class_get_checked, see
-         * log 0.32: pc=0x200cfccd4 FAR=0x135).  Reference ports (terraria-nextos)
-         * do the equivalent from an eglSwapBuffers hook, i.e. after render+swap.
-         * Bump the delay a bit past the first frame to give the domain time to
-         * settle (assemblies list may be empty on frame 0). */
-        if (!kv_jobworkers_done && f >= 30 && f < 240) kv_set_job_workers_zero();
+        /* job fix is handled by the fixer thread spawned before the loop */
+
         /* Periodic liveness: confirms nativeRender is actually looping (and not
          * stuck inside one call).  Also tells us how fast frames are being
          * produced relative to real time. */
