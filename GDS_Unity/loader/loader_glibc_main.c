@@ -56,57 +56,66 @@ struct timespec { long tv_sec; long tv_nsec; };
  * So we have the PC.  To turn it into a (file, offset) we just need the
  * current /proc/self/maps snapshot; we read it ONCE per dump and resolve
  * each thread's PC against it. */
-static char g_maps[256 * 1024];
-static int  g_maps_len;
-static void maps_refresh(void) {
+/* Stream /proc/self/maps line-by-line on demand.  Previous static buffer
+ * approach truncated at 64KB/256KB and missed the libc.so.6 r-xp segment
+ * at the top of the file (printed rw-p/r--p tail only), so the resolved
+ * offset fell in the wrong segment.  See also maps_resolve(). below. */
+
+static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
+    /* Stream /proc/self/maps line-by-line.  Avoids buffer truncation, gives
+     * us full coverage of all mapped segments including the libc.so.6 r-xp
+     * section at the top of the file (which the static 64/256KB snapshot was
+     * eating).  Path stored in static per-call line buffer, NUL-terminated,
+     * returned to caller. */
+    static char line[512];
     int fd = open("/proc/self/maps", O_RDONLY);
-    if (fd < 0) { g_maps_len = 0; return; }
-    int off = 0;
-    while (off < (int)sizeof g_maps - 1) {
-        ssize_t n = read(fd, g_maps + off, sizeof g_maps - 1 - off);
+    if (fd < 0) return 0;
+    char buf[1024];
+    const char *lib = 0; unsigned long off = 0;
+    /* read whole file in chunks; for each line parse lo-hi/pathname and track
+     * the last line containing addr. */
+    int total = 0;
+    while (1) {
+        ssize_t n = read(fd, buf, sizeof buf);
         if (n <= 0) break;
-        off += (int)n;
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c == '\n' || total >= (int)sizeof line - 1) {
+                line[total] = 0;
+                total = 0;
+                /* parse "lo-hi perm offset dev inode pathname" */
+                const char *p = line; unsigned long lo = 0, hi = 0;
+                for (int phase = 0; phase < 2; phase++) {
+                    unsigned long v = 0;
+                    while (*p && *p != '-' && *p != ' ') {
+                        int cc = *p++;
+                        if (cc >= '0' && cc <= '9') v = (v<<4) | (cc-'0');
+                        else if (cc >= 'a' && cc <= 'f') v = (v<<4) | (cc-'a'+10);
+                        else if (cc >= 'A' && cc <= 'F') v = (v<<4) | (cc-'A'+10);
+                        else goto next_line;
+                    }
+                    p++;
+                    if (phase == 0) lo = v; else hi = v;
+                }
+                const char *q = p; int sp = 0;
+                for (; *q && *q != '\n'; q++) {
+                    if (*q == ' ') { if (++sp == 5) break; else if (sp > 1 && *(q+1) == ' ') continue; }
+                }
+                while (*q == ' ') q++;
+                if (addr >= lo && addr < hi) {
+                    lib = (*q) ? q : "[anon?]";
+                    off = addr - lo;
+                    if (*q) *(char *)(strchr(q, '\n') ? strchr(q, '\n') : q+strlen(q)) = 0;
+                }
+            next_line:;
+            } else {
+                line[total++] = c;
+            }
+        }
     }
     close(fd);
-    g_maps[off] = 0;
-    g_maps_len = off;
-}
-static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
-    /* parse "lo-hi perm offset dev inode pathname" lines; find one containing addr.
-     * Returns a NUL-terminated path (in g_maps) by overwriting the trailing '\n'. */
-    const char *s = g_maps; const char *best = 0; unsigned long best_off = 0;
-    char *best_eol = 0;
-    while (s < g_maps + g_maps_len) {
-        const char *eol = strchr(s, '\n'); if (!eol) break;
-        unsigned long lo = 0, hi = 0; const char *p = s;
-        for (int phase = 0; phase < 2; phase++) {
-            unsigned long v = 0;
-            while (*p && *p != '-' && *p != ' ') {
-                int c = *p++;
-                if (c >= '0' && c <= '9') v = (v<<4) | (c-'0');
-                else if (c >= 'a' && c <= 'f') v = (v<<4) | (c-'a'+10);
-                else if (c >= 'A' && c <= 'F') v = (v<<4) | (c-'A'+10);
-                else goto skip;
-            }
-            p++;
-            if (phase == 0) lo = v; else hi = v;
-        }
-        /* skip 3 fields (perm, offset, dev), find pathname (starts after the
-         * 5th space).  Crude: walk and count spaces. */
-        const char *q = p; int sp = 0;
-        for (; q < eol; q++) { if (*q == ' ') { if (++sp == 5) break; else if (sp > 1 && *(q+1) == ' ') continue; } }
-        while (q < eol && *q == ' ') q++;
-        if (addr >= lo && addr < hi) {
-            best = (q < eol) ? q : "[anon?]";
-            best_off = addr - lo;
-            best_eol = (char *)eol;
-        }
-    skip:;
-        s = eol + 1;
-    }
-    if (best_eol) *best_eol = 0;   /* NUL-terminate best path (overwrite '\n') */
-    if (off_out) *off_out = best_off;
-    return best;
+    if (off_out) *off_out = off;
+    return lib;
 }
 
 
@@ -487,8 +496,6 @@ static void *kv_watchdog(void *arg) {
         struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
         nanosleep(&ts, 0);
         printf("[watchdog] === thread dump #%d (blocked syscalls + wchan + kstack) ===\n", dump);
-    maps_refresh();   /* snapshot /proc/self/maps once per dump, for PC resolution */
-    printf("[watchdog] captured %d bytes of /proc/self/maps\n", g_maps_len);
     DIR *d = opendir("/proc/self/task");
     if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
     struct dirent *de;
