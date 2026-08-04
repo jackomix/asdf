@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.39.2-glibc"
+#define GDS_BUILD_VERSION "0.39.3-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -655,12 +655,16 @@ static void *kv_set_job_workers_zero(void *unused) {
     printf("[jobfix] main thread - proceeding to class scan\n"); fflush(stdout);
     /* Stage B: scan assemblies, find JobsUtility, invoke setters. */
     for (int tries = 0; tries < 200 && !kv_jobworkers_done; tries++) {
+        if (tries == 0) { printf("[jobfix] calling dom_get()...\n"); fflush(stdout); }
         void *domain = dom_get();
+        if (tries == 0) { printf("[jobfix] dom_get() -> %p\n", domain); fflush(stdout); }
         if (!domain) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
         size_t na = 0;
+        if (tries == 0) { printf("[jobfix] calling dom_asms()...\n"); fflush(stdout); }
         void **asms = (void **)dom_asms(domain, &na);
+        if (tries == 0) { printf("[jobfix] dom_asms() -> %p na=%zu\n", asms, na); fflush(stdout); }
         if (!asms || !na) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
-        if (tries == 0) { printf("[jobfix] assembly count=%zu\n", na); fflush(stdout); }
+        printf("[jobfix] assembly count=%zu\n", na); fflush(stdout);
         int found_class = 0;
         for (size_t i = 0; i < na; i++) {
             void *img = asm_img(asms[i]);
