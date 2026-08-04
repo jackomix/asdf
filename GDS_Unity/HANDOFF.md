@@ -22,6 +22,46 @@ Two approaches were started:
 The web target was explicitly **deprioritised**: a browser would need a WASM ARM
 emulator (the slow, hard half) and does not reuse the native win.
 
+## THE TWO REFERENCE PORTS — READ BEFORE ANY DEEP WORK
+
+Both are by the SAME author (NextOs-Ports), run Unity IL2CPP games on THIS R36S,
+and between them cover every hard problem in this project.  When stuck, mine
+their source for the exact mechanism instead of reinventing it.
+
+1. **`NextOs-Ports/terraria-nextos`** (Terraria 1.4.5.6.4, Unity 2021.3 IL2CPP)
+   - `src/main.c` — the complete loader boot: so_load/relocate/resolve, import
+     + GOT patching (`set_import`/`patch_got`), asset-redirect `my_open`, TLS
+     guard pad, crash handler, the whole Unity player-loop drive.
+   - `src/bionic_shims.c` — bionic/glibc ABI: FORTIFY `_chk`, sigset_t 8B->128B,
+     `my_sigaction`, `__system_property_get`.
+   - `src/pthread_fake.c` / `pthread_bridge.c` — the "slot" trick (ptr to a real
+     glibc object in the bionic object's first word) for mutex/cond/rwlock/sem;
+     `pthread_sigmask` bionic/glibc size fix.
+   - `src/jni_shim.c`, `src/egl_shim.c` — JNI + SDL-backed EGL shims.
+
+2. **`NextOs-Ports/horizonchase-nextos`** (Horizon Chase, Unity, newer/more
+   battle-tested loader).  This one was the KEY to our current blocker:
+   - `src/main.c` `TER_FUTEXPOLL` + `my_syscall` — intercepts raw
+     `syscall(SYS_futex, FUTEX_WAIT)` (which BYPASSES pthread/sem shims) and
+     injects a short poll timeout so lost-wakeup job-system workers wake and
+     re-check.  Also intercepts `SYS_sched_getaffinity` to force 1 CPU (jobs
+     inline), and `SYS_rt_sigprocmask` for the GC's stop-the-world.
+   - `TER_JOBWORKERS0` — calls `JobsUtility.set_JobWorkerCount(0)` (and
+     ActiveThreadCount/WarpThreadCount) via `il2cpp_runtime_invoke` so jobs run
+     inline.  `TER_JOBINLINE` reports 1 CPU via sched_getaffinity + /proc/cpuinfo
+     + /sys/cpu.
+   - `TER_FAKEACK` / `TER_NOSUSPEND` — fake-ACKs the GC's thread-suspend signal
+     and swallows SIGPWR/SIGXCPU so the stop-the-world GC doesn't deadlock on
+     threads it can't reach.
+   - the futex-logging (`TER_FUTEXLOG`) and thread-comm helpers are invaluable
+     diagnostics.
+
+General rule: **if the game futex-waits with a NULL timeout, it is a RAW
+`syscall(SYS_futex)` that pthread/cond/sem shims can't reach — the fix is the
+`kv_syscall`/`my_syscall` interception (0.26.0 implements this).**  If a thread
+spins `state=R` on `read()`, it's waiting on a pipe/socket for an Android
+lifecycle event the loader must pump.  These two ports already solved both.
+
 ## What is DONE / WORKING
 
 - Cross-toolchain: `python3 -m ziglang cc -target aarch64-linux-gnu` builds
@@ -420,9 +460,11 @@ dialog build happens inside that first nativeRender.
   `loader/jni_shim.c` (JNI shim — the dialog is built through here),
   `loader/fs_redirect.c` (open/fopen redirect + cmdline inject),
   `loader/bionic_bridge.c` (pthread/signal/statfs), `loader/glibc_shims.c`.
-- Reference: `NextOs-Ports/terraria-nextos` runs a full Unity game on this exact
-  device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
-  solve these exact problems.
+- Reference ports (both by NextOs-Ports, both run Unity on THIS R36S — see the
+  "THE TWO REFERENCE PORTS" section near the top):
+  `NextOs-Ports/terraria-nextos` (so_load/import-patch/asset-redirect/TLS/bionic)
+  and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
+  stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
 ## LATEST STATUS (build 0.26.0-glibc) - syscall shim: raw futex poll + sched_getaffinity
 
