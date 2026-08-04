@@ -397,6 +397,8 @@ int kv_sched_setaffinity(int pid, size_t setsize, const void *mask) {
 /* sysconf: report 1 CPU for the processor-count queries Unity uses to size
  * workers (_SC_NPROCESSORS_ONLN=0x62, _SC_NPROCESSORS_CONF=0x61). */
 long kv_sysconf(int name) {
+    static int once; if (!once && (once = 1))
+        printf("[kv_sysconf] routed! name=%d tid=%ld\n", name, (long)syscall(178));
     if (name == 0x62 || name == 0x61) return 1;   /* 1 CPU -> 0 job workers */
     if (name == 0x27) return 4096;                 /* _SC_PAGESIZE */
     return sysconf(name);
