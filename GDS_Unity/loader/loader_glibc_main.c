@@ -47,37 +47,68 @@ extern int closedir(DIR *dirp);
 typedef unsigned long kv_pthread_t;   /* matches kv_libc.h */
 struct timespec { long tv_sec; long tv_nsec; };
 
-/* ptrace regs (aarch64 user_regs_struct from <sys/user.h>).  We declare it
- * by hand so the build needs no header.  Used by the watchdog to dump the PC
- * + first 16 regs of any thread that's blocked in a syscall - the kernel
- * per-thread syscall dump tells us WHAT we're waiting on, but not WHERE in
- * libunity/libil2cpp we called wait. */
-struct user_regs_struct {
-    unsigned long regs[31];   /* x0..x30 */
-    unsigned long sp;
-    unsigned long pc;
-    unsigned long pstate;
-};
-extern long ptrace(long req, long pid, void *addr, void *data);
-#define PTRACE_ATTACH 16
-#define PTRACE_DETACH 17
-#define PTRACE_GETREGSET 0x4204
-struct iovec { void *iov_base; unsigned long iov_len; };
-/* waitpid flags - Linux-specific.  When attaching to a SIBLING thread (same
- * process, NOT a child), waitpid requires __WALL or __WCLONE, otherwise it
- * returns ECHILD and the dump never happens.  Same-process PTRACE_ATTACH
- * makes the tracee a "clone child" relative to the tracer. */
-#ifndef __WALL
-#define __WALL 0x40000000
-#endif
-#ifndef __WCLONE
-#define __WCLONE 0x80000000
-#endif
+/* ptrace approach failed on darkOSre R36S (every attach returns EPERM even
+ * from same-process sibling threads — prctl PR_SET_PTRACER doesn't help
+ * without yama either; the kernel appears hardened against self-attach).
+ *
+ * BUT: /proc/<tid>/syscall already prints the user-space PC + SP as its
+ * LAST TWO fields (after the 6 syscall args: syscall#, arg0..arg5, sp, pc).
+ * So we have the PC.  To turn it into a (file, offset) we just need the
+ * current /proc/self/maps snapshot; we read it ONCE per dump and resolve
+ * each thread's PC against it. */
+static char g_maps[64 * 1024];
+static int  g_maps_len;
+static void maps_refresh(void) {
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) { g_maps_len = 0; return; }
+    int off = 0;
+    while (off < (int)sizeof g_maps - 1) {
+        ssize_t n = read(fd, g_maps + off, sizeof g_maps - 1 - off);
+        if (n <= 0) break;
+        off += (int)n;
+    }
+    close(fd);
+    g_maps[off] = 0;
+    g_maps_len = off;
+}
+static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
+    /* parse "lo-hi perm offset dev inode pathname" lines; find one containing addr */
+    const char *s = g_maps; const char *best = 0; unsigned long best_off = 0;
+    while (s < g_maps + g_maps_len) {
+        const char *eol = strchr(s, '\n'); if (!eol) break;
+        unsigned long lo = 0, hi = 0; const char *p = s;
+        for (int phase = 0; phase < 2; phase++) {
+            unsigned long v = 0;
+            while (*p && *p != '-' && *p != ' ') {
+                int c = *p++;
+                if (c >= '0' && c <= '9') v = (v<<4) | (c-'0');
+                else if (c >= 'a' && c <= 'f') v = (v<<4) | (c-'a'+10);
+                else if (c >= 'A' && c <= 'F') v = (v<<4) | (c-'A'+10);
+                else goto skip;
+            }
+            p++;
+            if (phase == 0) lo = v; else hi = v;
+        }
+        /* skip 3 fields (perm, offset, dev), find pathname (starts after the
+         * 5th space).  Crude: walk and count spaces. */
+        const char *q = p; int sp = 0;
+        for (; q < eol; q++) { if (*q == ' ') { if (++sp == 5) break; else if (sp > 1 && *(q+1) == ' ') continue; } }
+        while (q < eol && *q == ' ') q++;
+        if (addr >= lo && addr < hi) {
+            best = (q < eol) ? q : "[anon?]";
+            best_off = addr - lo;
+        }
+    skip:;
+        s = eol + 1;
+    }
+    if (off_out) *off_out = best_off;
+    return best;
+}
 
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.36.0-glibc"
+#define GDS_BUILD_VERSION "0.37.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -452,12 +483,14 @@ static void *kv_watchdog(void *arg) {
         struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
         nanosleep(&ts, 0);
         printf("[watchdog] === thread dump #%d (blocked syscalls + wchan + kstack) ===\n", dump);
+    maps_refresh();   /* snapshot /proc/self/maps once per dump, for PC resolution */
     DIR *d = opendir("/proc/self/task");
     if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
     struct dirent *de;
     while ((de = readdir(d))) {
         if (de->d_name[0] == '.') continue;
         char p[128], buf[512];
+        char sysbuf[512] = "";   /* raw /proc/<tid>/syscall text */
         /* state: /proc/self/task/<tid>/stat, field 3 (R running, S sleeping,
          * D io-wait).  comm is field 2 in parens; find last ')' then skip space. */
         snprintf(p, sizeof p, "/proc/self/task/%s/stat", de->d_name);
@@ -477,7 +510,28 @@ static void *kv_watchdog(void *arg) {
         if (fd >= 0) {
             ssize_t n = read(fd, buf, sizeof buf - 1);
             close(fd);
-            if (n > 0) { buf[n] = 0; printf("[watchdog] tid=%s syscall: %s", de->d_name, buf); }
+            if (n > 0) { buf[n] = 0; printf("[watchdog] tid=%s syscall: %s", de->d_name, buf); snprintf(sysbuf, sizeof sysbuf, "%s", buf); }
+        }
+        /* From the raw syscall we can extract PC (user-space return IP after
+         * `svc`).  Format: "98 arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n".
+         * Tokenize by whitespace, count to 9th, parse as hex. */
+        if (sysbuf[0]) {
+            char *tok = sysbuf; int idx = 0; unsigned long pc = 0, sp = 0;
+            for (; idx < 9; idx++) {
+                while (*tok == ' ') tok++;
+                if (!*tok || *tok == '\n') break;
+                char *e = tok;
+                while (*e && *e != ' ' && *e != '\n') e++;
+                if (idx == 7) sp = strtoul(tok, 0, 16);
+                if (idx == 8) pc = strtoul(tok, 0, 16);
+                tok = e;
+            }
+            if (pc) {
+                unsigned long off = 0;
+                const char *lib = maps_resolve(pc, &off);
+                printf("[watchdog] tid=%s user-pc=0x%lx sp=0x%lx  in %s +0x%lx\n",
+                       de->d_name, pc, sp, lib ? lib : "[unknown]", off);
+            }
         }
         /* wchan: kernel wait site name (e.g. "futex_wait_queue_me"). */
         snprintf(p, sizeof p, "/proc/self/task/%s/wchan", de->d_name);
@@ -506,37 +560,6 @@ static void *kv_watchdog(void *arg) {
                     q = nl + 1; lines++;
                 }
             }
-        }
-        /* Per-thread user-space PC dump via ptrace.  /proc/<tid>/syscall tells
-         * us WHAT we wait on; ptrace gives us WHERE in libunity we called wait.
-         * Attach stops the thread, GETREGSET reads regs, DETACH resumes it.
-         * yama/ptrace_scope < 1 required (we run as the same user - self-attach). */
-        long tid_l = strtol(de->d_name, 0, 10);
-        if (tid_l > 0 && ptrace(PTRACE_ATTACH, tid_l, 0, 0) == 0) {
-            /* PTRACE_ATTACH is async - the kernel sends a SIGSTOP; wait for it.
-             * __WALL is REQUIRED for same-process sibling thread attach: without
-             * it waitpid returns ECHILD (the tracee is a "clone" child, not a
-             * fork child) and we never observe the stop. */
-            int status = 0;
-            extern int waitpid(int, int *, int);
-            if (waitpid((int)tid_l, &status, __WALL) >= 0) {
-                struct user_regs_struct regs; struct iovec iov = { &regs, sizeof regs };
-                if (ptrace(PTRACE_GETREGSET, tid_l, (void *)1 /*NT_PRSTATUS*/, &iov) == 0) {
-                    printf("[watchdog] tid=%s user: pc=%lx lr=%lx sp=%lx\n",
-                           de->d_name, regs.pc, regs.regs[30], regs.sp);
-                    printf("[watchdog] tid=%s        x0=%lx x1=%lx x2=%lx x3=%lx\n",
-                           de->d_name, regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3]);
-                    printf("[watchdog] tid=%s        x19=%lx x20=%lx x21=%lx x22=%lx\n",
-                           de->d_name, regs.regs[19], regs.regs[20], regs.regs[21], regs.regs[22]);
-                } else {
-                    printf("[watchdog] tid=%s PTRACE_GETREGSET failed\n", de->d_name);
-                }
-            } else {
-                printf("[watchdog] tid=%s waitpid(__WALL) failed\n", de->d_name);
-            }
-            ptrace(PTRACE_DETACH, tid_l, 0, 0);
-        } else if (tid_l > 0) {
-            printf("[watchdog] tid=%s PTRACE_ATTACH failed\n", de->d_name);
         }
     }
     closedir(d);

@@ -507,12 +507,34 @@ No-yama on R36S (verified `cat /proc/sys/kernel/yama/ptrace_scope` returns ENOEN
 
 Fix per Linux man-page `ptrace(2)`: "**Use the `__WALL` flag** with `waitpid(2)` for ptrace-attached threads" (since they are CLONE_CHILDREN from kernel perspective, not fork children).
 
-### 0.36 - add __WALL flag + error reporting
+### 0.36 result
 
-- `waitpid((int)tid_l, &status, __WALL)` instead of `0`
-- Added `else` printf on `PTRACE_ATTACH` failure path so silence → visibility if attach really does fail
-- Added explicit `GETREGSET failed` and `waitpid failed` printf branches — previously silent fall-through
-- `__WALL = 0x40000000` declared locally (no glibc header included)
+Every thread printed `PTRACE_ATTACH failed`. Self-attach forbidden on this darkOSre R36S kernel build (no yama, but hardened — `prctl(PR_SET_PTRACER)` not pursue-able either).
+
+**BUT(tolua nobody)**: the watchdog already had ALL the PC info it needed. `/proc/<tid>/syscall` format is `syscall# arg0 arg1 arg2 arg3 arg4 arg5 sp pc` — the LAST two fields are user-space SP and PC (return IP after `svc`). We were printing them raw the whole time but treating them as opaque context bytes.
+
+For the main thread `tid=17377`: `pc=0x7f9f94ef6c` (the last hex value). That's pointer into dynamic librange. Now we need to resolve it.
+
+### 0.37 - parse PC from /proc/<tid>/syscall + /proc/self/maps
+
+Replaced ptrace approach with:
+
+1. `maps_refresh()` reads `/proc/self/maps` once per watchdog dump (~64KB buffer).
+2. Per-thread: parse the 9 fields of `/proc/<tid>/syscall`, take `fields[7]=sp`, `fields[8]=pc`.
+3. `maps_resolve(pc)`: walks snapshot, finds the line `lo-hi perm offset dev inode pathname` that contains `pc` (range check `lo<=pc<hi`), returns `pathname` + `pc - lo`.
+4. Printf `[watchdog] tid=X user-pc=0x... sp=0x... in <path/to/lib.so> +0xN`.
+
+For our libil2cpp at base `0x200000000` and libunity at `0x20222f000`, we expect output like:
+
+```
+[watchdog] tid=17377 user-pc=0x7f9f94ef6c sp=0x... in /usr/lib/libpthread-2.33.so +0x1e6c
+```
+
+That's libc's `pthread_cond_wait` futex-wait loop — telling us libunity is parked in `pthread_cond_wait` (or `sem_wait`), waiting for the job-queue signal that never comes.
+
+### Next (planned for 0.38)
+
+Once 0.37 confirms the wait site is libc `pthread_cond_wait` / `sem_wait` (probably matching the `0x189` futex we already see but inside a libc symbol), `bionic_bridge.c` route table gets a GOT intercept of `pthread_cond_wait`/`pthread_cond_timedwait` returning 0 immediately (or `sem_wait` returning 0), so Unity's own wait returns "completed" and the player loop advances. Also `kv_set_job_workers_zero` still hasn't run (first frame never finishes), so once the wait is unblocked the jobfix runs naturally.
 
 0.33 fix worked: `nativeRender` now enters (jobfix no longer pre-probe kills it).  Log shows the player loop STARTED:
 ```
