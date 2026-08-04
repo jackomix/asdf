@@ -245,9 +245,13 @@ int kv_pthread_cond_wait(void **cslot, void **mslot) {
     return kv_cond_poll_wait(cslot, mslot);
 }
 int kv_pthread_cond_timedwait(void **cslot, void **mslot, const struct timespec *ts) {
-    /* honor the caller's absolute deadline, but cap it so we still poll */
+    /* Like cond_wait: if main thread, return 0 immediately (spurious wake).
+     * Otherwise honor caller deadline but cap to KV_COND_POLL_WORK_NS so
+     * idle workers don't burn CPU. */
+    cond_get(cslot); mtx_get(mslot);
+    if (kv_is_main_thread()) return 0;
     struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
-    long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
+    long ns = KV_COND_POLL_WORK_NS;
     struct timespec cap = *ts;
     long capns = (cap.tv_sec - now.tv_sec) * 1000000000L + (cap.tv_nsec - now.tv_nsec);
     if (capns < 0 || capns > ns) capns = ns;
