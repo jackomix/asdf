@@ -56,7 +56,7 @@ struct timespec { long tv_sec; long tv_nsec; };
  * So we have the PC.  To turn it into a (file, offset) we just need the
  * current /proc/self/maps snapshot; we read it ONCE per dump and resolve
  * each thread's PC against it. */
-static char g_maps[64 * 1024];
+static char g_maps[256 * 1024];
 static int  g_maps_len;
 static void maps_refresh(void) {
     int fd = open("/proc/self/maps", O_RDONLY);
