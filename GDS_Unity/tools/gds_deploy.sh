@@ -76,10 +76,18 @@ else
 fi
 
 echo "Downloading gamedevstory.zip..."
-# Cache-buster (?ts=...) forces GitHub's raw CDN to serve a fresh copy instead
-# of a cached stale zip.  This was why the device ran an old loader2.
-CACHEBUST="?ts=$(date +%s)"
-curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip$CACHEBUST"
+# Download by commit SHA (unique URL per commit) so GitHub's raw CDN can't serve
+# a cached stale zip for a newer build.  The branch-tip URL (?ts= cache-buster) is
+# only a fallback.  This is what kept the device on an old loader2 before.
+DOWNLOAD_SHA="${GDS_SHA:-$GH_SHA}"
+ZIP_URL=""
+if [ -n "$DOWNLOAD_SHA" ]; then
+  ZIP_URL="https://github.com/jackomix/asdf/raw/$DOWNLOAD_SHA/GDS_Unity/gamedevstory.zip"
+  echo "  downloading via commit $DOWNLOAD_SHA"
+else
+  ZIP_URL="https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip?ts=$(date +%s)"
+fi
+curl -sL --progress-bar -o "$ZIP" "$ZIP_URL"
 echo
 if [ ! -s "$ZIP" ] || ! unzip -t "$ZIP" >/dev/null 2>&1; then
   echo "!! Downloaded zip corrupt/missing. Try again."; exit 1
@@ -88,14 +96,12 @@ fi
 GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+(-glibc)?" | head -1 || true)
 echo "  zip loader2: build ${GZVER:-version unknown}"
 # Hard check: the zip MUST contain the current loader build or the deploy is
-# pointless (the device would run stale code again).  Retry once with a fresh
-# cache-buster if the version is wrong/missing.
+# pointless (the device would run stale code again).  Retry with the branch URL.
 if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
   echo "!! Downloaded zip has loader build '${GZVER:-none}' but expected '$GDS_EXPECT_VER'."
-  echo "   (GitHub CDN cached an old zip) - retrying with a fresh cache-buster..."
+  echo "   (stale zip) - retrying via branch URL..."
   sleep 2
-  CACHEBUST="?ts=$(date +%s%N)"
-  curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip$CACHEBUST"
+  curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip?ts=$(date +%s%N)"
   echo
   GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+(-glibc)?" | head -1 || true)
   echo "  retry: zip loader2 build ${GZVER:-unknown}"
