@@ -853,6 +853,29 @@ int real_main(int argc, char **argv) {
     }
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
 
+    /* Stage 1.5: GOT route audit - print GOT slot values for key symbols. */
+    static const char *audit_syms[] = {"pthread_create","sysconf","sem_wait","sem_post","syscall","sched_getaffinity"};
+    for (Module *m = m_il2cpp; m; m = (m == m_il2cpp) ? m_unity : (m == m_unity ? m_main : 0)) {
+        if (!m) break;
+        for (int set = 0; set < 2; set++) {
+            Elf64_Rela *rels = set ? m->jmprel : m->rela;
+            size_t cnt = set ? m->jmprel_count : m->rela_count;
+            for (size_t i = 0; i < cnt; i++) {
+                uint32_t type = rels[i].r_info & 0xffffffffULL;
+                if (type != 1024 && type != 1026) continue;  /* R_AARCH64_GLOB_DAT=1024, JUMP_SLOT=1026 */
+                uint64_t symidx = rels[i].r_info >> 32;
+                const char *nm = m->strtab + m->symtab[symidx].st_name;
+                for (size_t k = 0; k < sizeof audit_syms/sizeof*audit_syms; k++) {
+                    if (strcmp(nm, audit_syms[k]) == 0) {
+                        uint64_t *slot = (uint64_t *)(m->bias + rels[i].r_offset);
+                        printf("[audit] %s GOT[%s] = %p (kv ptr range=0x10000000-0x13000000, libc=0x7f...)\n",
+                               m->name, nm, (void *)*slot);
+                    }
+                }
+            }
+        }
+    }
+
     /* Stage 2: Unity boot.  JNI_OnLoad for EACH lib is what registers the
      * native methods.  libunity's JNI_OnLoad registers initJni/nativeRender/
      * nativeResume/... (needed to drive the player loop); libil2cpp's and
