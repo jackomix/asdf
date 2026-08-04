@@ -88,7 +88,7 @@ static jclass kv_FindClass(JNIEnv env, const char *name) {
 }
 
 /* ---- jstring: store the real string so GetStringUTFChars returns it ---- */
-#define KV_MAX_JSTR 256
+#define KV_MAX_JSTR 4096
 static char kv_jstr_buf[KV_MAX_JSTR][256];
 static int kv_jstr_n = 0;
 static jstring kv_make_jstring(const char *s) {
@@ -102,6 +102,15 @@ static const char *kv_resolve_jstring(jstring s) {
     if (v >= 0x4000 && v < 0x4000 + KV_MAX_JSTR) return kv_jstr_buf[v - 0x4000];
     return "";
 }
+
+/* game dir (from argv[0]): where libil2cpp.so / data/ live.  Returned by
+ * getPackageCodePath/getFilesDir/getDataDir so Unity's OBB/streaming-assets
+ * path resolution finds the real files. */
+static char kv_game_dir[512] = ".";
+void kv_set_game_dir(const char *dir) {
+    if (dir) { strncpy(kv_game_dir, dir, sizeof kv_game_dir - 1); kv_game_dir[sizeof kv_game_dir - 1] = 0; }
+}
+const char *kv_get_game_dir(void) { return kv_game_dir; }
 
 /* ---- method registry: store id -> name/sig so Call*Method can dispatch ---- */
 struct kv_method { jmethodID id; const char *name; const char *sig; };
@@ -315,11 +324,32 @@ static jint kv_InputStreamRead_1(JNIEnv env, jobject stream) {
 
 static jobject kv_fake_obj = (jobject)(uintptr_t)0x6000;
 static jobject kv_assetmgr = (jobject)(uintptr_t)0x6100;   /* fake AssetManager */
+static jobject kv_pending_click = 0;   /* AlertDialog.setPositiveButton listener */
+
+/* forward decls (defined later) */
+static void kv_CallVoid(JNIEnv env, jobject o, jmethodID m, ...);
+static void kv_dispatch_runnable(JNIEnv env, jobject runnable);
+
+/* Forward varargs into a small buffer of pointers so kv_CallObjectMethodV can
+ * read arg[0..n].  On aarch64 a JNI Call*Method's varargs are a mix of refs and
+ * scalars in registers; reading them as uintptr_t and passing pointers keeps the
+ * ABI simple. */
+#define KV_MAX_ARGS 8
+struct kv_args { uintptr_t a[KV_MAX_ARGS]; int n; };
+static struct kv_args kv_collect_args(void *ap) {
+    struct kv_args r; r.n = 0; memset(&r, 0, sizeof r);
+    va_list *vap = (va_list *)ap;
+    if (vap) {
+        while (r.n < KV_MAX_ARGS) r.a[r.n++] = va_arg(*vap, uintptr_t);
+    }
+    return r;
+}
 
 static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void *ap) {
     (void)env;
     const char *nm = kv_method_name(mid);
     if (!nm) return kv_fake_obj;
+    struct kv_args args = kv_collect_args(ap);
     /* Trace the dialog flow: what Unity does after setMessage (setPositiveButton,
      * show, listeners) and what it queries. */
     if (nm && (strstr(nm, "ositive") || strstr(nm, "egative") || strstr(nm, "eutral") ||
@@ -329,28 +359,30 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
     if (strcmp(nm, "getAssets") == 0) return kv_assetmgr;
     if (strcmp(nm, "open") == 0 || strcmp(nm, "openNonAsset") == 0) {
         /* read the actual asset file from data/ and return a real stream */
-        void *pathobj = ap ? ((void **)ap)[0] : 0;
+        void *pathobj = args.n ? (void *)args.a[0] : 0;
         const char *path = pathobj ? kv_resolve_jstring((jstring)pathobj) : 0;
         void *stream = kv_asset_open(path);
         if (stream) return stream;
         return kv_fake_obj;   /* file missing: non-null so Unity doesn't crash */
     }
     if (strcmp(nm, "getFilesDir") == 0 || strcmp(nm, "getExternalFilesDir") == 0 ||
-        strcmp(nm, "getCacheDir") == 0 || strcmp(nm, "getDataDir") == 0 ||
-        strcmp(nm, "getPath") == 0 || strcmp(nm, "getAbsolutePath") == 0 ||
+        strcmp(nm, "getCacheDir") == 0 || strcmp(nm, "getDataDir") == 0) {
+        return kv_make_jstring(kv_get_game_dir());
+    }
+    if (strcmp(nm, "getPath") == 0 || strcmp(nm, "getAbsolutePath") == 0 ||
         strcmp(nm, "getCanonicalPath") == 0) {
-        return kv_make_jstring(".");
+        return kv_make_jstring(kv_get_game_dir());
     }
     /* Return real strings instead of a fake object pointer (0x6000) for
      * string-returning methods, so GetStringUTFChars/GetStringUTFLength return
      * sane values instead of dereferencing 0x6000 as a JNI string handle. */
     if (strcmp(nm, "getPackageName") == 0) return kv_make_jstring("net.kairosoft.android.gamedev3en");
-    if (strcmp(nm, "getPackageCodePath") == 0) return kv_make_jstring(".");
+    if (strcmp(nm, "getPackageCodePath") == 0) return kv_make_jstring(kv_get_game_dir());
     /* findLibrary(name) -> path to a native lib.  Our libs are already loaded
-     * natively by the loader; return the data dir so Unity's string handling
+     * natively by the loader; return the game dir so Unity's string handling
      * gets a valid handle (and any load of a missing subpath fails gracefully
      * rather than crashing on a raw pointer). */
-    if (strcmp(nm, "findLibrary") == 0) return kv_make_jstring(".");
+    if (strcmp(nm, "findLibrary") == 0) return kv_make_jstring(kv_get_game_dir());
     if (strcmp(nm, "toString") == 0) return kv_make_jstring("");
     if (strcmp(nm, "getName") == 0 || strcmp(nm, "getCanonicalName") == 0 ||
         strcmp(nm, "getTypeName") == 0) return kv_make_jstring("java.lang.Object");
@@ -367,14 +399,31 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
          * is a jstring.  The dialog message tells us exactly what Unity thinks
          * failed (e.g. "Failed to load libil2cpp.so", an exception, storage...). */
         if (strcmp(nm, "setMessage") == 0 || strcmp(nm, "setTitle") == 0) {
-            void *arg0 = ap ? ((void **)ap)[0] : 0;
+            void *arg0 = args.n ? (void *)args.a[0] : 0;
             const char *txt = arg0 ? kv_resolve_jstring((jstring)arg0) : "";
             printf("[jni] ALERTDIALOG %s: \"%s\"\n", nm, txt);
         }
+        /* Capture the positive/neutral button's OnClickListener so show() can
+         * auto-fire it (the dialog can't be shown on a real Java UI, so any
+         * dialog Unity builds would deadlock waiting for a click). */
+        if (strcmp(nm, "setPositiveButton") == 0 || strcmp(nm, "setNeutralButton") == 0) {
+            if (args.n > 1) kv_pending_click = (jobject)args.a[1];  /* listener */
+        }
         return obj;
     }
-    /* Builder.show() returns the AlertDialog (CallObjectMethod) */
-    if (strcmp(nm, "show") == 0) return kv_fake_obj;
+    /* Builder.show() returns the AlertDialog; auto-fire the captured positive
+     * button so Unity's boot doesn't block on a dialog that can't be shown. */
+    if (strcmp(nm, "show") == 0) {
+        if (kv_pending_click) {
+            /* listener.onClick(dialog, BUTTON_POSITIVE) */
+            jmethodID onclick = kv_GetMethodID(env, 0, "onClick",
+                                "(Landroid/content/DialogInterface;I)V");
+            if (onclick) kv_CallVoid(env, kv_pending_click, onclick, kv_fake_obj, (jint)-1);
+            printf("[jni] AlertDialog.show() auto-fired positive button\n");
+            kv_pending_click = 0;
+        }
+        return kv_fake_obj;
+    }
     /* fluent prefs editor */
     if (strcmp(nm, "putString") == 0 || strcmp(nm, "putInt") == 0 ||
         strcmp(nm, "putBoolean") == 0 || strcmp(nm, "putFloat") == 0 ||
@@ -388,7 +437,13 @@ static jobject kv_CallObjectMethodA(JNIEnv env, jobject obj, jmethodID mid, cons
     (void)args; return kv_CallObjectMethodV(env, obj, mid, 0);
 }
 static jobject kv_CallObj(JNIEnv env, jobject o, jmethodID m, ...) {
-    return kv_CallObjectMethodV(env, o, m, 0);
+    /* IMPORTANT: forward the real varargs (ap), not NULL.  Before, passing 0
+     * meant open()/setMessage()/findLibrary() never received their arguments,
+     * so boot.config was never read and the dialog-text capture was dead code. */
+    va_list ap; va_start(ap, m);
+    jobject r = kv_CallObjectMethodV(env, o, m, (void *)&ap);
+    va_end(ap);
+    return r;
 }
 static jboolean kv_CallBool(JNIEnv env, jobject o, jmethodID m, ...) {
     (void)env; (void)o;
@@ -404,9 +459,18 @@ static jboolean kv_CallBool(JNIEnv env, jobject o, jmethodID m, ...) {
      * getAssetPackState/getObbDirs, and when no real Play Core answers it
      * falls through to an AlertDialog and blocks forever on a button we never
      * fire.  Returning TRUE ("Play Core is missing") makes Unity use the
-     * filesystem fallback, where our already-extracted data/ lives.  This is
-     * the highest-confidence fix for the boot-time AlertDialog. */
+     * filesystem fallback, where our already-extracted data/ lives. */
     if (strcmp(nm, "playCoreApiMissing") == 0) return 1;
+    /* Handler.post(Runnable) / postDelayed: dispatch the Runnable inline and
+     * report success, so Unity's UI-queue work actually runs (no Android
+     * Looper in the shim, otherwise it blocks forever). */
+    if (strcmp(nm, "post") == 0 || strcmp(nm, "postDelayed") == 0) {
+        va_list ap; va_start(ap, m);
+        jobject runnable = va_arg(ap, jobject);
+        va_end(ap);
+        kv_dispatch_runnable(env, runnable);
+        return 1;
+    }
     return 0;
 }
 static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) {
@@ -431,14 +495,37 @@ static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) {
     return 0;
 }
 static jlong kv_CallLong(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
+/* Dispatch a Runnable synchronously: runOnUiThread/Handler.post call run() on
+ * the Runnable immediately.  Without this, Unity posts work to the Android UI
+ * thread (which doesn't exist) and blocks forever waiting for it to execute. */
+static void kv_dispatch_runnable(JNIEnv env, jobject runnable) {
+    if (!runnable) return;
+    /* run() on the Runnable object.  CallVoidMethod("run") recursively; run()
+     * has no special handling, so it resolves to the native method registered
+     * by RegisterNatives (Unity's proxy dispatch) and runs it. */
+    jmethodID run_mid = kv_GetMethodID(env, 0, "run", "()V");
+    if (run_mid) kv_CallVoid(env, runnable, run_mid);
+}
+
 static void kv_CallVoid(JNIEnv env, jobject o, jmethodID m, ...) {
-    (void)env;(void)o;
+    (void)env;
     const char *nm = kv_method_name(m);
     /* Log dialog/present-related void calls so we can see Unity's flow after
      * building the AlertDialog (show(), dismiss(), setOnClickListener...). */
     if (nm && (strstr(nm, "how") || strstr(nm, "ismiss") || strstr(nm, "nClick") ||
                strstr(nm, "ostDelayed") || strstr(nm, "unOnUi") || strstr(nm, "setCancel")))
         printf("[jni] CallVoidMethod(%s)\n", nm);
+    if (!nm) return;
+    /* runOnUiThread(Runnable): run it inline (no real Android UI thread). */
+    if (strcmp(nm, "runOnUiThread") == 0) {
+        va_list ap; va_start(ap, m);
+        jobject runnable = va_arg(ap, jobject);
+        va_end(ap);
+        kv_dispatch_runnable(env, runnable);
+        return;
+    }
+    /* run() itself: it's a Runnable proxy method.  Nothing to do beyond
+     * returning (the registered native for run() may be invoked elsewhere). */
 }
 static jfloat kv_CallFloat(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
 static jobject kv_CallStaticObj(JNIEnv env, jclass c, jmethodID m, ...) { (void)env;(void)c;(void)m; return 0; }

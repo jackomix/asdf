@@ -424,7 +424,39 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.18.0-glibc) - capture the AlertDialog message text
+## LATEST STATUS (build 0.19.0-glibc) - FIXED: CallObjectMethod dropped all varargs
+
+A second model's code review caught REAL, critical bugs we had all missed:
+
+**BUG 1 (CRITICAL): kv_CallObj always passed ap=NULL.**  The variadic
+CallObjectMethod (kv_CallObj, the path Unity uses for nearly every call) did
+`return kv_CallObjectMethodV(env,o,m,0)` - so EVERY method argument was dropped:
+- AssetManager.open(path) got no path -> boot.config was never read.
+- setMessage/setTitle capture read ((void**)ap)[0] on NULL -> 0.18's diagnostic
+  printed empty strings (dead code).
+Fix: kv_CallObj now does va_start/va_arg and forwards (void*)&ap; kv_CallObjectMethodV
+collects up to 8 args via va_arg.
+
+**BUG 2: runOnUiThread / Handler.post dropped the Runnable.**  Unity posts work
+to the Android UI thread (which doesn't exist) -> blocks forever.  Fix:
+kv_CallVoid dispatches runOnUiThread's Runnable inline; kv_CallBool dispatches
+post/postDelayed's Runnable and returns true.
+
+**BUG 3: AlertDialog can't be shown -> deadlock.**  Fix: capture the
+setPositiveButton listener and auto-fire listener.onClick(dialog, -1) when
+show() is called, so Unity's boot doesn't block on a modal that has no Java UI.
+
+**BUG 4: getPackageCodePath/getFilesDir returned ".".**  Now return the real
+game dir (set via kv_set_game_dir(kv_abspath(argv0,".")) from real_main).
+
+**BUG 5: KV_MAX_JSTR was 256 -> string aliasing during a long boot.**  Bumped to 4096.
+
+The bionic TLS pad is CONFIRMED working (tp+0x28 lands in the pad).  These are
+high-confidence fixes that address why Unity boots with an empty boot.config and
+falls into its error dialog.  Next deploy should show boot.config being read and
+the boot progressing past the dialog.
+
+### Prior: 0.18.0 - capture the AlertDialog message text
 
 0.17's playCoreApiMissing=true did NOT change the log - byte-identical, still the
 AlertDialog after findLibrary.  So this is NOT the Play Asset Delivery dialog; it
