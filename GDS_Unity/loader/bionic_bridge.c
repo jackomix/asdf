@@ -344,6 +344,9 @@ int kv_pthread_mutexattr_settype(void *a, int t) { (void)a; (void)t; return 0; }
 static long kv_futexpoll_ms = 2;   /* 2 ms poll slice for raw futex waits */
 extern long syscall(long n, ...);
 static long kv_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    static int once; if (!once && (once = 1))
+        printf("[kv_syscall] routed! n=%ld tid=%ld\n", n, (long)syscall(178));
+    static int clone_n; if (n == 220 /*SYS_clone*/) { if (++clone_n <= 30) printf("[kv_syscall] SYS_clone #%d flags=%lx parent=%ld\n", clone_n, (unsigned long)a1, (long)syscall(178)); }
     /* force 1 CPU at the syscall level (job workers = num_cpus - 1) */
     if (n == SYS_sched_getaffinity && a3) {
         long r = syscall(n, a1, a2, a3, a4, a5, a6);
