@@ -259,6 +259,8 @@ int kv_sem_post(void **slot) { return sem_post(sem_get(slot)); }
 /* Polling sem_wait: like cond_wait, cap the wait so a sem that is never posted
  * (Android job/looper absent) wakes the caller to re-check.  */
 int kv_sem_wait(void **slot) {
+    static int once; if (!once && (once = 1))
+        printf("[kv_sem_wait] routed! tid=%ld slot=%p *slot=%p\n", (long)syscall(178), (void*)slot, slot ? (void*)*slot : 0);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
