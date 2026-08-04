@@ -1270,3 +1270,103 @@ worker threads (which never traverse the kv_syscall GOT slot).
 
 ### Stable fact: the GOT route table IS fully applied — shims exist but are
 ### NOT the path the deadlocked threads take.  Tomorrow: figure out which path.
+
+## 0.38 — fixer thread approach (PARTIALLY DEPLOYED, WIFI DROPPED)
+
+### Hypothesis from 0.37 audit
+The 14 parked worker threads are likely **libmali GPU worker threads**, NOT
+Unity job workers.  libmali.so (`/usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so`)
+imports `pthread_create`/`sem_wait`/`pthread_cond_wait`, but its GOT is resolved
+by glibc's dynamic linker to libc directly — our loader only patches GOTs of
+libil2cpp/libunity/libmain.  So libmali hardware threads all sit on libc's
+raw `__syscall @0x8ef6c` (parked in `sem_wait` waiting for work that never
+comes because no GL draw was issued).  These threads are parked but **NOT the
+cause of main thread blocking**.
+
+The main thread actually deadlocks INSIDE first `nativeRender` waiting on
+a Unity job-system futex that never gets woken (Android looper absent).
+Our `kv_syscall` injects a 2ms poll timeout — but Unity's predicate stays
+false so main re-waits forever.
+
+### Approach:  fixer thread
+Instead of trying to fix the workers, run `JobsUtility.set_JobWorkerCount(0)`
+from a SEPARATE thread spawned BEFORE the render loop:
+
+1. Spawn `pthread_create(kv_pthread_t *fixer, fn=kv_set_job_workers_zero)`.
+2. fixer calls `il2cpp_init()` from a sibling thread — this synchronises
+   against Unity's in-flight init on main (it's idempotent + guarded).
+   Without this gate, calling `il2cpp_class_from_name` too early races
+   with the in-flight init and crashes at `mono_class_get_checked +0x17b3c`
+   (`pc=0x200cfccd4`, FAR=0x135, x0=0) — same crash as 0.32.
+3. After il2cpp_init returns, scan assemblies for JobsUtility + invoke
+   the three setters (`set_JobWorkerCount`, `SetJobQueueMaximumActiveThreadCount`,
+   `SetJobQueueMaximumWarpThreadCount`).
+4. Result: Unity job worker count set to 0 → Unity runs jobs inline on
+   whichever thread dispatches them → no workers needed → no deadlock.
+
+### State of 0.38.1 code (committed)
+- `kv_set_job_workers_zero(void *unused)` now a thread fn — poll il2cpp_init
+  then scan assemblies.
+- Spawn point inside `kv_unity_boot` right after `kv_start_watchdog()` +
+  BEFORE the render loop.  `pthread_detach` after create.
+- Removed inline `kv_set_job_workers_zero` call from render loop.
+
+### Deploy status (PARTIAL - WIFI DROPPED IN MIDDLE)
+0.38.0 (initial impl) deploys: SIGSEGV @ `0xcfccd4` (NULL mono class race).
+  Cause: domain non-NULL before assemblies loaded; il2cpp_class_from_name
+  too early. Same exact crash as 0.32 (`x0=0 x1=0 FAR=0x135`).
+0.38.1 (with il2cpp_init gate) built locally (`strings loader2_glibc`
+  shows `0.38.1-glibc`) — BUT the deploy script pulled a STALE github-raw
+  cached zip (showed `0.38.0`) because the git push happened too fast for
+  GitHub's CDN cache to invalidate.  The version-bump commit `876d9ea`
+  hadn't propagated when `gds_deploy.sh` curled `raw.githubusercontent`.
+  Need to wait ≥30s after push before curl, OR upload zip directly.
+
+Then WiFi dropped (long-running loader never returned, watchdog swap
+caused heavy wifi traffic).  User needs to reboot R36S to recover WiFi.
+
+### NEXT MOVE (resume here)
+1. Wait for user to reboot R36S to recover WiFi.
+2. After R36S back, re-deploy ensuring 0.38.1 zip is the one that uploads.
+   The committed binary in `/gamedevstory.zip` IS 0.38.1 — just git/CDN lag.
+3. If 0.38.1 STILL crashes at `pc=0xcfccd4` (mono_class_get_checked), it
+   means `il2cpp_init` from the sibling thread returned before
+   `il2cpp_class_from_name` is callable.  Need stricter gate:
+     a. Look into the il2cpp STARTUP SEQUENCE: maybe `il2cpp_init` returns
+        before assemblies are loaded?  Probably needs
+        `il2cpp_init("Domain")` domain-complete event gate.
+     b. Or use `il2cpp_thread_attach(NULL)` BEFORE looking up class —
+        required by IL2CPP for class-lookup to actually have a thread
+        context (otherwise internal mono_class_get_checked sees NULL
+        thread-context and dereferences garbage).  terraria-nextos'
+        `ter_jobworkers0` calls il2cpp_thread_attach first; that may be THE
+        gate, not il2cpp_init.
+   Try adding `il2cpp_thread_attach(il2cpp_domain_get())` BEFORE
+   `cls_from_name` — this likely fixes the race.
+4. If 0.38.1 actually deploys + runs WITHOUT crash but Unity still deadlocks
+   (workers already spawned), need to ALSO add code to TEAR DOWN existing
+   workers: `JobsUtility.JobWorkerCount` setter requires the new value to
+   be applied — Unity probably shuts down workers asynchronously.  May need
+   to also signal `JobWorker.Restart` or wait.
+
+### Code notes
+- `kv_set_job_workers_zero(void *)` in `loader_glibc_main.c` ~line 598.
+- Spawn in `kv_unity_boot` ~line 700-13 (after kv_start_watchdog, before
+  render loop).  Uses `kv_pthread_t fixer; pthread_create(&fixer, 0,
+  (void *(*)(void *))kv_set_job_workers_zero, 0); pthread_detach(fixer);`.
+- `il2cpp_init` exported by libil2cpp at 0xce3d34 (per readelf).
+- The 0.38.0 crash log saved at `/tmp/loader_038a.log`; 0.38.1 NOT YET
+  captured (WiFi died before fresh deploy).
+
+### Stable fact update
+- libmali.so spawns N worker threads via libc `pthread_create` (NOT routed
+  through kv_pthread_create because libmali's GOT is patched by glibc
+  dynamic linker, not our manual loader).  These threads park at
+  `libc __syscall @0x8ef6c` waiting on libmali's own sem_wait (also libc-
+  resolved).  They're harmless parkers.
+- Unity's job workers (separate from libmali's) are spawned via libil2cpp's
+  `pthread_create@LIBC` GOT slot, which IS routed to `kv_pthread_create`.
+  But only ONE kv_pthread_create log appears, suggesting the code path that
+  spawns the worker pool runs in the spawned thread itself (recursion)
+  via libc's pthread_create (NOT via libil2cpp's GOT).  Needs disasm of
+  `start=0x202737174` libil2cpp offset 0x2737174 to confirm.
