@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.38.1-glibc"
+#define GDS_BUILD_VERSION "0.38.2-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -608,6 +608,7 @@ static void *kv_set_job_workers_zero(void *unused) {
     void *(*cls_from_name)(void *, const char *, const char *) = kv_il_sym("il2cpp_class_from_name");
     void *(*cls_method)(void *, const char *, int) = kv_il_sym("il2cpp_class_get_method_from_name");
     void *(*rt_invoke)(void *, void *, void **, void **) = kv_il_sym("il2cpp_runtime_invoke");
+    void *(*thread_attach)(void *) = kv_il_sym("il2cpp_thread_attach");
     if (!dom_get || !dom_asms || !asm_img || !cls_from_name || !cls_method || !rt_invoke) {
         printf("[jobfix] IL2CPP symbols unavailable, skipping\n");
         return 0;
@@ -626,6 +627,21 @@ static void *kv_set_job_workers_zero(void *unused) {
         struct timespec ts = {0,50000000}; nanosleep(&ts, 0);
     }
     printf("[jobfix] il2cpp_init done, scanning assemblies for JobsUtility\n");
+    /* Stage A.5: il2cpp_thread_attach is REQUIRED before cls_from_name can
+     * safely run on this (non-main) thread — without it, Mono's per-thread
+     * class-lookup context is NULL and mono_class_get_checked derefs garbage
+     * (the 0.38b crash at pc=0xcfccd4 happened here even though il2cpp_init
+     * had returned successfully).  terraria-nextos does this in
+     * ter_jobworkers0() (main.c:431). */
+    if (thread_attach) {
+        void *dom = dom_get();
+        void *t = thread_attach(dom);
+        printf("[jobfix] thread_attach(domain=%p) -> %p\n", dom, t);
+    } else {
+        printf("[jobfix] WARNING no il2cpp_thread_attach symbol\n");
+    }
+    /* tiny settle delay to be safe in case attach races with main's init. */
+    struct timespec settle = {0, 100000000}; nanosleep(&settle, 0);
     /* Stage B: scan assemblies, find JobsUtility, invoke setters. */
     for (int tries = 0; tries < 200 && !kv_jobworkers_done; tries++) {
         void *domain = dom_get();
