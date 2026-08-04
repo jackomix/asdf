@@ -108,6 +108,8 @@ if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
   if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
     echo "!! Still got '${GZVER:-none}' (expected $GDS_EXPECT_VER). Aborting."
     echo "   The repo may not have the latest zip pushed yet, or GitHub is caching hard."
+    echo "   If THIS script itself is stale (its EXPECT_VER is old), re-fetch it with a cache-buster:"
+    echo "     curl -sL \"https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/tools/gds_deploy.sh?ts=\$(date +%s)\" -o gds_deploy.sh && chmod +x gds_deploy.sh"
     exit 1
   fi
 fi
