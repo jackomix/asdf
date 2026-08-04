@@ -1132,4 +1132,141 @@ proving the Mali driver is behind the context, then graphics init to proceed.
 
 ### Deploy (works, version-checked)
     curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
-Expect `[loader] build: 0.7.0-glibc` in the log (stale-zip guard aborts otherwise).
+Expect `[loader] build: 0.37.0-glibc` in the log (stale-zip guard aborts otherwise).
+
+## 0.37 — maps_resolve fixed, deadlock root cause analysed (NOT YET RESOLVED)
+
+### What was wrong with maps_resolve
+Pre-rewrite parser counted space chars between fields to find the pathname.
+`/proc/self/maps` lines pad the gap between inode and pathname with MANY spaces
+(e.g. `... 0 0           /usr/bin/cat`), so the `sp==5` cutoff landed inside
+the padding.  The trailing `while (*q==' ') q++` then advanced `q` past the
+pathname into the next whitespace, and the very last line in maps (`[stack]`)
+had no trailing newline so its `lo/hi` matched anything via garbage parse.
+Result: every thread resolved to `[stack] +0x8ef6c`.
+
+### Fix
+Rewrote `maps_resolve()` in `loader_glibc_main.c` (≈line 74) as a 5-token
+tokenizer: split each line on single spaces, NUL-terminate each token, then
+skip residual whitespace to reach the pathname.  Trees robust against any
+kernel padding.  Audit confirmed all Now resolved correctly:
+
+    [wd-resolve] hit lo=7fa0070000 hi=7fa020c000 path=/usr/lib/aarch64-linux-gnu/libc.so.6 off=8ef6c
+
+### Worker thread park sites
+ALL worker threads (incl. main) sit at `libc.so.6 + 0x8ef6c` which disassembles to:
+
+    8ef40: bti c
+    ...
+    8ef68: svc #0x0            ;; raw futex syscall
+    8ef6c: ret                  ;; return trampoline after svc
+
+So workers are INSIDE libc's raw `__syscall` return trampoline.  This is the
+primitive used by libc's `sem_wait` slow path (jumps via `8edbc → 8ed40 → _dl_mcount+0x1c0`)
+and by libc's `syscall()` wrapper body (start `0xebb00`, PC `0xebb28 = +0x28`).
+
+The libc offset `0x8ef6c` lies between `sem_wait@@GLIBC_2.34 @0x8ee60` (size 0x60) and
+`sem_trywait@@GLIBC_2.34 @0x8eec0`.  It is the raw `__syscall` PLT-like stub used by
+libc's `sem_wait` slow path internally.
+
+### GOT audit confirms routing IS applied
+Added a post-load GOT audit in `loader_glibc_main.c` (`Stage 1.5`) which reads
+every GLOB_DAT/JUMP_SLOT reloc for libil2cpp + libunity + libmain and prints
+the GOT slot value for the key symbols:
+
+    [audit] ./libil2cpp.so GOT[sysconf]            = 0x1023da0   (kv_sysconf)
+    [audit] ./libil2cpp.so GOT[pthread_create]     = 0x1023994   (kv_pthread_create)
+    [audit] ./libil2cpp.so GOT[sem_post]          = 0x1023478   (kv_sem_post)
+    [audit] ./libil2cpp.so GOT[sem_wait]          = 0x1023550   (kv_sem_wait)
+    [audit] ./libil2cpp.so GOT[syscall]           = 0x1023f6c   (kv_syscall)
+    [audit] ./libunity.so  GOT[pthread_create]     = 0x1023994   (kv_pthread_create)
+    [audit] ./libunity.so  GOT[syscall]           = 0x1023f6c   (kv_syscall)
+    [audit] ./libunity.so  GOT[sysconf]           = 0x1023da0   (kv_sysconf)
+    [audit] ./libunity.so  GOT[sched_getaffinity] = 0x1023d10   (kv_sched_getaffinity)
+    [audit] ./libunity.so  GOT[sem_wait]          = 0x1023550   (kv_sem_wait)
+
+ALL six key symbols in BOTH .so's are routed to `kv_*` shims, NOT to libc.
+So route table is correct and GOT is patched.
+
+### Mystery: shims ARE routed but never fire
+- `[kv_pthread_create] n=1` logged ONLY ONCE.  Worker count = ~14 spawn.
+- `[kv_sysconf] routed` ZERO hits.  (Unity never calls sysconf via GOT.)
+- `[kv_sem_wait] routed` ZERO hits.  (Workers' park is NOT sem_wait via GOT.)
+- `[kv_syscall] routed` printed ONCE (`n=178` = our own gettid).  Then `[kv_syscall] SYS_futex tid=... op=0 a4=...` ONLY fires for 2 different tids (main and one worker).  Other workers never go through kv_syscall.
+
+This means: GOT IS patched correctly, BUT the workloads that actually run
+inside the spawned worker threads do NOT call those imported symbols via
+the patched GOT slot.  The workers park in libc `__syscall` directly.
+
+### Most plausible explanation
+- libil2cpp calls `pthread_create` ONCE via GOT → routed to `kv_pthread_create` → spawns ONE thread (start=`0x202737174` libil2cpp).
+- That single thread's start function internally spawns the remaining ~13 worker threads via libc- internal `pthread_create` (NOT through any patched GOT) OR via raw `clone` syscall (but `kv_syscall` clone trace showed NOTHING — no SYS_clone / SYS_clone3).
+- Workers then call `sem_wait` / `pthread_cond_wait` via libc-INTERNAL code paths (e.g. static asm wrappers inside libil2cpp that bypass its own GOT) — those calls land at libc `__syscall` trampoline directly without ever touching `kv_sem_wait`.
+
+This is why all our route-table work doesn't help with the deadlock: the
+sleeping workers never call our wrapped `sem_wait`.  They sit in libc's
+internal `__syscall` after a `futex(FUTEX_WAIT_BITSET, op=0x189, a4=0)`,
+which means **infinite wait with no timeout injected** — our `kv_syscall`
+2ms timeout hack only catches the FIRST futex on the main thread, not the
+worker threads (which never traverse the kv_syscall GOT slot).
+
+### Open question to investigate tomorrow
+- WHERE do the worker threads come from if not the patched `pthread_create`
+  and not `clone`/`clone3` (already traced, both empty)?
+  Candidate runs to investigate:
+    * `pthread_create` from libc internals (sigevent/timer thread pool)
+    * libil2cpp static asm trampoline that calls libc `__pthread_create@@GLIBC_2.34`
+      via its OWN absolute address (resolved at libil2cpp build time as if it
+      linked libpthread statically).  Verify by dumping `pthread_create` calls
+      in libil2cpp disasm — does it BLR through GOT slot or through ABS branch?
+    * `bionic.bridge` static-link pickup of `pthread_create` (Unity shipped
+      with embedded libpthread code that bypasses dynamic PLT entirely).  Look
+      for `pthread_create` symbol DEFINED in libil2cpp/libunity (not UND).
+
+- Confirm which libc fn maps to worker PC `0x8ef6c`.  Most likely:
+  `sem_wait@@GLIBC_2.34` slow path → libc-internal `__syscall` stub.
+  But workers could just as well be in `pthread_cond_wait` slow path (also
+  calls same `__syscall` trampoline).  Both end at PC `0x8ef6c`.  Distinguish
+  by stack walk if possible (or by arg inspection — futex addr in
+  `0x7fbfd8...` range = worker stack region for `sem_t` vs `pthread_cond_t`).
+
+### Next moves (resume here)
+1. Read libunity.so disasm of `pthread_create` call site — does it use the PLT
+   (BLR via GOT slot) or a direct branch to an internal symbol?  If the latter,
+   the IL2CPP worker-pool code likely has its own statically-linked thread
+   spawn that never touches the GOT — we need a different intercept strategy
+   (e.g. GOT-patch the `sem_wait` import to `sem_timedwait` redirect isn't
+   enough; we'd need to patch libc's `sem_wait` itself in libc.so.6 text via
+   mprotect PROT_WRITE + first-instruction-redirect).
+2. Check if libil2cpp defines `pthread_create`/`sem_wait`/`syscall` as
+   NON-UND symbols (statically linked copy).  `readelf -s libil2cpp.so`
+   full (not just dynamic).
+3. Alternative path: instead of intercepting libc internals, just SET
+   `JobsUtility.JobWorkerCount=0` from a SEPARATE thread spawned before
+   nativeRender is called.  Spawn a "fixer" thread that bootstraps after
+   il2cpp_init (wait on a flag set by first nativeRender entry) then runs
+   `il2cpp_class_from_name` + `il2cpp_runtime_invoke(set_JobWorkerCount,0)`.
+   Ref: terraria-nextos/src/main.c:431 `ter_jobworkers0()` — called from
+   `ter_before_present()` (an `eglSwapBuffers` hook), but our equivalent
+   can be the "fixer" thread instead, since the main thread deadlocks
+   BEFORE the first `eglSwapBuffers` returns.
+4. Clean up the debug printf spam once root cause found — keep GOT audit,
+   drop kv_pthread_create tid trace, drop kv_syscall clone/openat traces,
+   drop maps_resolve log line (keep the function, just remove `[wd-resolve] hit`).
+
+### Files touched this session
+- `loader/loader_glibc_main.c`:
+    - Rewrote `maps_resolve()` (stream-based 5-token parser).
+    - Added Stage 1.5 GOT audit printing slot values for 6 key syms.
+    - Removed `kv_set_job_workers_zero` early-trigger; moved to gated-after-render
+      (currently cannot fire because main never returns from first render).
+- `loader/bionic_bridge.c`:
+    - Added `[kv_syscall] routed!` once-print, `SYS_clone`/`SYS_clone3`/`SYS_openat` traces.
+    - `[kv_pthread_create]` now logs tid, up to 30 hits.
+    - `[kv_sem_wait] routed!` once-print (never fires; route confirmed via audit).
+    - `[kv_sysconf] routed!` once-print (never fires; route confirmed via audit).
+- `loader/fs_redirect.c`:
+    - Added `[fs] open(...)` trace for cpu-related paths (cpuinfo, /sys/.../cpu, etc.)
+
+### Stable fact: the GOT route table IS fully applied — shims exist but are
+### NOT the path the deadlocked threads take.  Tomorrow: figure out which path.
