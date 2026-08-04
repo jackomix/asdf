@@ -362,7 +362,17 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
     if (strcmp(nm, "setTitle") == 0 || strcmp(nm, "setMessage") == 0 ||
         strcmp(nm, "setIcon") == 0 || strcmp(nm, "setCancelable") == 0 ||
         strcmp(nm, "setPositiveButton") == 0 || strcmp(nm, "setNegativeButton") == 0 ||
-        strcmp(nm, "setNeutralButton") == 0 || strcmp(nm, "setItems") == 0) return obj;
+        strcmp(nm, "setNeutralButton") == 0 || strcmp(nm, "setItems") == 0) {
+        /* CAPTURE the dialog text: arg[0] of setMessage/setTitle(CharSequence)
+         * is a jstring.  The dialog message tells us exactly what Unity thinks
+         * failed (e.g. "Failed to load libil2cpp.so", an exception, storage...). */
+        if (strcmp(nm, "setMessage") == 0 || strcmp(nm, "setTitle") == 0) {
+            void *arg0 = ap ? ((void **)ap)[0] : 0;
+            const char *txt = arg0 ? kv_resolve_jstring((jstring)arg0) : "";
+            printf("[jni] ALERTDIALOG %s: \"%s\"\n", nm, txt);
+        }
+        return obj;
+    }
     /* Builder.show() returns the AlertDialog (CallObjectMethod) */
     if (strcmp(nm, "show") == 0) return kv_fake_obj;
     /* fluent prefs editor */

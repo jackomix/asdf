@@ -424,7 +424,20 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.17.0-glibc) - Play Asset Delivery bypass (playCoreApiMissing=true)
+## LATEST STATUS (build 0.18.0-glibc) - capture the AlertDialog message text
+
+0.17's playCoreApiMissing=true did NOT change the log - byte-identical, still the
+AlertDialog after findLibrary.  So this is NOT the Play Asset Delivery dialog; it
+is Unity's GENERIC error dialog (shown via runOnUiThread on an uncaught error
+during startup), which appears right after findLibrary.  The dialog text is the
+decisive diagnostic: it tells us exactly what Unity thinks failed.
+
+0.18 adds capture of the dialog text: in kv_CallObjectMethodV, when Unity calls
+AlertDialog.Builder.setMessage/setTitle, resolve arg[0] (a jstring) and print:
+  [jni] ALERTDIALOG setMessage: "<text>"
+Next deploy will reveal the actual error message, pinpointing the root cause.
+
+### Prior: 0.17.0 - Play Asset Delivery bypass (playCoreApiMissing=true)
 
 0.16's JNI trace confirmed the trigger sequence:
 `GetMethodID(playCoreApiMissing, ()Z)` then `findLibrary` CallObjectMethod, then
