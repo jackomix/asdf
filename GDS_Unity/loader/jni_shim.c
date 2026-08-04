@@ -320,6 +320,12 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
     (void)env;
     const char *nm = kv_method_name(mid);
     if (!nm) return kv_fake_obj;
+    /* Trace the dialog flow: what Unity does after setMessage (setPositiveButton,
+     * show, listeners) and what it queries. */
+    if (nm && (strstr(nm, "ositive") || strstr(nm, "egative") || strstr(nm, "eutral") ||
+               strstr(nm, "how") || strstr(nm, "etTitle") || strstr(nm, "etMessage") ||
+               strstr(nm, "nClick") || strstr(nm, "etOnKey") || strstr(nm, "findLibrary")))
+        printf("[jni] CallObjectMethod(%s)\n", nm);
     if (strcmp(nm, "getAssets") == 0) return kv_assetmgr;
     if (strcmp(nm, "open") == 0 || strcmp(nm, "openNonAsset") == 0) {
         /* read the actual asset file from data/ and return a real stream */
@@ -342,6 +348,13 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
     if (strcmp(nm, "addFlags") == 0 || strcmp(nm, "setFlags") == 0 ||
         strcmp(nm, "setData") == 0 || strcmp(nm, "setAction") == 0 ||
         strcmp(nm, "append") == 0 || strcmp(nm, "edit") == 0) return obj;
+    /* AlertDialog.Builder chained setters return the builder */
+    if (strcmp(nm, "setTitle") == 0 || strcmp(nm, "setMessage") == 0 ||
+        strcmp(nm, "setIcon") == 0 || strcmp(nm, "setCancelable") == 0 ||
+        strcmp(nm, "setPositiveButton") == 0 || strcmp(nm, "setNegativeButton") == 0 ||
+        strcmp(nm, "setNeutralButton") == 0 || strcmp(nm, "setItems") == 0) return obj;
+    /* Builder.show() returns the AlertDialog (CallObjectMethod) */
+    if (strcmp(nm, "show") == 0) return kv_fake_obj;
     /* fluent prefs editor */
     if (strcmp(nm, "putString") == 0 || strcmp(nm, "putInt") == 0 ||
         strcmp(nm, "putBoolean") == 0 || strcmp(nm, "putFloat") == 0 ||
@@ -389,7 +402,15 @@ static jint kv_CallInt(JNIEnv env, jobject o, jmethodID m, ...) {
     return 0;
 }
 static jlong kv_CallLong(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
-static void kv_CallVoid(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; }
+static void kv_CallVoid(JNIEnv env, jobject o, jmethodID m, ...) {
+    (void)env;(void)o;
+    const char *nm = kv_method_name(m);
+    /* Log dialog/present-related void calls so we can see Unity's flow after
+     * building the AlertDialog (show(), dismiss(), setOnClickListener...). */
+    if (nm && (strstr(nm, "how") || strstr(nm, "ismiss") || strstr(nm, "nClick") ||
+               strstr(nm, "ostDelayed") || strstr(nm, "unOnUi") || strstr(nm, "setCancel")))
+        printf("[jni] CallVoidMethod(%s)\n", nm);
+}
 static jfloat kv_CallFloat(JNIEnv env, jobject o, jmethodID m, ...) { (void)env;(void)o;(void)m; return 0; }
 static jobject kv_CallStaticObj(JNIEnv env, jclass c, jmethodID m, ...) { (void)env;(void)c;(void)m; return 0; }
 static jint kv_CallStaticInt(JNIEnv env, jclass c, jmethodID m, ...) { (void)env;(void)c;(void)m; return 0; }
