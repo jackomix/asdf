@@ -63,54 +63,50 @@ struct timespec { long tv_sec; long tv_nsec; };
 
 static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
     /* Stream /proc/self/maps line-by-line.  Avoids buffer truncation, gives
-     * us full coverage of all mapped segments including the libc.so.6 r-xp
-     * section at the top of the file (which the static 64/256KB snapshot was
-     * eating).  Path stored in static per-call line buffer, NUL-terminated,
-     * returned to caller. */
-    static char line[512];
+     * full coverage of all mapped segments including libc.so.6 r-xp line at
+     * the top (which the static 64/256KB snapshot was eating).  Path stored
+     * in static per-call line buffer, NUL-terminated, returned to caller. */
+    static char line[640];
     int fd = open("/proc/self/maps", O_RDONLY);
     if (fd < 0) return 0;
-    char buf[1024];
     const char *lib = 0; unsigned long off = 0;
-    /* read whole file in chunks; for each line parse lo-hi/pathname and track
-     * the last line containing addr. */
     int total = 0;
+    char readbuf[1024];
+    /* read chunks; newline ends a line; parse each. */
     while (1) {
-        ssize_t n = read(fd, buf, sizeof buf);
+        ssize_t n = read(fd, readbuf, sizeof readbuf);
         if (n <= 0) break;
         for (ssize_t i = 0; i < n; i++) {
-            char c = buf[i];
-            if (c == '\n' || total >= (int)sizeof line - 1) {
+            if (readbuf[i] == '\n' || total >= (int)sizeof line - 1) {
                 line[total] = 0;
                 total = 0;
-                /* parse "lo-hi perm offset dev inode pathname" */
-                const char *p = line; unsigned long lo = 0, hi = 0;
-                for (int phase = 0; phase < 2; phase++) {
-                    unsigned long v = 0;
-                    while (*p && *p != '-' && *p != ' ') {
-                        int cc = *p++;
-                        if (cc >= '0' && cc <= '9') v = (v<<4) | (cc-'0');
-                        else if (cc >= 'a' && cc <= 'f') v = (v<<4) | (cc-'a'+10);
-                        else if (cc >= 'A' && cc <= 'F') v = (v<<4) | (cc-'A'+10);
-                        else goto next_line;
-                    }
-                    p++;
-                    if (phase == 0) lo = v; else hi = v;
-                }
-                const char *q = p; int sp = 0;
-                for (; *q && *q != '\n'; q++) {
-                    if (*q == ' ') { if (++sp == 5) break; else if (sp > 1 && *(q+1) == ' ') continue; }
-                }
-                while (*q == ' ') q++;
-                if (addr >= lo && addr < hi) {
-                    lib = (*q) ? q : "[anon?]";
-                    off = addr - lo;
-                    if (*q) *(char *)(strchr(q, '\n') ? strchr(q, '\n') : q+strlen(q)) = 0;
-                }
-            next_line:;
             } else {
-                line[total++] = c;
+                line[total++] = readbuf[i];
+                continue;
             }
+            /* parse one maps line: "lo-hi perm offset dev inode pathname".
+             * Use 5 single-space-delimited tokens then skip whitespace to pathname. */
+            char *p = line, *t[5];
+            for (int ti = 0; ti < 5; ti++) {
+                while (*p == ' ') p++;
+                t[ti] = p;
+                while (*p && *p != ' ') p++;
+                if (!*p) goto next_line;
+                *p++ = 0;
+            }
+            /* t[0]='lo-hi', t[1]=perm, t[2]=offset, t[3]=dev, t[4]=inode.
+             * parse lo-hi by splitting on '-'. */
+            char *dash = strchr(t[0], '-'); if (!dash) goto next_line;
+            *dash = 0;
+            unsigned long lo = strtoul(t[0], 0, 16);
+            unsigned long hi = strtoul(dash + 1, 0, 16);
+            while (*p == ' ') p++;
+            if (addr >= lo && addr < hi && *p) {
+                lib = p; off = addr - lo;
+                char *nl = strchr(p, '\n'); if (!nl) nl = p + strlen(p);
+                *nl = 0;
+            }
+        next_line:;
         }
     }
     close(fd);
