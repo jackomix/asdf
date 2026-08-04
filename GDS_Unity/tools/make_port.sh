@@ -24,6 +24,11 @@ cp -r "$APKROOT/assets/bin/Data" "$PD/data"
 chmod +x "$PD/loader2" "ports/gamedevstory/Game Dev Story.sh"
 
 rm -f GameDevStory_PortMaster.zip
-( cd ports && zip -q -r -y "$here/GameDevStory_PortMaster.zip" gamedevstory )
+# Zip the CONTENTS of ports/gamedevstory (not the gamedevstory/ parent dir),
+# so the resulting zip extracts flat: ./Game Dev Story.sh, ./gamedevstory/loader2,
+# ...  The deploy's version-check greps `gamedevstory/loader2` (flat path), and
+# the launcher extracts straight into /roms/ports/, so a nested layout breaks
+# both.  Previous commits zipped contents via `cd ports/gamedevstory && zip`.
+( cd ports/gamedevstory && zip -q -r -y "$here/GameDevStory_PortMaster.zip" . )
 echo "built GameDevStory_PortMaster.zip"
 echo "extract into /roms/ports/ on the R36S, then EmulationStation -> Ports -> Game Dev Story"

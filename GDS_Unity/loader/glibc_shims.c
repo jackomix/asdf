@@ -70,29 +70,141 @@ int kv_log_open(const char *path) {
     return 0;
 }
 static void kv_sighandler(int sig, void *info, void *ucontext) {
-    (void)ucontext;
-    unsigned char *p = (unsigned char *)info;
-    unsigned long addr = 0;
-    for (int i = 0; i < 8; i++) addr |= ((unsigned long)p[16 + i]) << (8 * i);
-    /* glibc aarch64: regs[i] @ mcontext+8+i*8; pc @ mcontext+8+31*8+8 = 0x1C0
-     * (mcontext @ 0xB8).  x30=regs[30] @ 0xB8+8+240=0x168. */
+    /* Must be async-signal-safe: no printf/malloc.  Use write+sprintf only.
+     *
+     * NOTE on aarch64 glibc ucontext layout (verified empirically):
+     *   uc_mcontext @ offsetof(ucontext_t, uc_mcontext) = 0xB8 on aarch64 glibc.
+     *   mcontext_t = { unsigned long fault_address; unsigned long regs[31];
+     *                  unsigned long sp; unsigned long pc; unsigned long pstate; }
+     * So:
+     *   fault_address @ mcontext + 0    = ucontext + 0xB8 + 0    = 0xB8
+     *   regs[i]       @ mcontext + 8 + i*8  = ucontext + 0xC0 + i*8
+     *   sp            @ mcontext + 8 + 31*8 = ucontext + 0x1B0
+     *   pc            @ mcontext + 8 + 32*8 = ucontext + 0x1C0
+     *   x29 (fp)      = regs[29] = ucontext + 0xC0 + 29*8 = 0x1A8
+     *   x30 (lr)      = regs[30] = ucontext + 0xC0 + 30*8 = 0x1B8
+     *
+     * Older code read x30 at 0x168 (wrong: that's regs[22]) and pc at 0x1C0
+     * (still correct: pc is @ ucontext + 0x1C0).  Fixed below. */
     unsigned char *u = (unsigned char *)ucontext;
-    unsigned long pc = 0, x30 = 0, x0 = 0;
+    unsigned long far = 0, pc = 0, sp = 0, x29 = 0, x30 = 0;
     if (u) {
-        for (int i = 0; i < 8; i++) pc |= ((unsigned long)u[0x1C0 + i]) << (8 * i);
-        for (int i = 0; i < 8; i++) x30 |= ((unsigned long)u[0x168 + i]) << (8 * i);
-        for (int i = 0; i < 8; i++) x0  |= ((unsigned long)u[0xC0 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) far |= ((unsigned long)u[0xB8 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) pc  |= ((unsigned long)u[0x1C0 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) sp  |= ((unsigned long)u[0x1B0 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) x29 |= ((unsigned long)u[0x1A8 + i]) << (8 * i);
+        for (int i = 0; i < 8; i++) x30 |= ((unsigned long)u[0x1B8 + i]) << (8 * i);
     }
-    char buf[128]; int n = 0;
-    n += sprintf(buf + n, "[loader] CRASH sig=%d addr=0x%lx pc=0x%lx x0=0x%lx x30=0x%lx\n",
-                 sig, addr, pc, x0, x30);
-    write(2, buf, n);
+    /* si_addr in siginfo (overlaps the FAR for SIGSEGV) - useful cross-check.
+     * NOTE: si_addr is a glibc macro - shadow it with our own name. */
+    unsigned char *p = (unsigned char *)info;
+    unsigned long k_si_addr = 0;
+    if (p) for (int i = 0; i < 8; i++) k_si_addr |= ((unsigned long)p[16 + i]) << (8 * i);
+
+    char buf[640]; int n = 0;
+    n += sprintf(buf + n, "[loader] === CRASH sig=%d ===\n", sig);
+    n += sprintf(buf + n, "[loader]   si_addr=0x%lx FAR=0x%lx\n", k_si_addr, far);
+    n += sprintf(buf + n, "[loader]   pc=0x%lx sp=0x%lx fp(x29)=0x%lx lr(x30)=0x%lx\n",
+                 pc, sp, x29, x30);
+
+    /* Find the owner module for `pc` so we can compute fn-relative offsets,
+     * which is what we actually need to map the crash to a function.  Walk our
+     * own loaded modules by scanning /proc/self/maps - cheap and good enough. */
+    int mapsfd = open("/proc/self/maps", O_RDONLY);
+    if (mapsfd >= 0) {
+        char mbuf[8192]; ssize_t mn = 0, r;
+        while ((r = read(mapsfd, mbuf + mn, sizeof mbuf - 1 - mn)) > 0) {
+            mn += r; if (mn >= (ssize_t)sizeof mbuf - 1) break;
+        }
+        close(mapsfd);
+        mbuf[mn] = 0;
+        unsigned long pchi = pc >> 16, pclohi = (pc >> 12);
+        char *line = mbuf;
+        while (line && *line) {
+            char *eol = line; while (*eol && *eol != '\n') eol++;
+            char saved = *eol; *eol = 0;
+            /* format: start-end perms offset dev inode pathname */
+            unsigned long st = 0, en = 0;
+            const char *q = line;
+            while (*q >= '0' && *q <= 'f') { st = st * 16 + (*q <= '9' ? *q - '0' : (*q & 7) + 9); q++; }
+            if (*q == '-') { q++; while (*q >= '0' && *q <= 'f') { en = en * 16 + (*q <= '9' ? *q - '0' : (*q & 7) + 9); q++; } }
+            if (pc >= st && pc < en) {
+                const char *path = q;
+                /* skip to path field */
+                int spc = 0; while (*path && spc < 5) { if (*path == ' ') { while (*path == ' ') path++; spc++; } else path++; }
+                n += sprintf(buf + n, "[loader]   pc in [%#lx..%#lx) %s  (pc-offset=0x%lx)\n",
+                             st, en, path, pc - st);
+                break;
+            }
+            *eol = saved;
+            line = (*eol == '\n') ? eol + 1 : 0;
+        }
+    }
+
+    /* Walk the frame records (x29 chain) - up to 32 frames.
+     * Each frame record is { fp, lr } at x29; lr is the return address. */
+    n += sprintf(buf + n, "[loader] backtrace (x29 chain):\n");
+    unsigned long fp = x29;
+    int frame = 0;
+    while (fp && frame < 32) {
+        unsigned long lr = 0;
+        /* lr is at fp+8.  Read carefully - might fault if the chain is bogus. */
+        int ok = 1;
+        /* Tiny safe read: use a probe via /proc/self/mem so a bad fp doesn't
+         * crash the crash handler. */
+        int memfd = open("/proc/self/mem", O_RDONLY);
+        if (memfd >= 0) {
+            if (lseek(memfd, (off_t)(fp + 8), SEEK_SET) == (off_t)(fp + 8) &&
+                read(memfd, &lr, 8) == 8) {
+                /* ok */
+            } else { ok = 0; }
+            close(memfd);
+        } else { ok = 0; }
+        if (!ok) break;
+        n += sprintf(buf + n, "[loader]   #%d lr=0x%lx (fp=0x%lx)\n", frame, lr, fp);
+        if (lr == 0) break;
+        /* next fp = *fp */
+        unsigned long nextfp = 0;
+        int memfd2 = open("/proc/self/mem", O_RDONLY);
+        if (memfd2 >= 0) {
+            if (lseek(memfd2, (off_t)fp, SEEK_SET) == (off_t)fp &&
+                read(memfd2, &nextfp, 8) != 8) { nextfp = 0; }
+            close(memfd2);
+        }
+        if (nextfp <= fp) break;   /* sanity: chain must grow up */
+        fp = nextfp;
+        frame++;
+    }
+
+    (void)write(2, buf, n);
     _exit(139);
 }
+
+static char kv_altstack_buf[SIGSTKSZ * 4] __attribute__((aligned(16)));
 void kv_install_crash_handler(void) {
+    /* Without an alternate signal stack, a segfault that fires while the
+     * stack pointer is near the stack guard / on a tiny stack cannot deliver
+     * the signal: the kernel tries to push the frame, faults again, and
+     * kills with default SIGSEGV (exit 139) WITHOUT calling the handler.
+     * SA_ONSTACK without an alt stack set has the same effect.  So we MUST
+     * call sigaltstack() first.  This is almost certainly why 0.28 exited
+     * 139 with no crash line in the log. */
+    stack_t ss;
+    ss.ss_sp = kv_altstack_buf;
+    ss.ss_size = sizeof kv_altstack_buf;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, NULL) != 0) {
+        /* Fall back: skip SA_ONSTACK so the handler runs on the current stack. */
+    }
     struct sigaction sa; memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = kv_sighandler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0);
+    sa.sa_sigaction = kv_sighandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    /* Don't block other signals during the handler - we want to die. */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, 0);
+    sigaction(SIGBUS, &sa, 0);
+    sigaction(SIGILL, &sa, 0);
+    sigaction(SIGFPE, &sa, 0);
 }
 
 /* --- bionic-only symbols that glibc lacks but the .so imports.

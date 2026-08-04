@@ -466,6 +466,54 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
+## LATEST STATUS (build 0.29.0-glibc) - Crash handler: alt-stack + backtrace walk
+
+0.28 segfaulted inside the first `nativeRender` and exited 139 with **no crash line in the log**.  Diagnosis of why no crash line: `kv_install_crash_handler` set `sa.sa_flags = SA_SIGINFO | SA_ONSTACK` but never called `sigaltstack()`.  Per `sigaction(2)`:
+
+> If `SA_ONSTACK` is set and no alternate stack is configured, the behavior is implementation-defined; on Linux with no alt stack, a SIGSEGV that the handler can't deliver against the current stack runs the default action instead (exit 139 with no handler invocation).
+
+Most plausible: the segfault site is inside a leaf with very little stack left (or a chicken-and-egg in the GC second-chance stack), the kernel tries to push a signal frame, finds no room and no alt stack, and kills with default SIGSEGV — exactly the silent exit 139 we observe.
+
+Fix in `loader/glibc_shims.c`:
+1. **`sigaltstack()` allocated before `sigaction`.**  `kv_altstack_buf` is a 32 KB static buffer (`SIGSTKSZ * 4`), passed via `stack_t` to `sigaltstack.MasterThesis`. Handler can now run even on a blown stack.
+2. **Backtrace walk added.**  On crash, the handler prints:
+   - `si_addr` + `FAR` (faulting address from mcontext @ ucontext+0xB8)
+   - `pc` (ucontext+0x1C0), `sp` (+0x1B0), `fp`/x29 (+0x1A8), `lr`/x30 (+0x1B8)
+     — note: previous code read x30 at **0x168 (wrong, regs[22])**; mcontext regs[30] is at +0x1B8
+   - The mapping / module the pc lives in (via `/proc/self/maps` parse) AND pc-offset within it — this is what makes the log directly reportable to function symbols in the corresponding lib*.so
+   - A 32-frame x29-chain backtrace, each `{lr, fp}` pair, using `/proc/self/mem` `lseek`+`read` instead of direct deref so a broken fp chain never crashes the handler
+3. **Also catch SIGFPE** in addition to SEGV/BUS/ILL (some Unity aborts come through integer div), and reset-on-deliver (`SA_RESETHAND`) so a recursive fault in the handler kills cleanly.
+4. `sigemptyset(&sa.sa_mask)` so we don't mask other signals during handler.
+
+### Source exploration while planning the fix
+Read `loader/jni_shim.c` 160-380 + `loader/egl_shim.c` symbol map.  Two things noticed that **may or may not be the actual crash cause** — worth keeping in mind for 0.30 once 0.29 reveals the real PC:
+
+- **Two competing `ANativeWindow_*` impls.**  `host_syms.c:209-224` defines stub `ANativeWindow_*` returning `&kv_fbdev_win` (640x480).  `egl_shim.c:418-428` ALSO defines them returning `&g_anw_w` (`egl_shim_screen_w/h()`).  Whichever wins in `resolve()` is what Unity gets.  If the stub wins while the EGL surface layer expects the egl_shim's window handle (or vice versa), `nativeRecreateGfxState` could store a window ptr that the EGL side can't match later.  **Needs `resolve()` order check in `loader_glibc_main.c`** — but only fix if 0.29's crash log points near surface code.
+- `nativeRender` signature: `unsigned char (*render)(void *env, void *thiz)`.  The boot path calls `render(env, thizp)` — only 2 args.  If libunity's `nativeRender` is registered with a sig like `(Lcom/.../UnityPlayer;)V` expecting a different `thiz` layout (e.g. reads `[thiz+0x148]` requiring at least 0x150 writable bytes), the zeroed 0x200 `static unsigned char thiz[0x200]` is sized for that.  Still — if Unity derefs a method pointer pulled from `thiz`'s vtable, the zeroed buffer yields jumps to 0.  Plausible crash mode.
+
+### What to do now
+1. Deploy 0.29 and read the fresh `loader.log`.  Expect:
+   ```
+   [loader] build: 0.29.0-glibc
+   ...
+   [unity] nativeRender loop...
+   [loader] === CRASH sig=11 or sig=10 or sig=8 ===
+   [loader]   si_addr=<addr> FAR=<addr>
+   [loader]   pc=<addr> sp=<addr> fp=<addr> lr=<addr>
+   [loader]   pc in [<range>) <path>  (pc-offset=0x<offset>)
+   [loader] backtrace (x29 chain):
+   [loader]   #0 lr=<addr> (fp=<addr>)
+   ...
+   ```
+2. With the real faulting PC + the module + offset, disassemble that offset in the offending `.so` (`aarch64-linux-gnu-objdump -d libX.so | grep -A5 "^X:<offset>"`) to identify the exact faulting instruction + the surrounding function.  That becomes the 0.30 surgical fix.
+
+### Deploy (unchanged deploy script, version-checked)
+```
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+```
+
+---
+
 ## LATEST STATUS (build 0.28.0-glibc) - Deadlock bypassed, now hitting Segfault (exit 139)
 
 0.28.0 successfully bypassed the `AlertDialog` deadlock! The two fixes were:
