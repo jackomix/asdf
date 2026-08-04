@@ -47,9 +47,27 @@ extern int closedir(DIR *dirp);
 typedef unsigned long kv_pthread_t;   /* matches kv_libc.h */
 struct timespec { long tv_sec; long tv_nsec; };
 
+/* ptrace regs (aarch64 user_regs_struct from <sys/user.h>).  We declare it
+ * by hand so the build needs no header.  Used by the watchdog to dump the PC
+ * + first 16 regs of any thread that's blocked in a syscall - the kernel
+ * per-thread syscall dump tells us WHAT we're waiting on, but not WHERE in
+ * libunity/libil2cpp we called wait. */
+struct user_regs_struct {
+    unsigned long regs[31];   /* x0..x30 */
+    unsigned long sp;
+    unsigned long pc;
+    unsigned long pstate;
+};
+extern long ptrace(long req, long pid, void *addr, void *data);
+#define PTRACE_ATTACH 16
+#define PTRACE_DETACH 17
+#define PTRACE_GETREGSET 0x4204
+struct iovec { void *iov_base; unsigned long iov_len; };
+
+
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.34.0-glibc"
+#define GDS_BUILD_VERSION "0.35.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -478,6 +496,28 @@ static void *kv_watchdog(void *arg) {
                     q = nl + 1; lines++;
                 }
             }
+        }
+        /* Per-thread user-space PC dump via ptrace.  /proc/<tid>/syscall tells
+         * us WHAT we wait on; ptrace gives us WHERE in libunity we called wait.
+         * Attach stops the thread, GETREGSET reads regs, DETACH resumes it.
+         * yama/ptrace_scope < 1 required (we run as the same user - self-attach). */
+        long tid_l = strtol(de->d_name, 0, 10);
+        if (tid_l > 0 && ptrace(PTRACE_ATTACH, tid_l, 0, 0) == 0) {
+            /* PTRACE_ATTACH is async - the kernel sends a SIGSTOP; wait for it. */
+            int status = 0;
+            extern int waitpid(int, int *, int);
+            if (waitpid((int)tid_l, &status, 0) >= 0) {
+                struct user_regs_struct regs; struct iovec iov = { &regs, sizeof regs };
+                if (ptrace(PTRACE_GETREGSET, tid_l, (void *)1 /*NT_PRSTATUS*/, &iov) == 0) {
+                    printf("[watchdog] tid=%s user: pc=%lx lr=%lx sp=%lx\n",
+                           de->d_name, regs.pc, regs.regs[30], regs.sp);
+                    printf("[watchdog] tid=%s        x0=%lx x1=%lx x2=%lx x3=%lx\n",
+                           de->d_name, regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3]);
+                    printf("[watchdog] tid=%s        x19=%lx x20=%lx x21=%lx x22=%lx\n",
+                           de->d_name, regs.regs[19], regs.regs[20], regs.regs[21], regs.regs[22]);
+                }
+            }
+            ptrace(PTRACE_DETACH, tid_l, 0, 0);
         }
     }
     closedir(d);

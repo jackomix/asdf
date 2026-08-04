@@ -466,7 +466,36 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.34.0-glibc) - deadlock reached render loop
+## LATEST STATUS (build 0.35.0-glibc) - ptrace PC dump + persistent deadlock confirmed
+
+0.34 deployed, 3 watchdog dumps captured. Findings:
+
+1. **Deadlock persists across dumps #0..#2** (-12s, -24s, -36s). Process not progressing.
+2. Main thread `tid=14158`:
+   - dumps #0/#1: `state=S` syscall 98 op=`0x189` (`FUTEX_WAIT_BITSET | PRIVATE | CLOCK_REALTIME`) `a4=0x7fca297b58` (FINITE timeout). Our `kv_syscall` 2ms poll-reinject IS active (timeout pointer non-null).
+   - dump #2: `state=R` (RUNNING) but `syscall=98 0x7d1a2c0 0x189` — still parked-on/futex-val but actively scheduled. So poll returns, Unity loops back to futex_wait, infinite loop.
+3. 14 worker threads all parked `op=0x189` infinite (`a4=0x0`) — Unity ThreadPool threads waiting for jobs that never come (main thread holds the work queue). `kv_set_job_workers_zero` never ran (still waiting at f>=30 but renders never complete).
+4. 2 workers on `ppoll` (syscall 73); `tid=14162` on syscall 115 (`clock_nanosleep`); `tid=14199` syscall 63 — at `sigaltstack`.
+5. **`/proc/<tid>/wchan` and `/proc/<tid>/stack` printed ZERO lines** in all 3 dumps — `ark` user has no read perm on those (yama ptrace_scope=1 or similar). Useless for diagnosis.
+
+### 0.35 changes
+
+1. Watchdog now ALSO does `ptrace(PTRACE_ATTACH, tid)` on every thread, then `PTRACE_GETREGSET` (NT_PRSTATUS) → `user_regs_struct`. Prints user-space `pc`, `lr`, `sp`, `x0..x3`, `x19..x22` per thread.
+
+   `PTRACE_ATTACH` from same-process sibling thread should work even under yama=1 (self-attach). `pc` will be inside libunity.so where the `pthread_cond_wait`/`sem_wait`/`futex` syscall was issued. We can disasm that page to identify the calling function name (via `objdump -T` symbol offsets) and proceed with a targeted GOT/call intercept.
+
+2. Bumped version → 0.35.0-glibc.
+
+### Expected 0.35 output
+
+Each watchdog dump (~12s after render loop starts) will print per-thread:
+```
+[watchdog] tid=14158 user: pc=0x20234XXXX lr=0x20243YYYY sp=0x7fca297b58
+[watchdog] tid=14158        x0=... x1=... x2=... x3=...
+```
+`pc` will fall in libunity (`0x20222f000..0x203269000`) or libil2cpp (`0x200000000..0x20221f000`). Cross-reference with `aarch64-elf-objdump -T libunity.so` dynamic symbol table + `objdump -d` disasm to find the function the main thread is parked inside (most likely `pthread_cond_wait` or `std::condition_variable::wait` inside Unity's `JobSystem::Exec` waiting for the worker queue signal).
+
+Once identified, next version intercepts that function in `bionic_bridge.c` route table OR patches the GOT slot in libunity.
 
 0.33 fix worked: `nativeRender` now enters (jobfix no longer pre-probe kills it).  Log shows the player loop STARTED:
 ```
