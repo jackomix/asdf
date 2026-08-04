@@ -424,7 +424,25 @@ dialog build happens inside that first nativeRender.
   device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
   solve these exact problems.
 
-## LATEST STATUS (build 0.24.0-glibc) - 1-CPU shim v2: + /proc/cpuinfo + /sys/cpu
+## LATEST STATUS (build 0.25.0-glibc) - 1-CPU shim v3: + opendir/readdir /sys/cpu
+
+Three external models reviewed 0.24's dump.  Decisive findings (cross-checked
+against nm imports):
+- libil2cpp.so AND libunity.so both import **opendir + readdir** (verified).  This
+  is the missing CPU-count path: Unity scans /sys/devices/system/cpu/cpu*/ as a
+  DIRECTORY to count cores.  My kv_open prefix interception never sees opendir.
+- libs do NOT import openat (Claude's theory doesn't hold) or get_nprocs.
+- Main thread tid 1211 now has a non-null timeout (polling works); workers
+  (1218-1255) still futex-wait with NULL timeout = infinite waits not in poll shim.
+- 1-CPU shims (sched_getaffinity/sysconf/cpuinfo/sys files) all fire but workers
+  still get created -> the directory-scan path is the remaining leak.
+
+Fix (0.25.0): add opendir/readdir/closedir interception to fs_redirect.c.
+opendir("/sys/devices/system/cpu*") returns a fake DIR containing only "cpu0";
+readdir/closedir on it are handled.  Combined with all prior shims, Unity should
+now see 1 CPU from EVERY source -> 0 job workers -> jobs run inline.
+
+### Prior: 0.24.0 - 1-CPU shim v2: + /proc/cpuinfo + /sys/cpu
 
 0.23's dump: main thread tid 9866 now shows `syscall: running` (SPINNING - my
 polling shim works), but the worker pool STILL exists (~10 threads, 9888-9892,

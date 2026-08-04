@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <sys/types.h>
 
@@ -76,6 +77,9 @@ static int (*r_lstat)(const char *, struct stat *);
 static int (*r_lstat64)(const char *, struct stat *);
 static int (*r_access)(const char *, int);
 static int (*r_fstat)(int, struct stat *);
+static DIR *(*r_opendir)(const char *);
+static struct dirent *(*r_readdir)(DIR *);
+static int (*r_closedir)(DIR *);
 static void fs_load_real(void) {
     if (g_inited && r_open) return;
     r_open   = (int (*)(const char *, int, ...))dlsym(RTLD_DEFAULT, "open");
@@ -87,11 +91,51 @@ static void fs_load_real(void) {
     r_lstat64= (int (*)(const char *, struct stat *))dlsym(RTLD_DEFAULT, "lstat64");
     r_access = (int (*)(const char *, int))dlsym(RTLD_DEFAULT, "access");
     r_fstat  = (int (*)(int, struct stat *))dlsym(RTLD_DEFAULT, "fstat");
+    r_opendir= (DIR *(*)(const char *))dlsym(RTLD_DEFAULT, "opendir");
+    r_readdir= (struct dirent *(*)(DIR *))dlsym(RTLD_DEFAULT, "readdir");
+    r_closedir=(int (*)(DIR *))dlsym(RTLD_DEFAULT, "closedir");
     if (!r_open) r_open = r_open64;
     if (!r_stat) r_stat = r_stat64;
     if (!r_lstat) r_lstat = r_lstat64;
     if (!r_fopen) r_fopen = (FILE *(*)(const char *, const char *))dlsym(RTLD_DEFAULT, "fopen64");
     g_inited = 1;
+}
+
+/* ---- fake /sys/devices/system/cpu/ directory: only "cpu0" ----
+ * Unity sizes its job-worker pool by scanning the /sys/devices/system/cpu/
+ * cpu* directories via opendir/readdir (not just reading the online/present
+ * files that kv_open already intercepts).  We return a fake dir containing a
+ * single "cpu0" entry -> 1 CPU -> 0 job workers -> jobs run inline. */
+struct kv_fake_dir { int active; int n; };
+static struct kv_fake_dir g_fake_cpudir;
+static int is_cpu_dir(const char *p) {
+    return p && (strstr(p, "/sys/devices/system/cpu") != NULL);
+}
+static DIR *kv_opendir(const char *p) {
+    fs_load_real();
+    if (is_cpu_dir(p)) {
+        g_fake_cpudir.active = 1; g_fake_cpudir.n = 0;
+        printf("[fs] injected opendir /sys/devices/system/cpu (1 CPU)\n");
+        return (DIR *)&g_fake_cpudir;
+    }
+    return r_opendir ? r_opendir(p) : NULL;
+}
+static struct dirent *kv_readdir(DIR *dir) {
+    fs_load_real();
+    if (dir == (DIR *)&g_fake_cpudir) {
+        static struct dirent de;
+        if (g_fake_cpudir.n++ == 0) {
+            memset(&de, 0, sizeof de);
+            strcpy(de.d_name, "cpu0");
+            return &de;
+        }
+        return NULL;
+    }
+    return r_readdir ? r_readdir(dir) : NULL;
+}
+static int kv_closedir(DIR *dir) {
+    if (dir == (DIR *)&g_fake_cpudir) { g_fake_cpudir.active = 0; return 0; }
+    return r_closedir ? r_closedir(dir) : 0;
 }
 
 /* ---- command-line injection: force single-threaded rendering ---- */
@@ -220,6 +264,9 @@ void *kv_fs_route(const char *name) {
         {"stat", kv_stat}, {"stat64", kv_stat},
         {"lstat", kv_lstat}, {"lstat64", kv_lstat},
         {"access", kv_access},
+        {"opendir", kv_opendir}, {"opendir64", kv_opendir},
+        {"readdir", kv_readdir}, {"readdir64", kv_readdir},
+        {"closedir", kv_closedir},
         {0, 0}
     };
     for (int i = 0; m[i].n; i++) if (strcmp(m[i].n, name) == 0) return m[i].f;
