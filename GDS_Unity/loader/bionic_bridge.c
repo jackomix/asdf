@@ -293,7 +293,8 @@ int kv_pthread_detach(pthread_t t) { return pthread_detach(t); }
 int kv_pthread_join(pthread_t t, void **r) { return pthread_join(t, r); }
 pthread_t kv_pthread_self(void) { return pthread_self(); }
 int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), void *arg) {
-  static int n; if (++n <= 30) printf("[kv_pthread_create] n=%d start=%p arg=%p\n", n, (void*)start, (void*)arg);
+  static int n; long tid = syscall(178);
+  if (++n <= 30) printf("[kv_pthread_create] n=%d tid=%ld start=%p arg=%p\n", n, tid, (void*)start, (void*)arg);
   (void)attr; return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }
@@ -347,6 +348,10 @@ static long kv_syscall(long n, long a1, long a2, long a3, long a4, long a5, long
     static int once; if (!once && (once = 1))
         printf("[kv_syscall] routed! n=%ld tid=%ld\n", n, (long)syscall(178));
     static int clone_n; if (n == 220 /*SYS_clone*/) { if (++clone_n <= 30) printf("[kv_syscall] SYS_clone #%d flags=%lx parent=%ld\n", clone_n, (unsigned long)a1, (long)syscall(178)); }
+    if (n == 221 /*SYS_clone3*/ && (++once, 1)) {
+        static int cl3; if (++cl3 <= 30) printf("[kv_syscall] SYS_clone3 args=%lx pidtid=%p parent=%ld\n", (unsigned long)a1, (void*)a2, (long)syscall(178));
+    }
+    if (n == 56 /*SYS_openat*/) printf("[kv_syscall] SYS_openat dirfd=%ld path=%s tid=%ld\n", a1, (char*)a2, (long)syscall(178));
     /* force 1 CPU at the syscall level (job workers = num_cpus - 1) */
     if (n == SYS_sched_getaffinity && a3) {
         long r = syscall(n, a1, a2, a3, a4, a5, a6);

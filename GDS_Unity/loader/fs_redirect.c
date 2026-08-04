@@ -195,12 +195,13 @@ int kv_open(const char *p, int flags, ...) {
     fs_load_real();
     if (!r_open) return -1;
     if (p && (strstr(p, "cpuinfo") || strstr(p, "cpu/") || strstr(p, "cpu_") || strstr(p, "/sys/devices/system/cpu") || strstr(p, "/proc/stat") || strstr(p, "thermal") || strstr(p, "cpufreq") || strstr(p, "topology"))) {
-        printf("[fs] open %s\n", p);
+        printf("[fs] open(%s)\n", p);
     }
     if (p) {
         if (strstr(p, "cmdline")) { int fd = kv_cmdline_fd(); if (fd >= 0) return fd; }
         if (strstr(p, "cpuinfo")) { int fd = kv_cpuinfo_fd(); if (fd >= 0) return fd; }
         if (strstr(p, "/sys/devices/system/cpu/")) { int fd = kv_sys_cpu_fd(); if (fd >= 0) return fd; }
+        if (strstr(p, "/sys/devices/system/cpu")) { int fd = kv_sys_cpu_fd(); if (fd >= 0) return fd; }
     }
     va_list ap; va_start(ap, flags);
     mode_t mode = va_arg(ap, mode_t);
