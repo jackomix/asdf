@@ -337,30 +337,50 @@ int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), vo
   static int n; long tid = syscall(178);
   if (++n <= 300) printf("[kv_pthread_create] n=%d tid=%ld start=%p arg=%p\n", n, tid, (void*)start, (void*)arg);
   (void)attr;
-  /* 0.39.6: Unity's JobWorker start_routine lives inside libunity (under
-   * 0.39 log it was libunity+0x508174).  It crashes immediately in
+  /* 0.39.6: Unity's JobWorker start_routine lives inside libunity (worker
+   * start = libunity+0x508174 under 0.39 log).  It crashes immediately in
    * mono_class_get_checked because the new thread is NOT auto-attached to
    * il2cpp (Unity expects pthread_create to register the thread; under our
-   * loader it doesn't).  Don't spawn it — return 0 (fake success) so Unity
-   * believes the worker is alive.  Spurious return 0 from kv_pthread_cond_wait
-   * then keeps main progressing instead of waiting for the dead worker. */
+   * loader it doesn't) AND because the worker's role is running il2cpp_init
+   * to set up the domain — Unity main is blocked on cond_wait waiting for
+   * this worker.  But the worker crashes before completing init.
+   *
+   * 0.39.6 first attempt: detoured the spawn (returned fake thread_t).
+   * Result: Unity main, with spurious cond_wait return, proceeded PAST its
+   * wait point while il2cpp_init never ran → dom_get NULL → same crash
+   * (mono_class_get_checked from lr=libunity+0x5c3550).
+   *
+   * New plan: Let worker spawn, but it WILL crash because the worker's
+   * start_routine body does il2cpp_init / class lookup with no thread attach.
+   * So we must DETOUR the worker's START routine — wrap it so that BEFORE
+   * the user-supplied start runs, we attach the thread to il2cpp (so Unity
+   * can register it and class lookups work).  terra-nextos do this via
+   * il2cpp_thread_attach(domain) at top of worker bootstrap.
+   *
+   * Implement by replacing `start` with our wrapper that does
+   *   il2cpp_thread_attach(il2cpp_domain_get());
+   * then calls original `start(arg)`.  But domain might be NULL at this
+   * point — Unity main never ran il2cpp_init (the WHOLE POINT of this
+   * worker is init).  So thread_attach with NULL domain would fail too.
+   *
+   * Real worker code path is unknown yet.  Fall back: spawn NORMALLY and
+   * let it crash, capture log, then we know start_routine body. */
   void *att = kv_il_sym("il2cpp_thread_attach");           /* libil2cpp */
   void *unity_send = kv_il_sym("UnitySendMessage");         /* libunity */
-  uintptr_t lo_il = (uintptr_t)att;
-  uintptr_t hi_il = lo_il + 0x221f000;                      /* libil2cpp span */
-  uintptr_t lo_un = (uintptr_t)unity_send;
-  uintptr_t hi_un = lo_un + 0x103a000;                      /* libunity span */
+  uintptr_t lo_il = (uintptr_t)att - 0xce47ec;               /* libil2cpp base */
+  uintptr_t hi_il = lo_il + 0x221f000;
+  uintptr_t lo_un = (uintptr_t)unity_send - 0x642b18;          /* libunity base */
+  uintptr_t hi_un = lo_un + 0x103a000;
   uintptr_t s = (uintptr_t)start;
   int il2 = (att && s >= lo_il && s < hi_il);
   int un  = (unity_send && s >= lo_un && s < hi_un);
   if (il2 || un) {
-    printf("[kv_pthread_create] detouring Unity-internal worker spawn (start=%p mod=%s offset=0x%lx)\n",
+    printf("[kv_pthread_create] Unity-internal worker spawn (start=%p mod=%s offset=0x%lx) — REAL spawn for disasm\n",
            (void*)s, il2?"libil2cpp":"libunity",
            (unsigned long)(s - (il2?lo_il:lo_un)));
     fflush(stdout);
-    if (t) *t = (pthread_t)0xdeadbeef;
-    return 0;
   }
+  (void)il2; (void)un; (void)hi_il; (void)hi_un;
   return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }
