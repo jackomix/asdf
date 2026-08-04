@@ -342,7 +342,98 @@ natively and correctly.
   `git fetch origin '+refs/heads/*:refs/remotes/origin/*'` then
   `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`.
 
-## LATEST STATUS (build 0.15.0-glibc) - inject -force-gfx-direct (single-threaded rendering)
+## CURRENT BLOCKER — CONSULT THIS FIRST
+
+**The game boots into the player loop but never renders.**  We're handing this to
+another model for fresh insight, so here is the complete, current picture.
+
+### What WORKS (verified on-device, build 0.15.0-glibc)
+- All 3 libs (libil2cpp.so + libunity.so + libmain.so) load, relocate, run
+  init_array (24 + 426 + ctors).
+- All 3 JNI_OnLoads fire, return JNI_VERSION_1_6.
+- A real **SDL2 KMSDRM window + GLES2 context** is created with the **real Mali
+  GPU driver**:
+  ```
+  [egl] SDL video driver = KMSDRM
+  [egl] GL_VENDOR=ARM
+  [egl] GL_RENDERER=Mali-G31
+  [egl] GL_VERSION=OpenGL ES-CM 1.1 ...
+  [egl] window 640x480 context ready (ES2)
+  ```
+  (The 4 `Can't window GBM/EGL surfaces` lines are the first 4 format attempts
+  failing; the 5th format `{0,0,0}` SUCCEEDS — window + context exist.)
+- initJni OK, nativeRecreateGfxState OK, then `nativeRender loop...` begins and
+  runs a long sequence of JNI calls (hundreds of FindClass/GetMethodID for
+  Android classes: Context, PackageManager, AssetManager, SharedPreferences,
+  Looper/Handler, PlayAssetDelivery, ...) — the game IS executing its boot.
+
+### What's WRONG (the blocker)
+- The log ends right after Unity queries `android/app/AlertDialog$Builder` +
+  `GetMethodID(setTitle)` + `GetMethodID(setMessage)`.  Unity is building an
+  **AlertDialog** and then **hangs forever inside the first nativeRender call**.
+- **Zero EGL calls** from Unity: the `[egl] CALLS ...` counters (GetDisplay/
+  Initialize/ChooseConfig/CreateContext/MakeCurrent/SwapBuffers) NEVER appear.
+  So Unity builds the dialog BEFORE it ever calls our EGL shim / GL.
+- **nativeRender frame liveness never prints** (not even `frame 1 alive`), i.e.
+  the FIRST `render()` call doesn't return — it blocks inside.
+- Screen stays black.  It never gets to present.
+
+### What we've already tried (each did NOT change the log — it stays byte-identical)
+- **0.13 statfs shim** — made `statfs`/`statfs64` report 1 TiB free.  libunity
+  contains "Not enough storage space to install required resources." (vaddr
+  0xbdbe5).  No change.
+- **0.14 fs-redirect** — intercepted open/fopen/stat/lstat/access to rewrite
+  `assets/bin/Data/...` paths onto the local `data/` dir.  No change (so Unity's
+  data reads go through the JNI AssetManager shim, which already works).
+- **0.15 cmdline inject** — injected `-force-gfx-direct -force-gles20` into
+  `/proc/self/cmdline` (Terraria's trick to force single-threaded rendering).
+  No change.
+- **0.16 JNI dialog trace** — added logging to Call* so the next log shows
+  exactly what Unity does after setMessage (setPositiveButton/show/findLibrary)
+  and returns the builder for AlertDialog.Builder chained setters.  Deploy
+  pending.
+
+### KEY HYPOTHESIS (unconfirmed)
+The JNI calls right before the dialog include: `getPackageInfo`, `getPackageName`,
+`findLibrary`, `PlayAssetDeliveryUnityWrapper.init`, `getAssetPackState`,
+`getObbDirs`.  These smell like an **app-install / Play Asset Delivery / asset-pack
+verification** check (not the storage-space check).  Unity verifies the game is a
+"properly installed" Android app; finding none, it builds an AlertDialog and waits
+on a **Java button callback** (setPositiveButton/OnClickListener) that our JNI
+shim never invokes → deadlock.  The fix is likely: make the JNI shim return
+"installed/verified OK" so no dialog is built, OR auto-fire the dialog's positive
+button when it's shown.
+
+The 0.16 trace (once deployed) will show the exact dialog-method sequence and
+which check triggers it.
+
+### The boot sequence our loader drives (loader_glibc_main.c kv_unity_boot)
+egl_shim_create_window(); egl_shim_ensure_current(); → initJni(env,thiz,ctx) →
+nativeRecreateGfxState(env,thiz,0,surf) x2 → nativeSendSurfaceChangedEvent →
+nativeResume → nativeFocusChanged(1) → **loop nativeRender(env,thiz)**.  The
+dialog build happens inside that first nativeRender.
+
+### How to reproduce / iterate
+- Deploy: `curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20`
+- Read `gamedevstory/gamedevstory/loader.log` (fresh each run now).
+- Key files: `loader/loader_glibc_main.c` (boot), `loader/egl_shim.c` (EGL/GL),
+  `loader/jni_shim.c` (JNI shim — the dialog is built through here),
+  `loader/fs_redirect.c` (open/fopen redirect + cmdline inject),
+  `loader/bionic_bridge.c` (pthread/signal/statfs), `loader/glibc_shims.c`.
+- Reference: `NextOs-Ports/terraria-nextos` runs a full Unity game on this exact
+  device; its `src/main.c` + `src/bionic_shims.c` + `src/pthread_fake.c` + `src/jni_shim.c`
+  solve these exact problems.
+
+## LATEST STATUS (build 0.16.0-glibc) - trace the dialog flow
+
+0.13/0.14/0.15 (statfs, fs-redirect, cmdline-inject) each left the log byte-identical:
+Unity builds an AlertDialog inside the first nativeRender and never reaches GL (zero
+EGL calls).  See the CURRENT BLOCKER section at top for the full picture and the
+unconfirmed app-install/PlayAssetDelivery hypothesis.  0.16 adds JNI Call* tracing so
+the next log shows exactly what Unity does after setMessage and what check triggers the
+dialog, enabling a surgical fix instead of guessing.
+
+### Prior: 0.15.0 - inject -force-gfx-direct (single-threaded rendering)
 
 0.14.0 fs-redirect didn't change the log (identical, still stuck at AlertDialog,
 zero EGL calls).  So Unity's data reads are going through the JNI AssetManager
