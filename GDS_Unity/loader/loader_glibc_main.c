@@ -49,7 +49,7 @@ struct timespec { long tv_sec; long tv_nsec; };
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.33.0-glibc"
+#define GDS_BUILD_VERSION "0.34.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -420,9 +420,10 @@ int egl_shim_ensure_current(void);
  * wchan, so we can see exactly where the process is stuck. */
 static void *kv_watchdog(void *arg) {
     (void)arg;
-    struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
-    nanosleep(&ts, 0);
-    printf("[watchdog] === thread dump (blocked syscalls) ===\n");
+    for (int dump = 0; dump < 5; dump++) {
+        struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
+        nanosleep(&ts, 0);
+        printf("[watchdog] === thread dump #%d (blocked syscalls + wchan + kstack) ===\n", dump);
     DIR *d = opendir("/proc/self/task");
     if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
     struct dirent *de;
@@ -450,9 +451,38 @@ static void *kv_watchdog(void *arg) {
             close(fd);
             if (n > 0) { buf[n] = 0; printf("[watchdog] tid=%s syscall: %s", de->d_name, buf); }
         }
+        /* wchan: kernel wait site name (e.g. "futex_wait_queue_me"). */
+        snprintf(p, sizeof p, "/proc/self/task/%s/wchan", de->d_name);
+        fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) { buf[n] = 0; if (buf[n-1] == '\n') buf[n-1] = 0; printf(" wchan=%s\n", buf); }
+            else printf(" wchan=?\n");
+        }
+        /* kernel stack: shows the call chain inside the kernel (must be root
+         * or have /proc/sys/kernel/yama/ptrace_scope <= 1; on darkOSre R36S the
+         * ark user typically has it).  Truncated to 4 lines to bound log. */
+        snprintf(p, sizeof p, "/proc/self/task/%s/stack", de->d_name);
+        fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = 0;
+                int lines = 0;
+                char *q = buf, *nl;
+                while (lines < 5 && q && *q && (nl = strchr(q, '\n'))) {
+                    *nl = 0;
+                    printf("[watchdog] tid=%s kstack: %s\n", de->d_name, q);
+                    q = nl + 1; lines++;
+                }
+            }
+        }
     }
     closedir(d);
-    printf("[watchdog] === end dump ===\n");
+    printf("[watchdog] === end dump #%d ===\n", dump);
+    }
     return 0;
 }
 static void kv_start_watchdog(void) {

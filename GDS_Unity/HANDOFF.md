@@ -466,7 +466,41 @@ dialog build happens inside that first nativeRender.
   and `NextOs-Ports/horizonchase-nextos` (raw-futex `syscall` intercept, GC
   stop-the-world, job-inline).  Mine them before reinventing any mechanism.
 
-## LATEST STATUS (build 0.33.0-glibc) - jobfix crash root cause
+## LATEST STATUS (build 0.34.0-glibc) - deadlock reached render loop
+
+0.33 fix worked: `nativeRender` now enters (jobfix no longer pre-probe kills it).  Log shows the player loop STARTED:
+```
+[unity] nativeRender loop...
+[fs] injected /proc/cpuinfo (1 CPU) * 4
+[jni] FindClass(android/os/Process)
+[jni] GetMethodID(setThreadPriority, (II)V)
+[kv_syscall] SYS_futex tid=12025 op=0 a4=0x7f5e7ce6d0
+... (many getSystemService / AudioFocus / ArCore / PlayAssetDelivery / SharedPreferences / AlertDialog.Builder / Handler / ...)
+[jni] GetMethodID(setMessage, (...))
+[watchdog] === thread dump (blocked syscalls) ===
+[watchdog] tid=11980 state=S  <- MAIN thread, blocked!
+[watchdog] tid=11980 syscall: 98 0x1cb24240 0x189 0x0 0x7fdbff9bd8 ...
+```
+
+**Main thread blocks on futex** (syscall 98, op `0x189` = `FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`, `a4=0x0` infinite timeout). Our `kv_syscall` rewrites infinite futex waits to 2ms poll, so the wait returns regularly — but Unity immediately re-waits and never makes progress into the next frame.
+
+14 extra worker threads spawned (Unity threadpool — all waiting `0x189`). `tid=12024 state=R` on syscall 63 (`sigaltstack`?); two workers on syscall 73 (`ppoll`). So we have:
+- 1 blocked main + 14 blocked workers = entire process frozen IN the first `nativeRender` call.
+- `tid=12025 op=0 a4=0x7f5e7ce6d0` prints from our `kv_syscall` log; that's one of the polling futexes, suggests our poll-inject flows.
+
+The log CUT OFF at `[jni] GetMethodID(setMessage, ...)` — that's just where Unity happened to be when the watchdog fired (after 12s). Not the actual block site.
+
+### What 0.34 does
+
+1. Less verbose SDL window-format probing — only prints which format won, not the SDL "Can't window GBM/EGL surfaces on window creation" warning (which is SDL's own KMSDRM log, not ours to suppress).
+2. Watchdog now loops 5 dumps at 12s intervals (so we see if the deadlock PERSISTS or just stalls briefly). Each dump includes per-thread `/proc/<tid>/wchan` (kernel wait site name e.g. `futex_wait_queue_me`) and `/proc/<tid>/stack` (kernel call chain) — that reveals which kernel primitive holds the wait, narrowing the lock site.
+3. Bumped version → 0.34.0-glibc.
+
+### Next
+
+Deploy 0.34, capture `loader.log` with all 5 watchdog dumps. With per-thread `wchan` + kernel `stack` we'll know exactly which futex (REALTIME CLOCK vs MONOTONIC, private vs shared) the thread is parked on, and can either:
+- hook the underlying libc primitive (pthread_cond_wait uses CLOCK_REALTIME under futex 0x189? check),
+- or dump user-space PC via `ptrace(PTRACE_ATTACH, tid)` to disasm where in libunity/libil2cpp the wait call originates.
 
 0.32 deployed the `ucontext_t` struct-access crash handler. **It worked perfectly**:
 

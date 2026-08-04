@@ -179,12 +179,12 @@ void egl_shim_create_window(void) {
     egl_window = S.CreateWindow("Game Dev Story", SDL_WINDOWPOS_CENTERED,
                                 SDL_WINDOWPOS_CENTERED, width, height,
                                 SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
-    if (!egl_window) { printf("[egl] SDL_CreateWindow a%d d%d s%d: %s\n",
-                              fmts[f][0], fmts[f][1], fmts[f][2], S.GetError()); continue; }
+    if (!egl_window) { printf("[egl] fmt %zu (a%d d%d s%d) failed\n",
+                              f, fmts[f][0], fmts[f][1], fmts[f][2]); continue; }
     egl_share_root = S.GL_CreateContext(egl_window);
     if (!egl_share_root) {
-      printf("[egl] SDL_GL_CreateContext a%d d%d s%d: %s\n",
-             fmts[f][0], fmts[f][1], fmts[f][2], S.GetError());
+      printf("[egl] ctx fmt %zu (a%d d%d s%d) failed: %s\n",
+             f, fmts[f][0], fmts[f][1], fmts[f][2], S.GetError());
       S.DestroyWindow(egl_window); egl_window = NULL;
     }
     if (egl_share_root) { g_alpha_size = fmts[f][0]; g_depth_size = fmts[f][1]; g_stencil_size = fmts[f][2]; }
