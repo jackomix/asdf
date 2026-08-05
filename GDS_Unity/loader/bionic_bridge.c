@@ -347,18 +347,22 @@ static void *kv_worker_wrapper(void *ctxv) {
   fflush(stdout);
   void *(*att)(void *) = (void *(*)(void *))kv_il_sym("il2cpp_thread_attach");
   void *(*dom)(void)   = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
-  if (att) {
-    void *d = dom ? dom() : 0;
-    if (!d) {
-      printf("[kv_worker] dom_get NULL before launch — passing NULL to thread_attach (will auto-create)\n");
-      fflush(stdout);
-      att(0);
-    } else {
-      printf("[kv_worker] attaching to existing domain %p\n", d);
-      fflush(stdout);
+  /* 0.39.9: il2cpp_thread_attach aborts with "Threads explicit registering is
+   * not previously enabled" because il2cpp guards attach behind an internal
+   * explicit-registration flag. mono_thread_attach (lower-level Mono API)
+   * bypasses that gate. Use mono_thread_attach exclusively. */
+  void *(*mono_att)(void *) = (void *(*)(void *))kv_il_sym("mono_thread_attach");
+  if (mono_att) {
+    printf("[kv_worker] calling mono_thread_attach(0)\n"); fflush(stdout);
+    void *t = mono_att(0);
+    printf("[kv_worker] mono_thread_attach returned %p\n", t); fflush(stdout);
+  } else {
+    printf("[kv_worker] mono_thread_attach NOT found - falling back to il2cpp_thread_attach\n"); fflush(stdout);
+    if (att) {
+      void *d = dom ? dom() : 0;
       att(d);
+      printf("[kv_worker] il2cpp_thread_attach returned\n"); fflush(stdout);
     }
-    printf("[kv_worker] attach returned\n"); fflush(stdout);
   }
   printf("[kv_worker] dispatching orig_start\n"); fflush(stdout);
   void *(*s)(void *) = ctx->orig_start; void *a = ctx->orig_arg;
