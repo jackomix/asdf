@@ -342,13 +342,17 @@ pthread_t kv_pthread_self(void) { return pthread_self(); }
 struct kv_worker_ctx { void *(*orig_start)(void *); void *orig_arg; };
 static void *kv_worker_wrapper(void *ctxv) {
   struct kv_worker_ctx *ctx = (struct kv_worker_ctx *)ctxv;
+  printf("[kv_worker] wrapper entered tid=%ld orig_start=%p arg=%p\n",
+         (long)syscall(178), (void*)ctx->orig_start, (void*)ctx->orig_arg);
+  fflush(stdout);
   void *(*att)(void *) = (void *(*)(void *))kv_il_sym("il2cpp_thread_attach");
   void *(*dom)(void)   = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
-  if (att && dom) {
+  if (0 && att && dom) {
     void *d = dom();
     if (d) { att(d); printf("[kv_worker] attached new thread to domain %p\n", d); fflush(stdout); }
     else   { printf("[kv_worker] dom_get(NULL) - cannot attach new thread\n"); fflush(stdout); }
   }
+  printf("[kv_worker] dispatching orig_start\n"); fflush(stdout);
   void *(*s)(void *) = ctx->orig_start; void *a = ctx->orig_arg;
   free(ctx);
   return s(a);
