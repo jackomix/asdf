@@ -347,23 +347,24 @@ static void *kv_worker_wrapper(void *ctxv) {
   fflush(stdout);
   void *(*att)(void *) = (void *(*)(void *))kv_il_sym("il2cpp_thread_attach");
   void *(*dom)(void)   = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
+  (void)att; (void)dom;
+  /* 0.39.10: ABORTED il2cpp_thread_attach / mono_thread_attach attempt —
+   * both trip Unity's internal "Threads explicit registering is not
+   * previously enabled" assertion because bionic's pthread_create hook
+   * (which on Android+Unity registers a thread before its start_routine runs)
+   * is not reproduced under glibc. Enabling explicit registration requires
+   * running through Unity's own internal il2cpp_init phase that occurs
+   * AFTER the worker has finished its own thread setup — a chicken-and-egg
+   * problem. Next session: inspect Unity's exact pthread_atfork or
+   * init_array ordering in libil2cpp's .init to find the implicit
+   * "register-main-thread" call site, then replicate it before spawn. */
   /* 0.39.9: il2cpp_thread_attach aborts with "Threads explicit registering is
    * not previously enabled" because il2cpp guards attach behind an internal
    * explicit-registration flag. mono_thread_attach (lower-level Mono API)
    * bypasses that gate. Use mono_thread_attach exclusively. */
   void *(*mono_att)(void *) = (void *(*)(void *))kv_il_sym("mono_thread_attach");
-  if (mono_att) {
-    printf("[kv_worker] calling mono_thread_attach(0)\n"); fflush(stdout);
-    void *t = mono_att(0);
-    printf("[kv_worker] mono_thread_attach returned %p\n", t); fflush(stdout);
-  } else {
-    printf("[kv_worker] mono_thread_attach NOT found - falling back to il2cpp_thread_attach\n"); fflush(stdout);
-    if (att) {
-      void *d = dom ? dom() : 0;
-      att(d);
-      printf("[kv_worker] il2cpp_thread_attach returned\n"); fflush(stdout);
-    }
-  }
+  (void)mono_att;  /* not used after abort discovered; left for future */
+  printf("[kv_worker] dispatching orig_start (no attach attempted - aborts Unity)\n"); fflush(stdout);
   printf("[kv_worker] dispatching orig_start\n"); fflush(stdout);
   void *(*s)(void *) = ctx->orig_start; void *a = ctx->orig_arg;
   free(ctx);
