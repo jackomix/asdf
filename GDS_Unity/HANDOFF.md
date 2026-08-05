@@ -1768,3 +1768,38 @@ deadlock the reference ports solve via 0 workers (jobs run inline):
 not fully resolve the post-boot job hang; if the hang persists, the next lever is forcing the
 job-worker-count global to 0 (its source is behind a pointer table, hard to trace statically)
 or patching the JobQueue to run jobs inline.
+
+---
+
+## 0.50.3-glibc — REFERENCE PORT: real cond/sem semantics + bionic log/sysprop
+
+### SIGUSR1 confirmed the exact hang site
+Main's PC dump showed backtrace `#1 lr=0x2005c3550` = libunity+0x5c3550, which is
+the wait loop INSIDE the JobWorker-spawn function (0x5c3490) after pthread_create:
+main spawns a worker and spins on [x20+0x20] (ready flag) while the worker futex-waits.
+
+### Root cause (reference comparison)
+Our main-thread `kv_pthread_cond_wait` returned 0 IMMEDIATELY **without releasing the
+mutex**.  So main held the lock while spinning at 0x5c3550, the JobWorker could never
+acquire it to set the ready flag, and the worker starved forever -> permanent hang.
+The reference (hitmango b_cond_wait) does a REAL `pthread_cond_timedwait` with a short
+ceiling for ALL threads, which releases the mutex during the wait so the worker proceeds.
+
+### What 0.50.3 ports (matching hitmango/oceanhorn's foundational layer)
+1. **kv_pthread_cond_wait** -> real 50ms `pthread_cond_timedwait` (hitmango b_cond_wait).
+   Releases the mutex during wait; timeout = harmless spurious wakeup the while() re-checks.
+2. **kv_pthread_cond_timedwait** -> honors the caller deadline (no main-thread short-circuit).
+3. **kv_sem_wait** -> real blocking `sem_wait` retried on EINTR (hitmango b_sem_wait),
+   instead of the old EAGAIN-on-timeout poll.
+4. **Removed** the "jobfix" calls (set_JobWorkerCount(0)) from kv_syscall/cond paths —
+   a no-op for GDS (no such setter) that did heavy re-entrant il2cpp reflection.
+5. **Real bionic log + system-property shims** (ported from hitmango bionic.c): __android_log_*
+   mirror to stderr; __system_property_* return a plausible Pixel-6 table (ro.opengles.version
+   =196608, ro.build.version.sdk=31, etc) so Unity picks correct quality tiers instead of low-end
+   fallbacks.
+
+### Why not the rest of the reference yet
+audio/input/gamepad/keyboard/render-scale are game-specific and not the blocker; porting them
+before the game renders is premature. dl_iterate_phdr needs phdr storage in our Module and risks
+the working boot — deferred.  The verified blocker (worker handshake) is addressed by the
+cond/sem port.

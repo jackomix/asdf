@@ -330,13 +330,78 @@ void kv_engine_exit(int code) {
 }
 
 /* --- bionic-only symbols that glibc lacks but the .so imports.
- * Exported (non-static) so dlsym(RTLD_DEFAULT, ...) finds them. --- */
-int __system_property_get(const char *name, char *value) { (void)name; if (value) value[0]=0; return 0; }
-void __system_property_find(void) {}
-int __system_property_read(void *e, char *n, char *v) { (void)e;(void)n; if (v) v[0]=0; return 0; }
-int __android_log_print(int prio, const char *tag, const char *fmt, ...) { (void)prio;(void)tag;(void)fmt; return 0; }
-int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) { (void)prio;(void)tag;(void)fmt;(void)ap; return 0; }
-int __android_log_write(int prio, const char *tag, const char *msg) { (void)prio;(void)tag;(void)msg; return 0; }
+ * Exported (non-static) so dlsym(RTLD_DEFAULT, ...) finds them. ---
+ *
+ * 0.50.3: ported from hitmango-nextos bionic.c — real system-property table and
+ * log mirroring.  Unity reads these (ro.product.model, ro.opengles.version,
+ * ro.build.version.sdk, persist.sys.locale ...) to pick quality tiers and decide
+ * whether it is on a known device.  The old stubs returned empty, so Unity fell
+ * into low-end fallbacks / uncertain state. */
+static const char gds_lvl[] = "?????VDIWEFS";
+int __android_log_write(int prio, const char *tag, const char *msg) {
+    fprintf(stderr, "[%c/%s] %s\n", gds_lvl[prio & 15], tag ? tag : "?", msg ? msg : "");
+    return 0;
+}
+int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+    char buf[2048];
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    return __android_log_write(prio, tag, buf);
+}
+int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = __android_log_vprint(prio, tag, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+static const struct { const char *k, *v; } gds_props[] = {
+    { "ro.product.model",            "Pixel 6" },
+    { "ro.product.manufacturer",     "Google" },
+    { "ro.product.brand",            "google" },
+    { "ro.product.device",           "oriole" },
+    { "ro.product.name",             "oriole" },
+    { "ro.product.board",            "oriole" },
+    { "ro.product.cpu.abi",          "arm64-v8a" },
+    { "ro.product.cpu.abilist",      "arm64-v8a" },
+    { "ro.build.version.sdk",        "31" },
+    { "ro.build.version.release",    "12" },
+    { "ro.build.id",                 "SQ1D.220205.004" },
+    { "ro.build.type",               "user" },
+    { "ro.build.tags",               "release-keys" },
+    { "ro.debuggable",               "0" },
+    { "ro.secure",                   "1" },
+    { "ro.hardware",                 "oriole" },
+    { "ro.arch",                     "arm64" },
+    { "debug.egl.hw",                "1" },
+    { "ro.opengles.version",         "196608" },
+    { "persist.sys.locale",          "en-US" },
+    { "ro.product.locale",           "en-US" },
+};
+int __system_property_get(const char *key, char *value) {
+    for (size_t i = 0; i < sizeof gds_props / sizeof *gds_props; i++)
+        if (strcmp(gds_props[i].k, key) == 0)
+            return (int)strlen(strcpy(value, gds_props[i].v));
+    value[0] = 0;
+    return 0;
+}
+const void *__system_property_find(const char *key) {
+    for (size_t i = 0; i < sizeof gds_props / sizeof *gds_props; i++)
+        if (strcmp(gds_props[i].k, key) == 0)
+            return &gds_props[i];
+    return NULL;
+}
+int __system_property_read(const void *pi, char *name, char *value) {
+    const struct { const char *k, *v; } *p = pi;
+    if (!p) return 0;
+    if (name) strcpy(name, p->k);
+    if (value) strcpy(value, p->v);
+    return (int)strlen(p->v);
+}
+int __system_property_foreach(void (*cb)(const void *, void *), void *ck) {
+    for (size_t i = 0; i < sizeof gds_props / sizeof *gds_props; i++)
+        cb(&gds_props[i], ck);
+    return 0;
+}
 /* _ctype_ — bionic exports this as `const unsigned char*` pointing at a
  * 257-byte char-class table indexed as `_ctype_[(int)c+1]` by isalpha/
  * isdigit/tolower/etc.  libunity reads it as `ldr [_ctype_ GOT]; ldr [x0]`

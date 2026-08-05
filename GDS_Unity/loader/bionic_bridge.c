@@ -32,9 +32,7 @@
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 
-void *kv_set_job_workers_zero(void *unused);  /* defined in loader_glibc_main.c */
 void *kv_il_sym(const char *name);              /* ditto */
-int kv_jobworkers_is_done(void);                /* ditto */
 
 /* ---- statfs shim: defeat Unity's "Not enough storage space" dialog ----
  * libunity.so imports statfs and checks the free space on the target volume
@@ -218,64 +216,34 @@ int kv_pthread_cond_broadcast(void **slot) { return pthread_cond_broadcast(cond_
  * re-checks its predicate in its while() loop and can make progress.  This is
  * Terraria's CUP_CONDPOLL approach.  The main thread (tid == getpid) polls
  * shorter so it stays responsive; workers poll longer to avoid burning CPU. */
-#define KV_COND_POLL_MAIN_NS 2000000L    /* 2 ms for the main thread */
-#define KV_COND_POLL_WORK_NS 5000000L    /* 5 ms for worker threads */
 int kv_is_main_thread(void) {
     return (int)syscall(SYS_gettid) == (int)getpid();
 }
-static int kv_cond_poll_wait(void **cslot, void **mslot) {
+int kv_pthread_cond_wait(void **cslot, void **mslot) {
+    /* 0.50.3: port of hitmango-nextos b_cond_wait().  Our old main-thread path
+     * returned 0 immediately WITHOUT releasing the mutex, so main held the lock
+     * while spinning at libunity+0x5c3550 (JobWorker-spawn wait) and the worker
+     * could never acquire it to set the ready flag -> permanent hang.
+     *
+     * Reference behavior (proven on this device): always do a REAL timedwait
+     * with a short ceiling.  POSIX cond semantics release the mutex during the
+     * wait and re-acquire it on return, so the worker can proceed; the timeout
+     * becomes a harmless spurious wakeup the caller's while() re-checks.  A
+     * lost wakeup shows up as a slow frame, never a freeze. */
+    cond_get(cslot); mtx_get(mslot);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
-    ts.tv_nsec += ns;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    ts.tv_nsec += 50000000L;   /* 50 ms ceiling, same as hitmango b_cond_wait */
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
     int r = pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), &ts);
-    return (r == ETIMEDOUT) ? 0 : r;   /* timeout -> spurious wakeup */
-}
-int kv_pthread_cond_wait(void **cslot, void **mslot) {
-    /* If called on the MAIN thread: return 0 immediately (spurious wake).
-     * ALSO: opportunistically invoke set_JobWorkerCount(0) on the FIRST main
-     * call where Unity's il2cpp domain is already set up.  By the time Unity
-     * main reaches cond_wait inside nativeRender, Unity's own il2cpp_init has
-     * at least created the root domain (dom_get() != NULL).  Calling
-     * il2cpp_runtime_invoke(set_JobWorkerCount, 0) here from main works
-     * because main thread has full il2cpp thread context.
-     *
-     * terra-nextos does the equivalent from its eglSwapBuffers hook.
-     * We do it inline here because eglSwapBuffers never returns for us. */
-    cond_get(cslot); mtx_get(mslot);
-    if (kv_is_main_thread()) {
-        static int jobfix_tried = 0;
-        if (!jobfix_tried) {
-            void *(*dom_get)(void) = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
-            if (dom_get && dom_get()) {
-                jobfix_tried = 1;
-                printf("[jobfix] main cond_wait + dom_get OK - running set_JobWorkerCount once\n");
-                fflush(stdout);
-                kv_set_job_workers_zero(0);
-            }
-            /* if dom_get returns NULL: leave jobfix_tried=0, retry on next cond_wait;
-             * Unity continues its own init past us because we return 0 immediately. */
-        }
-        return 0;
-    }
-    return kv_cond_poll_wait(cslot, mslot);
+    return r == ETIMEDOUT ? 0 : r;
 }
 int kv_pthread_cond_timedwait(void **cslot, void **mslot, const struct timespec *ts) {
-    /* Like cond_wait: if main thread, return 0 immediately (spurious wake).
-     * Otherwise honor caller deadline but cap to KV_COND_POLL_WORK_NS so
-     * idle workers don't burn CPU. */
+    /* port of hitmango b_cond_timedwait: honor the caller deadline; no
+     * main-thread short-circuit (that was the deadlock bug).  The caller's
+     * own absolute deadline is used so real waits complete on time. */
     cond_get(cslot); mtx_get(mslot);
-    if (kv_is_main_thread()) return 0;
-    struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
-    long ns = KV_COND_POLL_WORK_NS;
-    struct timespec cap = *ts;
-    long capns = (cap.tv_sec - now.tv_sec) * 1000000000L + (cap.tv_nsec - now.tv_nsec);
-    if (capns < 0 || capns > ns) capns = ns;
-    struct timespec use = now;
-    use.tv_nsec += capns;
-    if (use.tv_nsec >= 1000000000L) { use.tv_sec++; use.tv_nsec -= 1000000000L; }
-    return pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), &use);
+    return pthread_cond_timedwait(cond_get(cslot), mtx_get(mslot), ts);
 }
 
 static sem_t *sem_get(void **slot) {
@@ -295,15 +263,15 @@ int kv_sem_post(void **slot) { return sem_post(sem_get(slot)); }
 /* Polling sem_wait: like cond_wait, cap the wait so a sem that is never posted
  * (Android job/looper absent) wakes the caller to re-check.  */
 int kv_sem_wait(void **slot) {
-    static int once; if (!once && (once = 1))
-        printf("[kv_sem_wait] routed! tid=%ld slot=%p *slot=%p\n", (long)syscall(178), (void*)slot, slot ? (void*)*slot : 0);
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    long ns = kv_is_main_thread() ? KV_COND_POLL_MAIN_NS : KV_COND_POLL_WORK_NS;
-    ts.tv_nsec += ns;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    int r = sem_timedwait(sem_get(slot), &ts);
-    return (r == ETIMEDOUT) ? EAGAIN : r;   /* timeout -> treat as would-block */
+    /* 0.50.3: port of hitmango b_sem_wait() — a REAL blocking wait, retried on
+     * EINTR.  The old polling timedwait returned EAGAIN on timeout, which broke
+     * the worker handshake semantics the same way the cond_wait bug did.  The
+     * reference uses a real semaphore (handle-table in hitmango, slot-trick
+     * here) and blocks properly. */
+    sem_t *s = sem_get(slot);
+    int r;
+    do { r = sem_wait(s); } while (r == -1 && errno == EINTR);
+    return r;
 }
 int kv_sem_trywait(void **slot) { return sem_trywait(sem_get(slot)); }
 int kv_sem_getvalue(void **slot, int *v) { return sem_getvalue(sem_get(slot), v); }
@@ -467,27 +435,12 @@ static long kv_syscall(long n, long a1, long a2, long a3, long a4, long a5, long
         int op = (int)a2 & 0x7f;
         if (op == 0 /*FUTEX_WAIT*/ || op == 9 /*FUTEX_WAIT_BITSET*/) {
             long tid = syscall(178 /*SYS_gettid*/);
-            /* CRITICAL: the MAIN thread deadlocks on a raw futex (Unity's job
-             * system), never reaching kv_pthread_cond_wait where the jobfix
-             * lives.  So set_JobWorkerCount(0) never fires, Unity keeps
-             * dispatching jobs to workers that never run them, and main futex-
-             * waits forever.  FIRE the jobfix from the main-thread futex wait,
-             * exactly as terraria fires its ter_jobworkers0 from eglSwapBuffers
-             * (both are re-entrant into Unity's render path).  When
-             * JobWorkerCount=0, Unity runs jobs INLINE -> the job completes ->
-             * main's futex predicate becomes true -> main advances. */
-            if (tid == (long)getpid() && !kv_jobworkers_is_done()) {
-                static int jf_tried = 0;
-                if (!jf_tried) {
-                    void *(*dom_get)(void) = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
-                    if (dom_get && dom_get()) {
-                        jf_tried = 1;
-                        printf("[jobfix] main futex-wait + dom_get OK - set_JobWorkerCount(0)\n");
-                        fflush(stdout);
-                        kv_set_job_workers_zero(0);
-                    }
-                }
-            }
+            /* 0.50.3: the old "jobfix" (call set_JobWorkerCount(0)) was a no-op
+             * for GDS (its JobsUtility has no such setter) and did heavy
+             * re-entrant il2cpp reflection on main while Unity inits the job
+             * system.  Removed.  The real fix is that cond_wait now does a real
+             * timedwait that releases the mutex (hitmango b_cond_wait), so the
+             * worker handshake at libunity+0x5c3490 completes. */
             printf("[kv_syscall] SYS_futex tid=%ld op=%d a4=%p\n", tid, op, (void*)a4);
             /* FUTEX_WAIT: (uaddr, op, val, timeout). FUTEX_WAIT_BITSET: (uaddr,
              * op, val, timeout, bitset).  a4 = timeout (0 = infinite). */
