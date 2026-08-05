@@ -1563,3 +1563,52 @@ pushed to repro the mono_class_get_checked crash. Bench = partial repro only (co
    method it calls (nativeRestartActivityIndicator, nativeSendSurfaceChangedEvent order), and
    adopt its swap-hook `ter_nuke_methods()`/`set_JobWorkerCount(0)` timing if it can be fired
    BEFORE the first worker spawn (il2cpp_init completes early inside the first nativeRender).
+
+---
+
+## 0.43.1 — HEADLESS REPRO + metadata root-cause (addendum)
+
+### BREAKTHROUGH: the exact device crash is now reproducible headlessly
+Setting `il2cpp_set_data_dir` to the real port data tree in loader.c's boot (bench
+build) made the Unicorn bench reach the SAME fault as the device: pc=libil2cpp+0xcfccd4,
+FAR=0x135, x0=NULL, x20=0x202007000 — i.e. mono_class_get_checked(NULL).  The bench can
+now iterate on the fix without the handheld.  run_aarch64.py gained a full-reg + FP-chain
+backtrace dump and a hook that catches mono_class_get_checked entry.
+
+### The crash mechanism (bench-verified)
+- libil2cpp+0xcce854 (a cached-getter: allocates 0x38, caches @libil2cpp data 0x2007000+0x928)
+  reads the class as `x8=[g_root+0x10]` where `g_root=[libil2cpp+0x1ef5000+0x418]`, then calls
+  0xd11b0c which tail-calls 0xd11c14 -> 0xcfcccc (`ldrb w8,[x0,#0x135]`) with **x0=NULL**.
+- So the NULL is a MonoClass* from a global that was never registered/initialized.
+
+### ROOT-CAUSE HYPOTHESIS (strong, but UNCONFIRMED on device)
+`global-metadata.dat` is **NEVER opened** during the entire bench boot (no openat for it),
+and explicit `il2cpp_init()` returns 0 (failure) and hangs.  Without metadata, every class
+resolves NULL -> mono_class_get_checked(NULL).  Two concrete bugs found:
+  1. The player-loop path never called `il2cpp_set_data_dir` (fixed in 0.43.0).
+  2. `fs_redirect` mapped bare `global-metadata.dat` to `<data_dir>/global-metadata.dat`
+     (WRONG — the file lives at `<data_dir>/Managed/Metadata/global-metadata.dat`) —
+     fixed in 0.43.1.
+Caveat: the device reaches nativeRender's JobWorker spawn (deeper than the bench's
+initJni-phase crash), which suggests the device's il2cpp is MORE initialized than the
+bench's.  So on-device the metadata may already load, and the NULL class could instead be a
+job-spawn-specific timing issue.  The 0.43.1 domain diagnostics
+(`[il2cpp] domain_get before nativeRender / at nativeRender entry`) will disambiguate:
+- domain != NULL  -> il2cpp IS up; metadata loads; the NULL class is a job-spawn issue.
+- domain == NULL  -> il2cpp/init not complete; metadata/init is the root cause (0.43.1 targets this).
+
+### What 0.43.1-glibc deploys (commit c564e57)
+- kv_il_prepare_dirs(): il2cpp_set_data_dir("data")/set_config_dir/set_temp_dir/
+  set_commandline_arguments BEFORE initJni (so Unity's internal il2cpp_init finds metadata).
+- fs_redirect: bare `global-metadata.dat` -> `data/Managed/Metadata/global-metadata.dat`.
+- nativeRestartActivityIndicator lifecycle call (oceanhorn parity).
+- Domain diagnostics before/at nativeRender entry.
+
+### If 0.43.1 does NOT fix the device
+Next lever = the JobWorker-spawn NULL class (libunity+0x5c3490 -> 0x5c35d0 managed-object
+construction).  The worker count is NOT CPU-count-driven in GDS (1-CPU injection everywhere
+still spawned a worker), and 0x5c3490 calls pthread_create in BOTH branches (can't skip by
+zeroing the count).  Options: (a) set_JobWorkerCount(0) via il2cpp as early as possible
+(post-il2cpp-init, before the first job), or (b) identify the specific NULL class via Cpp2IL
+dump and patch, or (c) match oceanhorn's exact boot/JNI surface.  The bench repro now makes
+(a)/(b)/(c) testable headlessly.
