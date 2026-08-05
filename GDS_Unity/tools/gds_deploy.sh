@@ -8,7 +8,7 @@
 #   GDS_R36S_HOST   SSH host (default: ark@10.1.1.2)
 #   GDS_SSH_PASS    device password (default: ark)
 #   GDS_PORTS_DIR   ports dir on device (default: /roms/ports)
-#   GDS_BRANCH      git branch (default: arena/019fc860-asdf)
+#   GDS_BRANCH      git branch (default: arena/019fd2ec-asdf)
 #   GDS_RUN_SECONDS how long to let the game boot before the deploy returns
 #                   (default: 12).  The deploy never blocks on a running game.
 set -uo pipefail
@@ -16,7 +16,7 @@ set -uo pipefail
 HOST="${GDS_R36S_HOST:-${1:-ark@10.1.1.2}}"
 PASS="${GDS_SSH_PASS:-ark}"
 PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
-BRANCH="${GDS_BRANCH:-arena/019fc860-asdf}"
+BRANCH="${GDS_BRANCH:-arena/019fd2ec-asdf}"
 # The loader build version the deployed zip MUST contain.  Bump alongside
 # loader.c's GDS_BUILD_VERSION so the deploy refuses stale/cached zips.
 GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.60.1-ref}"

@@ -366,12 +366,12 @@ natively and correctly.
 
 ## COMMIT STATE
 
-- Session branch `arena/019fc860-asdf`.  (Note: the Unity/IL2CPP GDS APKs were
+- Session branch `arena/019fd2ec-asdf`.  (Note: the Unity/IL2CPP GDS APKs were
   committed on `arena/019fbc18-asdf` under `APKs/`; that branch's `APKs/`
   directory was NOT on `main`.  `git fetch origin '+refs/heads/*:refs/remotes/origin/*'`
   pulls it; `git show origin/arena/019fbc18-asdf:APKs/Game+Dev+Story_2.6.9.apk`
   recovers the 53 MB APK.)
-- Latest commits on `arena/019fc860-asdf`: loader loads all three real native
+- Latest commits on `arena/019fd2ec-asdf`: loader loads all three real native
   libs (libil2cpp.so + libunity.so + libmain.so), runs each init_array, drives
   the Android `JNI_OnLoad` chain (libmain's JNI_OnLoad -> JNI_VERSION_1_6),
   exits 0.  See commit messages for details.
@@ -454,7 +454,7 @@ nativeResume → nativeFocusChanged(1) → **loop nativeRender(env,thiz)**.  The
 dialog build happens inside that first nativeRender.
 
 ### How to reproduce / iterate
-- Deploy: `curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20`
+- Deploy: `curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20`
 - Read `gamedevstory/gamedevstory/loader.log` (fresh each run now).
 - Key files: `loader/loader_glibc_main.c` (boot), `loader/egl_shim.c` (EGL/GL),
   `loader/jni_shim.c` (JNI shim — the dialog is built through here),
@@ -1116,7 +1116,7 @@ Implemented in the glibc build (`loader/loader2_glibc`):
 
 Next on-device test (needs deploy; bench has no GPU/SDL so this can't run headless):
 ```
-curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 ```
 Expect `[loader] build: 0.7.0-glibc`, then `[egl] GL_VENDOR/RENDERER/VERSION`
 proving the Mali driver is behind the context, then graphics init to proceed.
@@ -1131,7 +1131,7 @@ proving the Mali driver is behind the context, then graphics init to proceed.
 > guard-pad layout instead of overwriting the register.
 
 ### Deploy (works, version-checked)
-    curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+    curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 Expect `[loader] build: 0.37.0-glibc` in the log (stale-zip guard aborts otherwise).
 
 ## 0.37 — maps_resolve fixed, deadlock root cause analysed (NOT YET RESOLVED)
@@ -1453,7 +1453,7 @@ the equivalent hook point is the MAIN-THREAD futex WAIT.  Fix (0.40.0):
 4. **Bypass Unity's JobWorker bootstrap altogether**: NEVER let libunity enter `0x5c3490` (JobWorker spawn). This means intercepting before the call site or mprotect+patch the libunity call instruction to a NOP. Hard (we don't own libunity code).
 
 ### Build/deploy state
-- HEAD of arena/019fc860-asdf: `0.39.10-glibc` (pushed but HANDOFF.md updates pending).
+- HEAD of arena/019fd2ec-asdf: `0.39.10-glibc` (pushed but HANDOFF.md updates pending).
 - See HANDOFF.md sections above (0.39.5) for the kv_pthread_cond_wait jobfix gate — still in code, only triggers when dom_get() non-NULL on MAIN.
 - Crash handler updated to log tid + pthread_self + `kv_is_main_thread()` so the crashing thread is unambiguous (commit `0105bd9`).
 
@@ -1924,7 +1924,7 @@ A rigorous comparison of `loader.log` (`0.50.4-glibc`, the older patched codebas
 ### How to test / deploy
 
 ```bash
-curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 ```
 Expect `[gds] build: 0.60.1-ref`, `0 relocations unresolved`, EGL/SDL window initialization (`[egl] window ... context ready (ES2)`), and smooth execution of `nativeRender loop` with jobs running inline on 1 CPU.
 
