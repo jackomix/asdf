@@ -121,7 +121,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.50.0-rewrite"
+#define GDS_BUILD_VERSION "0.50.1-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -679,116 +679,16 @@ static int kv_jobworkers_done = 0;
 int kv_jobworkers_is_done(void) { return kv_jobworkers_done; }
 void *kv_set_job_workers_zero(void *unused) {
     (void)unused;
-    int (*il_init_void)(const char *) = (int (*)(const char *))kv_il_sym("il2cpp_init");
-    /* Unity's il2cpp_init returns int (0=ok), but il2cpp_domain_get returns
-     * void* — we just check non-NULL.  il2cpp_init may already be in flight by
-     * Unity's main thread under nativeRender; calling it again from a sibling
-     * thread is safe (it's idempotent and guarded). */
-    void *(*dom_get)(void) = kv_il_sym("il2cpp_domain_get");
-    void *(*dom_asms)(void *, size_t *) = kv_il_sym("il2cpp_domain_get_assemblies");
-    void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
-    void *(*cls_from_name)(void *, const char *, const char *) = kv_il_sym("il2cpp_class_from_name");
-    void *(*cls_method)(void *, const char *, int) = kv_il_sym("il2cpp_class_get_method_from_name");
-    void *(*rt_invoke)(void *, void *, void **, void **) = kv_il_sym("il2cpp_runtime_invoke");
-    void *(*thread_attach)(void *) = kv_il_sym("il2cpp_thread_attach");
-    if (!dom_get || !dom_asms || !asm_img || !cls_from_name || !cls_method || !rt_invoke) {
-        printf("[jobfix] IL2CPP symbols unavailable, skipping\n");
-        return 0;
-    }
-    /* Stage A: Wait until il2cpp_init succeeds.  Calling il2cpp_init from a
-     * sibling thread is safe; it returns immediately if already initialized
-     * (Unity calls it from nativeRender on main thread).  This guarantees the
-     * runtime + metadata is fully loaded BEFORE we call class_from_name —
-     * without this gate, the lookup races with the in-flight init and
-     * mono_class_get_checked gets a NULL MonoClass* and SIGSEGVs (0.32, 0.38a).
-     * Poll for up to 30s — the crash handler won't catch us if we disappear. */
-    printf("[jobfix] waiting for il2cpp_init...\n");
-    /* On the MAIN thread: drive il2cpp_init directly (idempotent with Unity's
-     * own later call inside nativeRender).  This guarantees dom_get() returns
-     * a valid domain and we have a thread context attached. */
-    if (kv_is_main_thread()) {
-        /* Unity's il2cpp_set_data_dir isn't exported, so we rely on Unity's
-         * OWN il2cpp_init inside nativeRender (which has already started by
-         * the time kv_pthread_cond_wait fires on main).  No pre-init here. */
-    }
-    /* Stage A: Wait for il2cpp domain to exist (Unity's own il2cpp_init runs
-     * inside nativeRender, in parallel with this polling spin).  Do NOT call
-     * il2cpp_init ourselves—rerunning it mid-Unity-init causes deadlock /
-     * corruption. Just wait for dom_get() to return non-NULL. */
-    printf("[jobfix] waiting for Unity's il2cpp_init (dom_get)...\n");
-    for (int tries = 0; tries < 600; tries++) {
-        if (dom_get && dom_get()) break;
-        struct timespec ts = {0,50000000}; nanosleep(&ts, 0);
-    }
-    if (!dom_get || !dom_get()) {
-        printf("[jobfix] no domain after 30s — giving up\n");
-        return 0;
-    }
-    printf("[jobfix] il2cpp_init done, scanning assemblies for JobsUtility\n");
-    fflush(stdout);
-    /* Stage A.5: il2cpp_thread_attach is REQUIRED before cls_from_name can
-     * safely run on a NON-MAIN thread.  Haupt-thread is auto-attached by
-     * Unity's own il2cpp_init (which we drove above).  Sibling threads must
-     * call il2cpp_thread_attach(NULL) — but that triggers Unity's assertion
-     * "Threads explicit registering is not previously enabled" and aborts.
-     * So we DON'T run this from the sibling thread; we run from main only. */
-    if (!kv_is_main_thread()) {
-        printf("[jobfix] not main thread - skipping class scan to avoid mono assertion\n");
-        fflush(stdout);
-        return 0;
-    }
-    printf("[jobfix] main thread - proceeding to class scan\n"); fflush(stdout);
-    /* Stage B: scan assemblies, find JobsUtility, invoke setters. */
-    for (int tries = 0; tries < 200 && !kv_jobworkers_done; tries++) {
-        if (tries == 0) { printf("[jobfix] calling dom_get()...\n"); fflush(stdout); }
-        void *domain = dom_get();
-        if (tries == 0) { printf("[jobfix] dom_get() -> %p\n", domain); fflush(stdout); }
-        if (!domain) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
-        size_t na = 0;
-        if (tries == 0) { printf("[jobfix] calling dom_asms()...\n"); fflush(stdout); }
-        void **asms = (void **)dom_asms(domain, &na);
-        if (tries == 0) { printf("[jobfix] dom_asms() -> %p na=%zu\n", asms, na); fflush(stdout); }
-        if (!asms || !na) { struct timespec ts={0,50000000}; nanosleep(&ts,0); continue; }
-        printf("[jobfix] assembly count=%zu\n", na); fflush(stdout);
-        int found_class = 0;
-        for (size_t i = 0; i < na; i++) {
-            void *img = asm_img(asms[i]);
-            if (!img) continue;
-            if (tries == 0) { printf("[jobfix] asm[%zu] img=%p\n", i, img); fflush(stdout); }
-            void *cls = cls_from_name(img, "Unity.Jobs.LowLevel.Unsafe", "JobsUtility");
-            if (!cls) continue;
-            found_class = 1;
-            int zero = 0;
-            void *params[1] = { &zero };
-            void *exc = NULL;
-            const char *setters[] = {
-                "set_JobWorkerCount",
-                "SetJobQueueMaximumActiveThreadCount",
-                "SetJobQueueMaximumWarpThreadCount"
-            };
-            int any = 0;
-            for (unsigned s = 0; s < sizeof(setters)/sizeof(setters[0]); s++) {
-                void *m = cls_method(cls, setters[s], 1);
-                if (!m) continue;
-                exc = NULL;
-                rt_invoke(m, NULL, params, &exc);
-                printf("[jobfix] %s(0) invoked (exc=%p)\n", setters[s], exc);
-                any = 1;
-            }
-            if (any) {
-                printf("[jobfix] job workers set to 0 — jobs will run inline\n");
-                kv_jobworkers_done = 1;
-                return 0;
-            }
-        }
-        if (found_class) {
-            printf("[jobfix] JobsUtility found but no setter invoked — giving up\n");
-            kv_jobworkers_done = 1;
-            return 0;
-        }
-        struct timespec ts = {0,50000000}; nanosleep(&ts,0);
-    }
-    if (!kv_jobworkers_done) printf("[jobfix] gave up (il2cpp never ready or JobsUtility not found)\n");
+    /* 0.50.1: Game Dev Story's JobsUtility has NO set_JobWorkerCount /
+     * SetJobQueueMaximumActiveThreadCount / SetJobQueueMaximumWarpThreadCount
+     * (metadata-verified), so this jobfix can never reduce the worker count.
+     * The old body ran a heavy re-entrant il2cpp reflection scan (dom_get /
+     * dom_asms / class_from_name over all 39 assemblies) on the MAIN thread
+     * WHILE Unity was initialising the job system inside nativeRender - pure
+     * overhead and a potential re-entrant il2cpp deadlock.  Since it cannot
+     * succeed, skip the scan entirely.  (The worker-spawn problem is handled by
+     * reporting 1 CPU + the worker-TLS trampoline in bionic_bridge.c.) */
+    kv_jobworkers_done = 1;
     return 0;
 }
 
@@ -968,6 +868,28 @@ static void kv_setup_tls(void) {
 
 void kv_egl_dlopen(void);   /* glibc_shims.c: load real Mali GPU drivers */
 void kv_ctype_init(void);  /* glibc_shims.c: fill bionic _ctype_/_tolower_tab_/_toupper_tab_ */
+
+/* 0.50.1: set up bionic TLS slots for the CURRENT thread (called at the top of
+ * each worker's trampoline from kv_pthread_create).  Same logic as kv_setup_tls
+ * but silent (no per-worker log spam).  kv_bionic_pad is _Thread_local, so each
+ * worker's copy lands right after ITS glibc TCB at tp+0x28 - exactly where
+ * libunity's JobWorker start (mrs tpidr_el0; ldr [x23,#0x28]) reads. */
+void kv_setup_worker_tls(void) {
+    unsigned long tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    unsigned long pad_lo = (unsigned long)kv_bionic_pad;
+    unsigned long pad_hi = pad_lo + sizeof(kv_bionic_pad);
+    if (tp + 0x38 + 8 <= pad_hi && tp + 0x28 >= pad_lo) {
+        unsigned long sp;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        unsigned long hi = (sp + 0x400000) & ~0xffffUL;
+        unsigned long lo = (sp - 0x800000) & ~0xffffUL;
+        *(unsigned long *)(tp + 0x28) = 0x0BADC0DEDEADBEEFUL;   /* stack guard */
+        *(unsigned long *)(tp + 0x30) = lo;
+        *(unsigned long *)(tp + 0x38) = hi;
+    }
+}
+
 int main(int argc, char **argv) {
     kv_ctype_init();            /* fill tables BEFORE any libunity/libil2cpp ctor runs
                                  * (ctors read these via the GOT).  Without this the

@@ -1728,3 +1728,43 @@ il2cpp_init + load-order + NativeLoader.load are reference-aligned but not headl
 (the bench crashes at nativeRecreateGfxState, GPU-less, and mmaps files as anonymous).  This
 is the strongest, most evidence-based attempt: if il2cpp_init succeeds on device with the
 correct data_dir, classes resolve and the job-spawn NULL-class crash is gone.
+
+---
+
+## 0.50.1-glibc — game now BOOTS past the crash (0.50.0 was the milestone)
+
+### 0.50.0-rewrite result (on-device, log confirmed)
+The `data_dir="data/Managed"` fix + explicit il2cpp_init WORKED:
+- `[fs] open(global-metadata.dat 'data/Managed/Metadata/global-metadata.dat')` (metadata found)
+- `[il2cpp] explicit il2cpp_init -> 1` (SUCCESS - first time)
+- `[jobfix] assembly count=39` (all assemblies loaded, classes resolve)
+- `[unity] nativeRecreateGfxState OK` -> `nativeRender loop...`
+- **The mono_class_get_checked(NULL) crash is GONE** - it got past the job-worker spawn!
+
+### The new blocker (a hang, not a crash)
+After nativeRender, the process hangs (no exit 139, watchdog dumps repeat).  Main thread is
+R (running), job workers futex-wait at glibc+0x8ef6c.  This is the classic job-system
+deadlock the reference ports solve via 0 workers (jobs run inline):
+- Reference's `set_JobWorkerCount(0)` does NOT exist in GDS's JobsUtility (metadata-verified:
+  methods are only GetWorkStealingRange, ScheduleParallelFor, CreateJobReflectionData x2,
+  InvokePanicFunction, ScheduleParallelFor_Injected).
+- Reporting 1 CPU did not stop GDS's worker spawn (the worker start libunity+0x508174 was
+  still created; 0x5c3490 always spawns one worker regardless of count).
+
+### 0.50.1-glibc changes (pushed)
+1. **Worker-TLS trampoline**: kv_pthread_create now wraps EVERY created thread (incl. the
+   JobWorker at libunity+0x508174) with a trampoline that sets up that thread's bionic TLS
+   slots (thread-id, stack-guard @tp+0x28, stack lo/hi @+0x30/+0x38) via kv_setup_worker_tls
+   (silent copy of the main-thread kv_setup_tls).  The worker start reads these; without them
+   workers get garbage TLS (documented difference vs oceanhorn's thr_trampoline).  No
+   il2cpp_thread_attach (that asserts).
+2. **jobfix no-op**: kv_set_job_workers_zero() now returns immediately (marks done) because
+   GDS has no set_JobWorkerCount - the old body's 39-assembly re-entrant il2cpp reflection
+   scan on the main thread during nativeRender was pure overhead + a re-entrant deadlock risk.
+
+### Honest confidence
+0.50.0 proved the metadata path + explicit il2cpp_init is THE fix that gets past the crash.
+0.50.1 addresses the worker-TLS gap and removes the re-entrant jobfix scan.  It may or may
+not fully resolve the post-boot job hang; if the hang persists, the next lever is forcing the
+job-worker-count global to 0 (its source is behind a pointer table, hard to trace statically)
+or patching the JobQueue to run jobs inline.
