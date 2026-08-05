@@ -1921,10 +1921,50 @@ A rigorous comparison of `loader.log` (`0.50.4-glibc`, the older patched codebas
    - `tools/make_port.sh` packages `0.60.1-ref` into both `GameDevStory_PortMaster.zip` and `gamedevstory.zip`.
    - `tools/gds_deploy.sh` verifies `GDS_EXPECT_VER="0.60.1-ref"`.
 
-### How to test / deploy
+### How to test / deploy (0.60.1-ref)
 
 ```bash
 curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 ```
 Expect `[gds] build: 0.60.1-ref`, `0 relocations unresolved`, EGL/SDL window initialization (`[egl] window ... context ready (ES2)`), and smooth execution of `nativeRender loop` with jobs running inline on 1 CPU.
+
+## 0.60.2-ref — RESOLVING THE `raise(sig=5)` (`SIGTRAP`) CRASH AFTER `nativeRender loop`
+
+### Evidence from `0.60.1-ref` Logs & Disassembly
+Thanks to our unbuffered logging, `my_raise` wrapper, and complete crash signal handler shipped in `0.60.1-ref`, the device test produced a **decisive, complete diagnostic trace** instead of failing silently:
+```
+[egl] CALLS after Initialize: GetDisplay=1 Initialize=1 ChooseConfig=0 CreateContext=0 MakeCurrent=0 SwapBuffers=0 CreateWindowSurface=0 GetProcAddress=0
+[gds] === ENGINE raise(sig=5) caller=0x7f7a9e4380 ===
+[gds] signal 5 at pc=0x7f8a1a7d80 addr=0x3e800000797
+...
+[gds] backtrace (x29 chain):
+[gds]   #0 lr=0x7f8a156940
+[gds]   #1 lr=0x10380cc
+[gds]   #2 lr=0x7f7a9e4380
+[gds]   #3 lr=0x28
+```
+- `#1 lr=0x10380cc` is `loader2` (`my_raise`).
+- `#2 lr=0x7f7a9e4380` is inside `libunity.so` (`0x7f79fa6000..0x7f7afe0000`), at relative offset `0xa3e380`.
+- Why did `libunity.so` call `raise(5)` (`SIGTRAP`) immediately after `nativeRender loop` started?
+- Because **`il2cpp_init("IL2CPP Root Domain")` had never been called**!
+- In Android, the Java runtime / engine calls `il2cpp_init()` before entering the render loop. In our standalone native loader, `0.60.1-ref` called `initJni OK` and then immediately jumped to `nativeRecreateGfxState` / `nativeRender` without ever calling `il2cpp_init()`.
+- Because `il2cpp_init()` never ran, `data/Managed/Metadata/global-metadata.dat` was never opened and no C# managed classes were registered. When `nativeRender` entered managed IL2CPP code on frame 0, IL2CPP detected an uninitialized runtime and executed `raise(5)` (`SIGTRAP`).
+
+### What `0.60.2-ref` Shipped
+1. **Explicit IL2CPP Initialization (`loader_ref/main.c`)**:
+   - Immediately after `initJni OK` (and before `nativeRecreateGfxState` / `nativeRender`), `run_unity()` now looks up `il2cpp_set_data_dir` and sets `"data/Managed"` (`<gamedir>/data/Managed`), ensuring that `gds_redirect` maps `global-metadata.dat` to `<gamedir>/data/Managed/Metadata/global-metadata.dat`.
+   - Then `run_unity()` explicitly calls `il2cpp_init("IL2CPP Root Domain")`.
+   - This loads `global-metadata.dat`, initializes the IL2CPP runtime, and registers all 39 managed assemblies so managed C# invocations from Unity's `nativeRender` succeed without raising `SIGTRAP` (signal 5).
+2. **Version & Deploy Validation**:
+   - Updated `#define GDS_BUILD_VERSION "0.60.2-ref"` in `loader_ref/main.c`, `build.sh`, and `make_port.sh`.
+   - Updated `GDS_EXPECT_VER="0.60.2-ref"` in `tools/gds_deploy.sh`.
+
+### How to test / deploy (0.60.2-ref)
+```bash
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+```
+In `loader.log`, expect:
+- `[gds] calling il2cpp_init("IL2CPP Root Domain")...`
+- `[gds] il2cpp_init -> 1`
+- `[gds] nativeRender loop` executing frames cleanly without raising signal 5 (`SIGTRAP`).
 

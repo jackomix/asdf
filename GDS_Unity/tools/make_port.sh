@@ -33,5 +33,5 @@ rm -f GameDevStory_PortMaster.zip gamedevstory.zip
 # both.  Previous commits zipped contents via `cd ports/gamedevstory && zip`.
 ( cd ports/gamedevstory && zip -q -r -y "$here/GameDevStory_PortMaster.zip" . )
 ( cd ports/gamedevstory && zip -q -r -y "$here/gamedevstory.zip" . )
-echo "built GameDevStory_PortMaster.zip and gamedevstory.zip (0.60.1-ref)"
+echo "built GameDevStory_PortMaster.zip and gamedevstory.zip (0.60.2-ref)"
 echo "extract into /roms/ports/ on the R36S, then EmulationStation -> Ports -> Game Dev Story"

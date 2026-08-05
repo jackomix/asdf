@@ -24,7 +24,7 @@
 #include "nx_elf.h"
 #include "gds.h"
 
-#define GDS_BUILD_VERSION "0.60.1-ref"
+#define GDS_BUILD_VERSION "0.60.2-ref"
 
 char gds_gamedir[1024];
 char gds_datadir[1024];
@@ -410,6 +410,32 @@ static void run_unity(void)
     fprintf(stderr, "[gds] initJni...\n");
     ((void (*)(void *, void *, void *))fn)(env, player, activity);
     fprintf(stderr, "[gds] initJni OK\n");
+
+    /* EXPLICIT IL2CPP INIT: In native Android, Java/engine calls il2cpp_init
+     * before nativeRender. In our standalone native loader, we must drive
+     * il2cpp_init explicitly on the main thread after initJni so that
+     * global-metadata.dat is loaded and managed classes resolve before the
+     * first frame of nativeRender. */
+    nx_mod *mod_il2cpp = nx_find_mod("libil2cpp.so");
+    if (mod_il2cpp) {
+        void *(*set_data)(const char *) =
+            (void *(*)(const char *))nx_lookup_in(mod_il2cpp, "il2cpp_set_data_dir");
+        if (set_data) {
+            char md[1024];
+            snprintf(md, sizeof md, "%s/Managed", gds_datadir);
+            set_data(md);
+            fprintf(stderr, "[gds] il2cpp_set_data_dir(\"%s\")\n", md);
+        }
+        int (*il2cpp_init_fn)(const char *) =
+            (int (*)(const char *))nx_lookup_in(mod_il2cpp, "il2cpp_init");
+        if (il2cpp_init_fn) {
+            fprintf(stderr, "[gds] calling il2cpp_init(\"IL2CPP Root Domain\")...\n");
+            int rc = il2cpp_init_fn("IL2CPP Root Domain");
+            fprintf(stderr, "[gds] il2cpp_init -> %d\n", rc);
+        } else {
+            fprintf(stderr, "[gds] WARNING: il2cpp_init not exported by libil2cpp.so\n");
+        }
+    }
 
     fn = gds_jni_native("com/unity3d/player/UnityPlayer",
                         "nativeRecreateGfxState");
