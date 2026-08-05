@@ -378,7 +378,26 @@ def main():
             uc.reg_read(UC_ARM64_REG_X0), uc.reg_read(UC_ARM64_REG_X30)), file=sys.stderr)
     uc.hook_add(unicorn.UC_HOOK_CODE, _d11c14, begin=0x200d11c14, end=0x200d11c18)
 
+    # probe: log every call into exported il2cpp_init (0xce3d34) - tells us if
+    # the runtime is ever initialised (which loads global-metadata.dat).
+    _init_count = [0]
+    def _ilinit(uc, addr, size, data):
+        from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30
+        _init_count[0] += 1
+        print('[ilinit] il2cpp_init called #%d arg(x0)=%#x caller(x30)=%#x' % (
+            _init_count[0], uc.reg_read(UC_ARM64_REG_X0), uc.reg_read(UC_ARM64_REG_X30)), file=sys.stderr)
+    uc.hook_add(unicorn.UC_HOOK_CODE, _ilinit, begin=0x200ce3d34, end=0x200ce3d38)
+
     def _memerr(uc, access, addr, size, value, user):
+        # BENCH-ONLY: tolerate writes to address 0 (a NULL thiz[0x148] write in
+        # GPU-less nativeRecreateGfxState, libunity+0x5ccb38) so the bench can
+        # reach nativeRender and we can observe il2cpp_init.  Map a scratch page.
+        if access == 2 and addr < PAGE:  # write
+            try:
+                uc.mem_map(0, PAGE, unicorn.UC_PROT_ALL)
+                return True
+            except Exception:
+                pass
         # Lazy commit for sparse regions (GC heap reservation): if the faulting
         # address lies inside a sparse range, map a CHUNK covering the whole
         # access (plus margin) now and let the guest retry.  Zero pages are

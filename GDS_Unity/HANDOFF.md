@@ -1690,3 +1690,41 @@ Match hitmango's boot: after loading the 3 modules, call the game's `NativeLoade
 (registered by libmain) with kv_dlopen returning the already-mapped modules, so libunity's
 init_array/JNI_OnLoad runs in the Android-canonical order that registers il2cpp classes.
 kv_dlopen is now in place; the call site + avoiding double-JNI_OnLoad is the next step.
+
+---
+
+## 0.50.0-rewrite — ROOT CAUSE FOUND (bench-verified): wrong il2cpp data_dir
+
+### The actual bug (headless-proven in the Unicorn bench)
+By hooking il2cpp_init in the bench and watching openat, we finally saw what il2cpp
+actually opens:
+  data_dir="data"       -> opens `<data_dir>/Metadata/global-metadata.dat`
+                           = data/Metadata/global-metadata.dat  -> NOT FOUND
+  data_dir="data/Managed" -> opens data/Managed/Metadata/global-metadata.dat
+                           -> fd 103, 5477380 bytes (FOUND!)
+
+**il2cpp's metadata path template is `<data_dir>/Metadata/global-metadata.dat`** (NO
+"Managed/" prefix).  Our loader set data_dir="data", so il2cpp looked for
+data/Metadata/global-metadata.dat and failed -> no metadata -> every class NULL ->
+mono_class_get_checked(NULL) crash.  This is THE root cause, independent of whether
+il2cpp_init is called by us or Unity: the path was simply wrong.
+
+### The rewrite (0.50.0-rewrite)
+1. **il2cpp_set_data_dir("data/Managed")** before initJni AND again before the explicit
+   il2cpp_init.  (data_dir="data/Managed" makes il2cpp open the correct metadata path.)
+2. **Explicit il2cpp_init("IL2CPP Root Domain")** on the main thread after initJni - the
+   engine (libunity) was never calling it internally, so the runtime never initialised.
+   il2cpp_init returns (does NOT hang); the bench's return-0 is a bench artifact (its mmap
+   maps anonymous memory, not the file fd - on the device glibc mmap maps the real file).
+3. Load order: libunity loaded first (init deferred), then libil2cpp, then libunity init,
+   then libmain - with deferred re-resolution of libunity's il2cpp imports (oceanhorn order).
+4. NativeLoader.load(libdir) boot step (hitmango reference) via a kv_dlopen bridge that
+   returns already-mapped modules.
+5. Kept fs_redirect global-metadata.dat -> Managed/Metadata/ fix + metadata-open logs.
+
+### Caveat (honest)
+data_dir="data/Managed" is bench-CONFIRMED to make il2cpp open the metadata.  The explicit
+il2cpp_init + load-order + NativeLoader.load are reference-aligned but not headless-verifiable
+(the bench crashes at nativeRecreateGfxState, GPU-less, and mmaps files as anonymous).  This
+is the strongest, most evidence-based attempt: if il2cpp_init succeeds on device with the
+correct data_dir, classes resolve and the job-spawn NULL-class crash is gone.

@@ -121,7 +121,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.43.5-glibc"
+#define GDS_BUILD_VERSION "0.50.0-rewrite"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -155,11 +155,16 @@ typedef struct Module {
     uint8_t       *init_array;
     size_t         init_array_sz;
     void (*init)(void);
+    int            defer_init;          /* don't run init_array at load time */
+    uint64_t     **unres_slot;          /* GOT slots left unresolved at load */
+    char         **unres_name;
+    int            unres_count, unres_cap;
     struct Module *next;
 } Module;
 
 static Module *g_modules;
 static uint8_t *g_brk = (uint8_t *)0x200000000UL;
+static int g_defer_next_init = 0;   /* set before load_object to defer its init */
 
 static void *xmmap(uint8_t *hint, size_t len, int prot) {
     void *p = mmap(hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
@@ -308,6 +313,9 @@ static void *resolve_sym(Module *m, uint64_t symidx, const char *name) {
     return resolve(name);
 }
 
+static void kv_module_run_init(Module *m);
+static void kv_reresolve_unresolved(Module *m);
+
 static Module *load_object(const char *path) {
     size_t len = 0;
     uint8_t *file = read_all(path, &len);
@@ -380,7 +388,21 @@ static Module *load_object(const char *path) {
                        type == R_AARCH64_ABS64 || type == R_AARCH64_ABS32) {
                 const char *name = m->strtab + m->symtab[symidx].st_name;
                 void *p = resolve_sym(m, symidx, name);
-                if (!p) { if (unresolved++ < 12) printf( "[loader]   unresolved %s\n", name); *slot = 0; }
+                if (!p) {
+                    if (unresolved++ < 12) printf( "[loader]   unresolved %s\n", name);
+                    /* record for deferred re-resolution (libunity's il2cpp
+                     * imports resolve after libil2cpp is loaded) */
+                    if (m->unres_count >= m->unres_cap) {
+                        int nc = m->unres_cap ? m->unres_cap * 2 : 64;
+                        m->unres_slot = realloc(m->unres_slot, nc * sizeof(void*));
+                        m->unres_name = realloc(m->unres_name, nc * sizeof(char*));
+                        m->unres_cap = nc;
+                    }
+                    m->unres_slot[m->unres_count] = (uint64_t*)slot;
+                    m->unres_name[m->unres_count] = (char*)name;
+                    m->unres_count++;
+                    *slot = 0;
+                }
                 else *slot = (uint64_t)p;
             } else if (type == R_AARCH64_COPY) {
                 /* handled by host linker; skip */
@@ -393,18 +415,40 @@ static Module *load_object(const char *path) {
 
     printf("[loader] %s mapped @%p span=%#zx relas=%zu\n", m->name, (void *)base, span, m->rela_count);
 
+    /* run init + init_array now, unless deferred (rewrite: libunity's init runs
+     * AFTER libil2cpp is loaded so its il2cpp imports are resolved first) */
+    m->defer_init = m->defer_init || g_defer_next_init;
+    g_defer_next_init = 0;
+    if (!m->defer_init) kv_module_run_init(m);
+    return m;
+}
+
+/* run a module's DT_INIT + DT_INIT_ARRAY (separated from load_object so we can
+ * defer libunity's init until after libil2cpp is loaded, matching oceanhorn) */
+static void kv_module_run_init(Module *m) {
     if (m->init) m->init();
     if (m->init_array) {
         size_t n = m->init_array_sz / sizeof(uint64_t);
         for (size_t i = 0; i < n; i++) {
             uint64_t fn = ((uint64_t *)m->init_array)[i];
-            /* Each entry was RELATIVE-relocated to an absolute address above;
-             * call it directly (adding m->bias again would double-shift). */
             if (fn) ((void (*)(void))fn)();
         }
         printf("[loader] %s init_array ran (%zu ctors)\n", m->name, n);
     }
-    return m;
+}
+
+/* re-resolve a module's unresolved GOT slots now that more modules are loaded */
+static void kv_reresolve_unresolved(Module *m) {
+    if (!m) return;
+    int fixed = 0;
+    for (int i = 0; i < m->unres_count; i++) {
+        void *p = loader_lookup_export(m->unres_name[i]);
+        if (!p) p = dlsym(0, m->unres_name[i]);   /* RTLD_DEFAULT */
+        if (p) { *m->unres_slot[i] = (uint64_t)p; fixed++; }
+        else printf("[loader]   STILL unresolved %s\n", m->unres_name[i]);
+    }
+    if (fixed) printf("[loader] re-resolved %d deferred imports in %s\n", fixed, m->name);
+    m->unres_count = 0;
 }
 
 /* aarch64 Linux passes argc/argv in x0/x1 at the entry point (this is true both
@@ -793,7 +837,7 @@ static void kv_unity_boot(void) {
      * domain_get pre-init; set_data_dir alone is a plain string store and is
      * safe (verified: it returns/logs fine and does not do a class lookup). */
     { void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
-      if (set_data) { set_data("data"); printf("[il2cpp] set_data_dir(\"data\")\n"); }
+      if (set_data) { set_data("data/Managed"); printf("[il2cpp] set_data_dir(\"data/Managed\")\n"); }
       else printf("[il2cpp] il2cpp_set_data_dir not found\n"); }
 
     /* 0.43.5: reference-aligned (hitmango-nextos) boot step - call the game's
@@ -806,6 +850,22 @@ static void kv_unity_boot(void) {
         printf("[unity] initJni...\n");
         ((void (*)(void *, void *, void *))fn)(env, thizp, ctx);
         printf("[unity] initJni OK\n");
+    }
+    /* REWRITE: explicitly drive il2cpp_init on the main thread now that the
+     * data dir is set and the JNI context exists.  The engine (libunity) is
+     * supposed to do this internally before nativeRender, but in our loader it
+     * never happens (no metadata is ever opened).  Calling it here loads
+     * global-metadata.dat -> classes resolve -> the job spawn no longer gets a
+     * NULL class.  il2cpp_init returns (it does NOT hang by itself).  Unity's
+     * own later call is idempotent. */
+    { void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+      int (*init)(const char *) = kv_il_sym("il2cpp_init");
+      if (set_data) set_data("data/Managed");
+      if (init) {
+          printf("[il2cpp] calling il2cpp_init explicitly...\n");
+          int rc = init("IL2CPP Root Domain");
+          printf("[il2cpp] explicit il2cpp_init -> %d\n", rc);
+      }
     }
     /* Surface lifecycle: nativeRecreateGfxState installs the GL surface that
      * nativeRender draws into; without it Unity hits a null surface.  Called
@@ -975,15 +1035,35 @@ int real_main(int argc, char **argv) {
     }
     int n = 0;
     Module *m_il2cpp = 0, *m_unity = 0, *m_main = 0;
+    const char *p_unity = 0, *p_il2cpp = 0, *p_main = 0;
     for (int i = 0; i < libc; i++) {
-        printf("[loader] loading %s\n", libs[i]);
-        Module *m = load_object(libs[i]);
-        if (m) {
-            n++;
-            if (strstr(m->name, "libil2cpp")) m_il2cpp = m;
-            else if (strstr(m->name, "libunity")) m_unity = m;
-            else if (strstr(m->name, "libmain")) m_main = m;
-        }
+        if (strstr(libs[i], "libunity")) p_unity = libs[i];
+        else if (strstr(libs[i], "libil2cpp")) p_il2cpp = libs[i];
+        else if (strstr(libs[i], "libmain")) p_main = libs[i];
+    }
+    /* REWRITE (oceanhorn order): load libunity first but DEFER its init_array +
+     * JNI_OnLoad until after libil2cpp is loaded, so libunity's il2cpp imports
+     * resolve before libunity's init runs.  Then libil2cpp's init runs.  This
+     * matches how the working 2022.3 references bring up the engine. */
+    if (p_unity) {
+        printf("[loader] loading %s (init deferred)\n", p_unity);
+        g_defer_next_init = 1;
+        Module *m = load_object(p_unity);
+        if (m) { n++; m_unity = m; }
+    }
+    if (p_il2cpp) {
+        printf("[loader] loading %s\n", p_il2cpp);
+        Module *m = load_object(p_il2cpp);
+        if (m) { n++; m_il2cpp = m; }
+    }
+    if (m_unity) {
+        kv_reresolve_unresolved(m_unity);   /* resolve libunity's il2cpp imports */
+        kv_module_run_init(m_unity);        /* now run libunity init_array */
+    }
+    if (p_main) {
+        printf("[loader] loading %s\n", p_main);
+        Module *m = load_object(p_main);
+        if (m) { n++; m_main = m; }
     }
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
 
