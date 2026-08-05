@@ -1456,3 +1456,37 @@ the equivalent hook point is the MAIN-THREAD futex WAIT.  Fix (0.40.0):
 - HEAD of arena/019fc860-asdf: `0.39.10-glibc` (pushed but HANDOFF.md updates pending).
 - See HANDOFF.md sections above (0.39.5) for the kv_pthread_cond_wait jobfix gate — still in code, only triggers when dom_get() non-NULL on MAIN.
 - Crash handler updated to log tid + pthread_self + `kv_is_main_thread()` so the crashing thread is unambiguous (commit `0105bd9`).
+
+## ADDENDUM (0.42.1, after 0.42 on-device)
+
+0.42 deployed: SAME crash at mono_class_get_checked(NULL) on MAIN, right after
+kv_pthread_create spawns the JobWorker (start=libunity+0x508174), pc=libil2cpp+
+0xcfccd4 (ldrb [x0,#0x135] x0=NULL), lr=libil2cpp+0xd11c24, caller libunity+0x5c3550.
+
+EXTENSIVE research + RE (not a new theory) established:
+1. Horizon Chase uses Unity **2022.3.33f1** (SAME 2022.3 family as GDS 2022.3.62f2)
+   and its loader works on this exact R36S.  Its boot is structurally IDENTICAL to
+   ours: JNI_OnLoad -> initJni -> nativeRecreateGfxState x2 -> surfaceChanged ->
+   resume -> focus -> nativeRender loop.
+2. libunity reads "job-worker-count" and "Creating JobQueue using job-worker-count
+   value %d" - a config value that sizes the worker pool.  If 0, no JobQueue
+   workers are created, no JobWorker spawn, no mono_class_get_checked crash.
+3. Horizonchase's fallback when job dispatch is broken is ter_inline_task: it
+   FAKES the per-object job completion on main (sets node->next=1 + increments the
+   global completion counter at g_unity_base+0xc10360) - but that offset is HC-specific.
+
+Changes shipped in 0.42.1 (best-evidence, NOT device-proven):
+- data/boot.config: added job-worker-count=0 + background-job-worker-count=0.
+  If libunity reads these from boot.config (same config system as the working
+  gfx-disable-mt-rendering=1), Unity creates 0 workers -> no JobWorker spawn ->
+  no crash.
+- loader/host_syms.c: fixed freestanding build (define `_ctype_` table so the
+  Unicorn bench compiles) - enables headless iteration of the boot logic.
+
+NEXT DEVICE TEST: deploy 0.42.1, read loader.log.  If the crash is GONE but the
+game still doesn't render, we've confirmed job-worker-count=0 works and the next
+blocker is elsewhere.  If the SAME mono_class_get_checked crash persists, then
+libunity does NOT read job-worker-count from boot.config, and the fix must be a
+targeted patch to libunity.so's JobWorker-spawn (libunity+0x5c3490) - either NOP
+the pthread_create at 0x5c3528, or force the worker-count global to 0 via a direct
+memory write (the reference ports' approach).

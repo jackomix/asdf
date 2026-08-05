@@ -338,10 +338,15 @@ int remove(const char *p) { (void)p; return -1; }
 
 /* ---- more libc stubs ---- */
 int _ctype_probe;  /* placeholder */
-/* `_ctype_` is now defined as a real data symbol in glibc_shims.c (the
- * bionic char-class table pointer — see comments there).  Do NOT redefine
- * it here as a function stub: that produces a wrong GOT binding and made
- * libunity crash inside nativeRender during string/asset processing. */
+/* bionic `_ctype_` is the pointer-to-char-class-table (indexed [_ctype_[(int)c+1]]
+ * by isalpha/isdigit/etc).  The glibc build defines it in glibc_shims.c as
+ * `const unsigned char * const _ctype_ = g_kv_ctype_table`.  The freestanding
+ * build needs the same data symbol here (NOT a function stub, which made libunity
+ * crash inside nativeRender). */
+#ifndef KV_USE_GLIBC
+static unsigned char g_kv_freestd_ctype[257];
+const unsigned char * const _ctype_ = g_kv_freestd_ctype;
+#endif
 int puts(const char *s) { if (s) printf("%s\n", s); return 0; }
 float logf(float x) { (void)x; return 0.0f; }
 float ldexpf(float a, int e) { (void)a;(void)e; return 0.0f; }
