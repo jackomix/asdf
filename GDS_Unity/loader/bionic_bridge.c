@@ -347,7 +347,7 @@ static void *kv_worker_wrapper(void *ctxv) {
   fflush(stdout);
   void *(*att)(void *) = (void *(*)(void *))kv_il_sym("il2cpp_thread_attach");
   void *(*dom)(void)   = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
-  if (0 && att && dom) {
+  if (att && dom) {
     void *d = dom();
     if (d) { att(d); printf("[kv_worker] attached new thread to domain %p\n", d); fflush(stdout); }
     else   { printf("[kv_worker] dom_get(NULL) - cannot attach new thread\n"); fflush(stdout); }
