@@ -1803,3 +1803,70 @@ audio/input/gamepad/keyboard/render-scale are game-specific and not the blocker;
 before the game renders is premature. dl_iterate_phdr needs phdr storage in our Module and risks
 the working boot — deferred.  The verified blocker (worker handshake) is addressed by the
 cond/sem port.
+
+---
+
+## 0.60.0-ref — FULL REFERENCE PORT (hitmango-nextos architecture, wholesale)
+
+### What this is
+This is NOT another patch to the divergent 0.5x loader.  It is a complete,
+wholesale port of the WORKING reference loader architecture (hitmango-nextos,
+Unity 2022.3.67f2 — closest to GDS's 2022.3.62f2) adapted for GDS.  Source lives
+in GDS_Unity/loader_ref/ (buildable via loader_ref/build.sh, zig glibc toolchain).
+
+### Files ported verbatim (renamed hgo->gds, game-specific bits adapted)
+- nx_elf.c/h   - the multi-module ARM64 ELF loader (mmap segments, DT_HASH/GNU_HASH
+                  symbol walking, binary-search import resolution, TLS reloc skip).
+- bionic.c     - the complete libc/liblog/libdl/libz surface (bionic ABI diffs:
+                  __android_log_*, __system_property_* Pixel table, FORTIFY __*_chk,
+                  __sF array, sigaction/sigset bridge, sysconf bionic constants,
+                  handle-aware dlopen/dlsym + dl_iterate_phdr + dladdr).
+- pthread_bridge.c - the bionic-slot->glibc-object bridge: mutex (honors bionic
+                  type bits), cond (real 50ms-ceiling timedwait that RELEASES the
+                  mutex - the fix that unblocked the JobWorker handshake), rwlock,
+                  sem (handle table, real blocking wait), attr (bionic layout),
+                  pthread_create honoring attr (stack size/detach).  THE reference
+                  sync layer, complete.
+- android.c     - libandroid/mediandk surface: ANativeWindow (width/height from fb),
+                  ALooper (idle poll), ASensor (none), ATrace, AChoreographer.
+- jni.c         - the complete generic Unity JNI surface: UnityPlayer + NativeLoader
+                  + ReflectionHelper + SharedPreferences + AssetManager + Choreographer
+                  + System.loadLibrary/Runtime.loadLibrary (-> nx_run_init, THE piece
+                  our old loader was missing that made findLibrary-load fail).
+- jni_slots.h   - JNI slot-number table (ABI check).
+- main.c        - reference boot: setup paths -> JNI init -> EGL init (creates SDL
+                  window+GLES2) -> build_imports (bionic+pthread+android+egl) ->
+                  load modules (libmain->libunity->libil2cpp, relocate) -> libmain
+                  init + JNI_OnLoad -> NativeLoader.load -> run_unity() lifecycle
+                  (initJni -> nativeRecreateGfxState x2 -> sendSurfaceChanged ->
+                  focus/resume -> nativeRender loop -> focus loss/pause).
+- gds_egl.c     - reference EGL table interface over our dlopen-based egl_shim.c
+                  (creates the real SDL window + GLES2 context; dlsym the Mali EGL).
+- gds_fs.c      - GDS data-path redirect: maps assets/bin/Data, bin/Data, assets/,
+                  and bare global-metadata.dat -> flat <gamedir>/data/ tree.
+- input.c       - minimal touch-game input (exit chord via dlopen SDL; no-op
+                  keyboard callbacks).  GDS is a Kairosoft touch game, not gamepad.
+- audio.c       - no-op (GDS libunity imports only fmodf, a libm math fn, NOT FMOD).
+- zlib_stub.c   - resolve libz symbols via dlsym so the loader doesn't link libz.
+
+### GDS adaptations (only the game-specific bits)
+- Package name -> net.kairosoft.android.gamedev3en
+- LIBS list: libmain, libunity, libil2cpp (no Firebase)
+- .so files at <gamedir>/ directly (not <gamedir>/lib/), data at <gamedir>/data/
+- il2cpp_set_data_dir(<gamedir>/data/Managed) before libil2cpp init_array runs
+  (the bench-proven metadata-path fix, applied in j_System_loadLibrary).
+
+### Why this is different
+Every prior 0.5x build was the OLD loader with targeted patches.  This replaces
+the loader ENTIRELY with the reference's proven architecture - including the
+System.loadLibrary binding that the old loader never had (which is what Unity
+needs to actually load il2cpp after findLibrary returns a path).  Version marker
+is "0.60.0-ref" (gds_deploy.sh regex already accepts -[a-z0-9]+ suffixes).
+
+### Honest status
+Builds cleanly as a glibc-linked aarch64 binary (not freestanding, so the Unicorn
+bench can't run it headlessly - it must be tested on-device).  Deploy 0.60.0-ref
+and the log should show the reference boot sequence [gds] initJni... ->
+nativeRecreateGfxState -> nativeRender loop, now with System.loadLibrary binding
+so il2cpp actually loads.  If it reaches nativeRender, the game data/rendering is
+the next surface (input is minimal; GDS is touch).
