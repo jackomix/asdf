@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <ucontext.h>
@@ -85,7 +86,9 @@ static void kv_sighandler(int sig, void *info, void *ucontext) {
     (void)info;
 
     char buf[4096]; int n = 0;
-    n += sprintf(buf + n, "[loader] === CRASH sig=%d tid=%ld ===\n", sig, (long)syscall(178));
+extern int kv_is_main_thread(void);
+    n += sprintf(buf + n, "[loader] === CRASH sig=%d tid=%ld pthread_self=%p main=%d ===\n",
+                 sig, (long)syscall(178), (void*)pthread_self(), kv_is_main_thread());
     n += sprintf(buf + n, "[loader]   FAR=0x%lx\n", far);
     n += sprintf(buf + n, "[loader]   pc=0x%lx sp=0x%lx fp(x29)=0x%lx lr(x30)=0x%lx\n",
                  pc, sp, x29, x30);
