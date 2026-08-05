@@ -102,7 +102,7 @@ void *gds_egl_sym(const char *name) {
 }
 
 void *gds_gl_sym(const char *name) {
-    void *f = dlsym(RTLD_DEFAULT, name);
+    void *f = eglGetProcAddress(name);   /* egl_shim proxies to SDL_GL_GetProcAddress */
     if (f) return f;
-    return eglGetProcAddress(name);   /* egl_shim proxies to SDL_GL_GetProcAddress */
+    return dlsym(RTLD_DEFAULT, name);
 }

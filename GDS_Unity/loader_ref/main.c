@@ -24,7 +24,7 @@
 #include "nx_elf.h"
 #include "gds.h"
 
-#define GDS_BUILD_VERSION "0.60.2-ref"
+#define GDS_BUILD_VERSION "0.60.3-ref"
 
 char gds_gamedir[1024];
 char gds_datadir[1024];

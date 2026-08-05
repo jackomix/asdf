@@ -579,9 +579,27 @@ static int my_sched_setaffinity(pid_t pid, size_t setsize, const void *mask)
 #ifndef SYS_sched_getaffinity
 #define SYS_sched_getaffinity 123
 #endif
+#ifndef SYS_kill
+#define SYS_kill 129
+#endif
+#ifndef SYS_tkill
+#define SYS_tkill 130
+#endif
+#ifndef SYS_tgkill
+#define SYS_tgkill 131
+#endif
 
 static long my_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6)
 {
+    if ((n == SYS_kill && a2 == 5) ||
+        (n == SYS_tkill && a2 == 5) ||
+        (n == SYS_tgkill && a3 == 5)) {
+        char buf[160];
+        int m = snprintf(buf, sizeof buf, "[gds] === ENGINE syscall(n=%ld, sig=5) from caller=%p (ignored debug trap) ===\n",
+                         n, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+        return 0;
+    }
     if (n == SYS_sched_getaffinity && a3) {
         long r = syscall(n, a1, a2, a3, a4, a5, a6);
         if (r > 0) {
@@ -627,6 +645,13 @@ static void my_abort(void)
 }
 static int my_raise(int sig)
 {
+    if (sig == 5 /* SIGTRAP: Unity debugger breakpoint/marker */ || sig == 0) {
+        char buf[160];
+        int m = snprintf(buf, sizeof buf, "[gds] === ENGINE raise(sig=%d) from caller=%p (ignored debug trap) ===\n",
+                         sig, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+        return 0;
+    }
     char buf[160];
     int m = snprintf(buf, sizeof buf, "[gds] === ENGINE raise(sig=%d) caller=%p ===\n",
                      sig, __builtin_return_address(0));
@@ -635,12 +660,41 @@ static int my_raise(int sig)
 }
 static int my_tgkill(int tgid, int tid, int sig)
 {
+    if (sig == 5 /* SIGTRAP */ || sig == 0) {
+        char buf[200];
+        int m = snprintf(buf, sizeof buf, "[gds] === ENGINE tgkill(tgid=%d tid=%d sig=%d) from caller=%p (ignored debug trap) ===\n",
+                         tgid, tid, sig, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+        return 0;
+    }
     char buf[200];
     int m = snprintf(buf, sizeof buf, "[gds] === ENGINE tgkill(tgid=%d tid=%d sig=%d) caller=%p ===\n",
                      tgid, tid, sig, __builtin_return_address(0));
     if (write(2, buf, m) < 0) { /* ignore */ }
     if (sig == 0) return 0;
     return raise(sig);
+}
+static int my_kill(pid_t pid, int sig)
+{
+    if (sig == 5 || sig == 0) {
+        char buf[160];
+        int m = snprintf(buf, sizeof buf, "[gds] === ENGINE kill(pid=%d sig=%d) from caller=%p (ignored debug trap) ===\n",
+                         (int)pid, sig, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+        return 0;
+    }
+    return kill(pid, sig);
+}
+static int my_pthread_kill(pthread_t t, int sig)
+{
+    if (sig == 5 || sig == 0) {
+        char buf[160];
+        int m = snprintf(buf, sizeof buf, "[gds] === ENGINE pthread_kill(t=%p sig=%d) from caller=%p (ignored debug trap) ===\n",
+                         (void *)(uintptr_t)t, sig, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+        return 0;
+    }
+    return pthread_kill(t, sig);
 }
 static void my_exit(int code)
 {
@@ -811,6 +865,7 @@ static nx_import tab[] = {
     M(_Exit),
     M(perror),
     A("tgkill", my_tgkill),
+    A("kill", my_kill),
     A("_ZTH15gDeferredAction", _ZTH15gDeferredAction),
 
     /* files */
@@ -863,7 +918,7 @@ static nx_import tab[] = {
     /* pthread calls whose objects are plain scalars on arm64: pthread_t is a
      * pointer and pthread_key_t an unsigned int in both libcs, so no bridge. */
     E(pthread_self), E(pthread_join), E(pthread_detach), E(pthread_equal),
-    E(pthread_exit), E(pthread_kill), E(pthread_key_create),
+    E(pthread_exit), M(pthread_kill), E(pthread_key_create),
     E(pthread_key_delete), E(pthread_getspecific), E(pthread_setspecific),
     M(pthread_sigmask), M(pthread_atfork), E(pthread_getcpuclockid),
 

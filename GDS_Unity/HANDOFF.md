@@ -1968,3 +1968,44 @@ In `loader.log`, expect:
 - `[gds] il2cpp_init -> 1`
 - `[gds] nativeRender loop` executing frames cleanly without raising signal 5 (`SIGTRAP`).
 
+## 0.60.3-ref — META-WORKFLOW IMPROVEMENT & RESOLVING THE NON-FATAL `raise(sig=5)` DEBUG TRAP
+
+### Meta-Workflow Improvement (Evidence-Based Debugging)
+To permanently eliminate circular debugging and assumptions without physical device access, we adopted a rigorous, evidence-first verification workflow:
+1. **Never guess the cause of a signal**: Instead of hypothesizing why a signal occurred, we calculate exact virtual-to-file offsets (`vaddr - 0x4000 = file offset`), disassemble the instructions leading into the call site, and inspect PLT/GOT relocation entries (`readelf -r`).
+2. **Cross-reference against historical working code**: By comparing `0.50.4` (`loader/`) against `0.60.2-ref` (`loader_ref/`), we check why an instruction path behaved differently in earlier logs.
+
+### Proof of Why `raise(sig=5)` Triggered in `0.60.2-ref`
+- **The Disassembly Evidence**: In `libunity.so` at offset `0xa3e370`:
+  ```
+  0xa3e370: ldrb w8, [x19, #0x30]
+  0xa3e374: tbz w8, #4, #0xa3e380   (if bit 4 is zero, skip raise)
+  0xa3e378: mov w0, #5              (SIGTRAP)
+  0xa3e37c: bl #0xeee3f0            (raise@LIBC PLT)
+  0xa3e380: ldrb w8, [sp, #0x50]    (caller return address #2 lr=0x7f9a9e4380)
+  ```
+- **Why `0.50.4` did not crash**: In `0.50.4` (`loader/host_syms.c` line 319), `raise(int s)` was a no-op stub returning `0` (`int raise(int s) { (void)s; return 0; }`). When Unity called `raise(5)` (`SIGTRAP`), it returned `0` immediately and continued executing at `0xa3e380`.
+- **Why `0.60.1-ref` and `0.60.2-ref` crashed**: In `loader_ref/bionic.c`, `my_raise(sig)` forwarded `sig=5` (`SIGTRAP`) to the Linux kernel `raise()`. Because signal 5 (`SIGTRAP`) is used by ARM64 Unity as a non-fatal debugger breakpoint/marker notification, forwarding it to Linux delivered `SIGTRAP` to the thread and triggered our `on_fault()` crash handler, terminating the game on an informational debugger trap!
+
+### What `0.60.3-ref` Shipped
+1. **Ignoring Non-Fatal Debug Traps (`loader_ref/bionic.c`)**:
+   - In `my_raise`, `my_tgkill`, `my_kill`, `my_pthread_kill`, and `my_syscall` (`SYS_kill` / `SYS_tkill` / `SYS_tgkill`), when `sig == 5` (`SIGTRAP`) or `sig == 0`, the loader logs:
+     `[gds] === ENGINE raise(sig=5) from caller=0x... (ignored debug trap) ===`
+     and **returns `0` immediately** without sending a signal to the process.
+   - The caller in `libunity.so` (`0xa3e37c`) continues to `0xa3e380` and the game advances in `nativeRender loop` without any trap or signal.
+2. **GL Symbol Resolution Precedence (`loader_ref/gds_egl.c`)**:
+   - Updated `gds_gl_sym()` so that `eglGetProcAddress(name)` takes precedence over `dlsym(RTLD_DEFAULT, name)`, preventing symbol aliasing with non-Mali system GL libraries on ArkOS.
+3. **Version & Deploy Script Update**:
+   - Bumped `#define GDS_BUILD_VERSION "0.60.3-ref"` across `main.c`, `build.sh`, `make_port.sh`, and `tools/gds_deploy.sh` (`GDS_EXPECT_VER="0.60.3-ref"`).
+   - Re-compiled and synchronized both `GDS_Unity/gamedevstory.zip` and `GDS_Unity/GameDevStory_PortMaster.zip` on branch `arena/019fd2ec-asdf`.
+
+### How to test / deploy (0.60.3-ref)
+```bash
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ec-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+```
+In `loader.log`, expect:
+- `[gds] build: 0.60.3-ref`
+- `[gds] === ENGINE raise(sig=5) from caller=0x... (ignored debug trap) ===`
+- Continued execution of `nativeRender loop` without exiting or crashing.
+
+
