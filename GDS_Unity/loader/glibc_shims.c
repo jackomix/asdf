@@ -179,6 +179,54 @@ extern int kv_is_main_thread(void);
  * handler invocation.  256KB comfortably holds the handler even on a blown
  * main stack. */
 static char kv_altstack_buf[256 * 1024] __attribute__((aligned(16)));
+
+/* 0.50.2: SIGUSR1 -> dump the receiving thread's PC + regs + backtrace and
+ * RETURN (unlike kv_sighandler which exits).  The watchdog sends SIGUSR1 to the
+ * main thread (which is busy-spinning, so /proc/self/task/<tid>/syscall just says
+ * "running" and gives no PC) to reveal exactly where it spins in nativeRender. */
+extern int kv_is_main_thread(void);
+static void kv_usrdump_handler(int sig, void *info, void *ucontext) {
+    (void)sig; (void)info;
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    unsigned long pc = uc ? uc->uc_mcontext.pc : 0;
+    unsigned long sp = uc ? uc->uc_mcontext.sp : 0;
+    unsigned long x29 = uc ? uc->uc_mcontext.regs[29] : 0;
+    unsigned long x30 = uc ? uc->uc_mcontext.regs[30] : 0;
+    char buf[2048]; int n = 0;
+    n += sprintf(buf + n, "[usp] === SIGUSR1 dump tid=%ld main=%d pc=0x%lx sp=0x%lx fp=0x%lx lr=0x%lx ===\n",
+                 (long)syscall(178), kv_is_main_thread(), pc, sp, x29, x30);
+    if (uc) for (int i = 0; i < 29; i++) {
+        n += sprintf(buf + n, " x%-2d=0x%lx", i, (unsigned long)uc->uc_mcontext.regs[i]);
+        if (i % 4 == 3) { buf[n++] = '\n'; }
+    }
+    if (n > 0 && buf[n-1] != '\n') buf[n++] = '\n';
+    /* backtrace via x29 chain (safe reads via /proc/self/mem) */
+    n += sprintf(buf + n, "[usp] backtrace:\n");
+    unsigned long fp = x29; int frame = 0;
+    while (fp && frame < 24) {
+        unsigned long lr = 0;
+        int memfd = open("/proc/self/mem", O_RDONLY);
+        if (memfd >= 0) {
+            if (lseek(memfd, (off_t)(fp + 8), SEEK_SET) == (off_t)(fp + 8) &&
+                read(memfd, &lr, 8) == 8) { } else { lr = 0; }
+            close(memfd);
+        }
+        n += sprintf(buf + n, "[usp]   #%d lr=0x%lx\n", frame, lr);
+        if (!lr) break;
+        unsigned long nextfp = 0;
+        int m2 = open("/proc/self/mem", O_RDONLY);
+        if (m2 >= 0) {
+            if (lseek(m2, (off_t)fp, SEEK_SET) == (off_t)fp &&
+                read(m2, &nextfp, 8) != 8) nextfp = 0;
+            close(m2);
+        }
+        if (nextfp <= fp) break;
+        fp = nextfp; frame++;
+    }
+    (void)write(2, buf, n);
+    (void)write(2, "\n", 1);
+}
+
 void kv_install_crash_handler(void) {
     /* Without an alternate signal stack, a segfault that fires while the
      * stack pointer is near the stack guard / on a tiny stack cannot deliver
@@ -209,6 +257,12 @@ void kv_install_crash_handler(void) {
     sigaction(SIGFPE,  &sa, 0);
     sigaction(SIGTRAP, &sa, 0);
     sigaction(SIGSYS,  &sa, 0);
+    /* SIGUSR1: diagnostic PC dump (returns, doesn't die). */
+    { struct sigaction su; memset(&su, 0, sizeof su);
+      su.sa_sigaction = kv_usrdump_handler;
+      su.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+      sigemptyset(&su.sa_mask);
+      sigaction(SIGUSR1, &su, 0); }
 }
 
 /* ------------------ engine abort/exit path overrides (0.30) ------------------

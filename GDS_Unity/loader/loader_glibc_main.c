@@ -121,7 +121,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.50.1-glibc"
+#define GDS_BUILD_VERSION "0.50.2-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -571,6 +571,10 @@ static void *kv_watchdog(void *arg) {
     for (int dump = 0; dump < 5; dump++) {
         struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
         nanosleep(&ts, 0);
+        /* 0.50.2: interrupt the main thread (busy-spinning, so its /proc/.../syscall
+         * says "running") with SIGUSR1 to dump its actual PC + backtrace. */
+        syscall(129 /*SYS_kill*/, (long)getpid(), 10 /*SIGUSR1*/);
+        { struct timespec s2; s2.tv_sec = 0; s2.tv_nsec = 100000000; nanosleep(&s2, 0); }
         printf("[watchdog] === thread dump #%d (blocked syscalls + wchan + kstack) ===\n", dump);
     DIR *d = opendir("/proc/self/task");
     if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
