@@ -201,6 +201,8 @@ static int kv_sys_cpu_fd(void) {
 int kv_open(const char *p, int flags, ...) {
     fs_load_real();
     if (!r_open) return -1;
+    if (p && strstr(p, "global-metadata.dat"))
+        printf("[fs] open(global-metadata.dat '%s')\n", p);
     if (p && (strstr(p, "cpuinfo") || strstr(p, "cpu/") || strstr(p, "cpu_") || strstr(p, "/sys/devices/system/cpu") || strstr(p, "/proc/stat") || strstr(p, "thermal") || strstr(p, "cpufreq") || strstr(p, "topology"))) {
         printf("[fs] open(%s)\n", p);
     }
@@ -232,6 +234,8 @@ int kv_open64(const char *p, int flags, ...) {
 FILE *kv_fopen(const char *p, const char *mode) {
     fs_load_real();
     if (!r_fopen) return NULL;
+    if (p && strstr(p, "global-metadata.dat"))
+        printf("[fs] fopen(global-metadata.dat '%s')\n", p);
     if (p) {
         if (strstr(p, "cmdline")) { int fd = kv_cmdline_fd(); if (fd >= 0) return fdopen(fd, "r"); }
         if (strstr(p, "cpuinfo")) { int fd = kv_cpuinfo_fd(); if (fd >= 0) return fdopen(fd, "r"); }
