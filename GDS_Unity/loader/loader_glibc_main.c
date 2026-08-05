@@ -121,7 +121,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.42.1-glibc"
+#define GDS_BUILD_VERSION "0.43.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -717,6 +717,42 @@ void *kv_set_job_workers_zero(void *unused) {
     return 0;
 }
 
+/* 0.43.0: FUNDAMENTAL metadata-path fix.
+ *
+ * The player-loop boot path never called il2cpp_set_data_dir / il2cpp_init;
+ * Unity's internal il2cpp_init (inside the first nativeRender) therefore used
+ * whatever data dir its JNI context implied.  If that resolves to a path where
+ * global-metadata.dat is NOT reachable, il2cpp loads no metadata -> EVERY class
+ * lookup returns NULL -> the job-worker spawn's managed-object construction
+ * crashes with a NULL class (the mono_class_get_checked-family crash we've been
+ * chasing).  Our fs_redirect rewrites global-metadata.dat by BASENAME to
+ * <data_dir>/global-metadata.dat, but the real file lives at
+ * <data_dir>/Managed/Metadata/global-metadata.dat - so a bare-path open fails.
+ *
+ * Fix: set the il2cpp dirs explicitly to our "data/" tree BEFORE Unity's
+ * internal il2cpp_init runs (during initJni/first nativeRender).  This makes
+ * il2cpp open data/Managed/Metadata/global-metadata.dat directly.  We do NOT
+ * call il2cpp_init ourselves (that hit uninitialized globals / hung) - we only
+ * arm the dirs Unity's own init will consume. */
+static void kv_il_prepare_dirs(void) {
+    void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+    void *(*set_cfg)(const char *) = kv_il_sym("il2cpp_set_config_dir");
+    void *(*set_temp)(const char *) = kv_il_sym("il2cpp_set_temp_dir");
+    void *(*set_cli)(int, void *, void *) = kv_il_sym("il2cpp_set_commandline_arguments");
+    void *(*dom_get)(void) = kv_il_sym("il2cpp_domain_get");
+    if (set_data) { set_data("data"); printf("[il2cpp] set_data_dir(\"data\")\n"); }
+    if (set_cfg)  { set_cfg("data/etc"); printf("[il2cpp] set_config_dir(\"data/etc\")\n"); }
+    if (set_temp) { set_temp("/tmp"); }
+    if (set_cli) {
+        char **av = calloc(2, sizeof(char *));
+        av[0] = strdup("GameDevStory");
+        set_cli(1, av, 0);
+    }
+    /* Diagnostics: is the il2cpp domain up yet?  NULL here means il2cpp hasn't
+     * initialized when the job spawn runs -> classes can't resolve. */
+    printf("[il2cpp] domain_get before nativeRender = %p\n", dom_get ? dom_get() : (void *)0);
+}
+
 static void kv_unity_boot(void) {
     void *env = kv_jni_env();
     /* Give Unity real, zeroed thiz/ctx/surf objects instead of tiny fake
@@ -729,6 +765,10 @@ static void kv_unity_boot(void) {
     void *thizp = thiz;
     unsigned char (*render)(void *, void *) = (unsigned char (*)(void *, void *))kv_jni_find_native("nativeRender");
     if (!render) { printf("[unity] no nativeRender registered - cannot drive player loop\n"); return; }
+
+    /* 0.43.0: arm il2cpp data/config dirs before Unity's internal il2cpp_init
+     * (inside the first nativeRender) so it can find global-metadata.dat. */
+    kv_il_prepare_dirs();
 
     /* THE fix for nativeRecreateGfxState (the graphics-init wall): per
      * terraria-nextos, create the REAL SDL2 window + GLES2 context and make it
@@ -767,10 +807,19 @@ static void kv_unity_boot(void) {
     if ((fn = kv_jni_find_native("nativeResume"))) {
         ((void (*)(void *, void *))fn)(env, thizp);
     }
+    /* oceanhorn-nextos parity: the APK's UnityPlayer also calls
+     * nativeRestartActivityIndicator in the lifecycle, before focus. */
+    if ((fn = kv_jni_find_native("nativeRestartActivityIndicator"))) {
+        ((void (*)(void *, void *))fn)(env, thizp);
+    }
     if ((fn = kv_jni_find_native("nativeFocusChanged"))) {
         ((void (*)(void *, void *, int))fn)(env, thizp, 1);
     }
     printf("[unity] nativeRender loop...\n");
+    {
+        void *(*dom_get)(void) = kv_il_sym("il2cpp_domain_get");
+        printf("[il2cpp] domain_get at nativeRender entry = %p\n", dom_get ? dom_get() : (void *)0);
+    }
     kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
     /* 0.39.5: jobzero is now invoked from kv_pthread_cond_wait the FIRST time
      * it's called on the main thread (main reaches cond_wait inside the

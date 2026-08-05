@@ -1490,3 +1490,76 @@ libunity does NOT read job-worker-count from boot.config, and the fix must be a
 targeted patch to libunity.so's JobWorker-spawn (libunity+0x5c3490) - either NOP
 the pthread_create at 0x5c3528, or force the worker-count global to 0 via a direct
 memory write (the reference ports' approach).
+
+---
+
+## 0.43.x — Link review + crash-site dissection (addendum, build 0.42.1-glibc era)
+
+### Review of the 12 links the user provided (all examined; 4 cloned)
+Genuinely useful (HIGH): **oceanhorn-nextos** and **hitmango-nextos** — both are the SAME
+author and BOTH run a Unity 2022.3-family IL2CPP engine natively on THIS exact R36S/ArkOS
+Mali-G31:
+- **oceanhorn = Unity 2022.3.61f1** (straddles GDS's 62f2). README states it is PLAYABLE on
+  "R36S / ArkOS (RK3326, Mali-G31), KMSDRM, ES3.0, 640×480". This is hard proof-by-example
+  that the bionic→glibc so-loader + full Unity job system CAN work on this exact hardware.
+- **hitmango = Unity 2022.3.67f2** (above GDS). Same architecture.
+Both loaders already live in `/home/user/*-nextos` (same machine) — GDS's loader is derived
+from them. Both default to NORMAL worker spawns (they do NOT force 1 CPU by default) and yet
+do NOT crash — so spawning a Job.Worker is NOT inherently broken on this device. Their
+`TER_JOBWORKERS0` (call `JobsUtility.set_JobWorkerCount(0)` via il2cpp_runtime_invoke) and
+`TER_JOBINLINE`/`CUP_1CORE` (report 1 CPU) are OPT-IN fallbacks, fired from the swap-hook on
+the FIRST PRESENT (`my_eglSwapBuffers` → `ter_shot_hook` → `ter_nuke_methods()+ter_jobworkers0()`).
+
+Medium (worth a look if we need it): **Cpp2IL**, **cpp2il.com**, **Il2CppDumperLinux** —
+decompile libil2cpp.so + global-metadata.dat → C#; would let us dump the EXACT managed class
+being constructed (to see WHY it resolves NULL) and the exact `JobsUtility.set_JobWorkerCount`
+signature. **frida-il2cpp-bridge** — runtime il2cpp hooking; concept useful but needs a JVM/Frida,
+not applicable to our bare native loader.
+
+Low / not applicable: kotamon-dev-cheese, MeowNet-recroom-Dump, operator-modding-toolkit,
+kgc-private-server, SonolusReverse (all game-specific modding); theescapists (Box64 x86_64 — a
+different paradigm; no x86_64 build of GDS exists, so N/A).
+
+### Crash-site dissection (vaddr→file+0x4000 confirmed for both libs)
+- libil2cpp+0xcfcccc is the real faulting fn: `ldrb w8,[x0,#0x135]` (reads a flag bit 1 at
+  offset 0x135) with **x0=NULL**. lr=libil2cpp+0xd11c24 (a "checked class" helper that calls
+  0xcfcccc). So a NULL *object/class* pointer reaches a managed-object/class accessor → the
+  job path is constructing a managed object from a NULL class.
+- libunity caller path: 0x5c3490 (JobWorker spawn) → `bl 0xeee5e0`(pthread_create) at 0x5c3528
+  → spin on [x20+0x20] → `bl 0x5c35d0` → 0x5c395c jump-table dispatch → managed object
+  construction → NULL class. NOTE: 0x5c3490 calls pthread_create in BOTH branches (w22==0 and
+  w22!=0 converge at 0x5c3524), so forcing the count arg to 0 does NOT skip the spawn — only
+  preventing 0x5c3490 from being CALLED does.
+
+### NEW EVIDENCE (invalides the "report 1 CPU" approach for GDS)
+The on-device log right before the crash shows Unity reading /proc/cpuinfo and
+/sys/devices/system/cpu/{present,possible} MULTIPLE times (we inject 1 CPU in all of them),
+plus sysconf(_SC_PAGESIZE=39). **A JobWorker STILL spawns.** So the GDS worker-spawn count is
+NOT (cores−1) derived from cpuinfo/sysconf — the "report 1 core" trick that works for
+Terraria/oceanhorn/hitmango does NOT transfer to GDS. That is WHY builds 0.23→0.42 all crashed
+identically. The count is likely a player-setting (`job-worker-count` string @ libunity vaddr
+0xb0dee) or a fixed value. boot.config `job-worker-count=0` did NOT stop it in 0.42.1 — but we
+have NOT yet proven whether libunity even READS data/boot.config on device (bench showed the
+loader's own read of `data/boot.config` resolves relative to cwd; on device cwd is
+/roms/ports/gamedevstory so `data/boot.config` should be found — but it is a FOLDER named
+`data`, i.e. the fs_redirect target is `data/boot.config` = the real file. UNCONFIRMED that
+libunity parses it).
+
+### Headless bench status
+The Unicorn bench (run_aarch64.py) loads the real 3 .so, reaches initJni, then crashes in
+nativeRecreateGfxState at libunity+0x5ccb38 = `strb 1,[thiz[0x148]]` with thiz[0x148]=NULL.
+Pre-filling thiz[0x148] in loader.c did NOT survive — Unity re-zeroes that field in the
+GPU-less path, so the bench diverges from the device at nativeRecreateGfxState and CANNOT be
+pushed to repro the mono_class_get_checked crash. Bench = partial repro only (confirmed).
+
+### Next experiments (pick one, device)
+1. **Prove whether libunity reads/applies data/boot.config on device** (add a log to
+   kv_fopen/kv_open when "boot.config" is opened; verify the file is parsed). If NOT read, fix
+   the path so job-worker-count=0 actually reaches the config table — this is the cheapest test
+   of the boot.config theory.
+2. **Cpp2IL dump** of libil2cpp.so + global-metadata.dat to identify the NULL class being
+   constructed in the job path (what assembly/class), to understand root cause.
+3. **Match oceanhorn's boot exactly** (it works on this device): verify we call every lifecycle
+   method it calls (nativeRestartActivityIndicator, nativeSendSurfaceChangedEvent order), and
+   adopt its swap-hook `ter_nuke_methods()`/`set_JobWorkerCount(0)` timing if it can be fired
+   BEFORE the first worker spawn (il2cpp_init completes early inside the first nativeRender).
