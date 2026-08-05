@@ -85,7 +85,7 @@ static void kv_sighandler(int sig, void *info, void *ucontext) {
     (void)info;
 
     char buf[4096]; int n = 0;
-    n += sprintf(buf + n, "[loader] === CRASH sig=%d ===\n", sig);
+    n += sprintf(buf + n, "[loader] === CRASH sig=%d tid=%ld ===\n", sig, (long)syscall(178));
     n += sprintf(buf + n, "[loader]   FAR=0x%lx\n", far);
     n += sprintf(buf + n, "[loader]   pc=0x%lx sp=0x%lx fp(x29)=0x%lx lr(x30)=0x%lx\n",
                  pc, sp, x29, x30);

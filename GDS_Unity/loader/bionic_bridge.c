@@ -333,6 +333,26 @@ int kv_pthread_join(pthread_t t, void **r) {
   return pthread_join(t, r);
 }
 pthread_t kv_pthread_self(void) { return pthread_self(); }
+
+/* 0.39.6: Wrap Unity worker start_routine so the new thread attaches to
+ * il2cpp domain BEFORE running the original start. Without this, the worker
+ * start_routine calls il2cpp class lookups with no thread context -> NULL
+ * MonoClass* -> crash in mono_class_get_checked. terra-nextos achieves the
+ * same result via il2cpp_thread_attach(domain) at top of every worker bootstrap. */
+struct kv_worker_ctx { void *(*orig_start)(void *); void *orig_arg; };
+static void *kv_worker_wrapper(void *ctxv) {
+  struct kv_worker_ctx *ctx = (struct kv_worker_ctx *)ctxv;
+  void *(*att)(void *) = (void *(*)(void *))kv_il_sym("il2cpp_thread_attach");
+  void *(*dom)(void)   = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
+  if (att && dom) {
+    void *d = dom();
+    if (d) { att(d); printf("[kv_worker] attached new thread to domain %p\n", d); fflush(stdout); }
+    else   { printf("[kv_worker] dom_get(NULL) - cannot attach new thread\n"); fflush(stdout); }
+  }
+  void *(*s)(void *) = ctx->orig_start; void *a = ctx->orig_arg;
+  free(ctx);
+  return s(a);
+}
 int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), void *arg) {
   static int n; long tid = syscall(178);
   if (++n <= 300) printf("[kv_pthread_create] n=%d tid=%ld start=%p arg=%p\n", n, tid, (void*)start, (void*)arg);
@@ -375,12 +395,15 @@ int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), vo
   int il2 = (att && s >= lo_il && s < hi_il);
   int un  = (unity_send && s >= lo_un && s < hi_un);
   if (il2 || un) {
-    printf("[kv_pthread_create] Unity-internal worker spawn (start=%p mod=%s offset=0x%lx) — REAL spawn for disasm\n",
+    printf("[kv_pthread_create] Unity-internal worker spawn (start=%p mod=%s offset=0x%lx) — wrapping with thread_attach\n",
            (void*)s, il2?"libil2cpp":"libunity",
            (unsigned long)(s - (il2?lo_il:lo_un)));
     fflush(stdout);
+    struct kv_worker_ctx *ctx = (struct kv_worker_ctx *)malloc(sizeof(*ctx));
+    if (!ctx) return ENOMEM;
+    ctx->orig_start = start; ctx->orig_arg = arg;
+    return pthread_create(t, NULL, kv_worker_wrapper, ctx);
   }
-  (void)il2; (void)un; (void)hi_il; (void)hi_un;
   return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }
