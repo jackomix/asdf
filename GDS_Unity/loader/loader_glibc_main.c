@@ -30,6 +30,9 @@ extern void *stdout;
 extern void *stderr;
 #define _IONBF 2
 
+/* Raw syscall for kv_pin_to_one_cpu (kv_libc.h doesn't declare syscall). */
+extern long syscall(long n, ...);
+
 /* Declarations for the watchdog (manual, no <dirent.h> due to the
  * freestanding kv_libc.h decls).  pthread_create/pthread_detach/nanosleep/
  * snprintf are already declared in kv_libc.h.  ABI-compatible with glibc. */
@@ -118,7 +121,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.40.0-glibc"
+#define GDS_BUILD_VERSION "0.42.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */

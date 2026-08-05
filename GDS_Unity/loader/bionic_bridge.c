@@ -403,25 +403,15 @@ int kv_pthread_create(pthread_t *t, const void *attr, void *(*start)(void *), vo
    *
    * Real worker code path is unknown yet.  Fall back: spawn NORMALLY and
    * let it crash, capture log, then we know start_routine body. */
-  void *att = kv_il_sym("il2cpp_thread_attach");           /* libil2cpp */
-  void *unity_send = kv_il_sym("UnitySendMessage");         /* libunity */
-  uintptr_t lo_il = (uintptr_t)att - 0xce47ec;               /* libil2cpp base */
-  uintptr_t hi_il = lo_il + 0x221f000;
-  uintptr_t lo_un = (uintptr_t)unity_send - 0x642b18;          /* libunity base */
-  uintptr_t hi_un = lo_un + 0x103a000;
-  uintptr_t s = (uintptr_t)start;
-  int il2 = (att && s >= lo_il && s < hi_il);
-  int un  = (unity_send && s >= lo_un && s < hi_un);
-  if (il2 || un) {
-    printf("[kv_pthread_create] Unity-internal worker spawn (start=%p mod=%s offset=0x%lx) — wrapping with thread_attach\n",
-           (void*)s, il2?"libil2cpp":"libunity",
-           (unsigned long)(s - (il2?lo_il:lo_un)));
-    fflush(stdout);
-    struct kv_worker_ctx *ctx = (struct kv_worker_ctx *)malloc(sizeof(*ctx));
-    if (!ctx) return ENOMEM;
-    ctx->orig_start = start; ctx->orig_arg = arg;
-    return pthread_create(t, NULL, kv_worker_wrapper, ctx);
-  }
+  /* 0.42.0: sysconf(96/97) now reports 1 CPU (bionic NPROCESSORS constants), so
+   * Unity creates 0 job workers and this path should not fire.  Even if a worker
+   * IS spawned, DO NOT wrap it with kv_worker_wrapper / thread_attach: that
+   * wrapper (0.39.x) runs the worker's start_routine which does il2cpp class
+   * lookups with no thread context and CRASHES at mono_class_get_checked (NULL
+   * MonoClass*).  The reference ports (terraria/horizonchase) do NOT wrap
+   * workers with thread_attach; they just let them run (and their sysconf
+   * reports 1 CPU so no worker is created).  Pass through to real pthread_create. */
+  (void)kv_il_sym;
   return pthread_create(t, NULL, start, arg);
 }
 int kv_pthread_attr_init(void *a) { (void)a; return 0; }
@@ -559,8 +549,17 @@ int kv_sched_setaffinity(int pid, size_t setsize, const void *mask) {
 long kv_sysconf(int name) {
     static int once; if (!once && (once = 1))
         printf("[kv_sysconf] routed! name=%d tid=%ld\n", name, (long)syscall(178));
-    if (name == 0x62 || name == 0x61) return 1;   /* 1 CPU -> 0 job workers */
-    if (name == 0x27) return 4096;                 /* _SC_PAGESIZE */
+    /* CRITICAL (0.42): Unity calls sysconf() with BIONIC constants, not glibc's.
+     * Horizonchase's my_sysconf documents this: _SC_PAGE_SIZE/PAGESIZE = 39/40,
+     * _SC_NPROCESSORS_CONF/ONLN = 96/97, _SC_PHYS_PAGES = 98, _SC_AVPHYS_PAGES = 99.
+     * Returning the REAL CPU count (96/97) made Unity spawn (ncpus-1) Job.Workers,
+     * whose bootstrap (libunity+0x508174) did il2cpp class lookups with no thread
+     * context and crashed at mono_class_get_checked (NULL MonoClass*) on main.
+     * Report 1 CPU -> 0 job workers -> jobs run inline -> no worker spawn -> no crash. */
+    if (name == 96 /*bionic _SC_NPROCESSORS_CONF*/ || name == 97 /*bionic _SC_NPROCESSORS_ONLN*/
+        || name == 0x61 || name == 0x62 || name == 83 || name == 84) return 1;
+    if (name == 39 || name == 40 /*bionic _SC_PAGE_SIZE/PAGESIZE*/) return 4096;
+    if (name == 0x27 || name == 30 /*glibc _SC_PAGESIZE*/) return 4096;
     return sysconf(name);
 }
 

@@ -1371,7 +1371,34 @@ caused heavy wifi traffic).  User needs to reboot R36S to recover WiFi.
   via libc's pthread_create (NOT via libil2cpp's GOT).  Needs disasm of
   `start=0x202737174` libil2cpp offset 0x2737174 to confirm.
 
-## LATEST STATUS (build 0.40.0-glibc) - fire jobfix from the MAIN-THREAD futex wait
+## LATEST STATUS (build 0.42.0-glibc) - ROOT CAUSE: sysconf uses BIONIC constants (96/97)
+
+The 0.40 log was the breakthrough: crash at mono_class_get_checked NULL on MAIN=1
+right after kv_pthread_create spawns the JobWorker, with `[kv_sysconf] name=39`.
+
+Studying horizonchase's my_sysconf revealed the ROOT CAUSE we'd been missing for
+every 1-CPU attempt: **Unity calls sysconf() with BIONIC constants, not glibc's.**
+Horizonchase documents (src/main.c my_sysconf):
+- _SC_PAGE_SIZE/PAGESIZE (bionic) = 39/40
+- **_SC_NPROCESSORS_CONF/ONLN (bionic) = 96/97**  <- THE CPU count
+- _SC_PHYS_PAGES (bionic) = 98, _SC_AVPHYS_PAGES = 99
+
+Our kv_sysconf was checking glibc's 83/84 and 0x61/0x62 - ALL WRONG.  So when
+Unity called sysconf(96)/sysconf(97) (its CPU-count query), our shim passed
+through to real glibc -> returned the real count (4) -> Unity spawned (4-1)=3
+Job.Workers -> the worker bootstrap (libunity+0x508174) ran il2cpp class lookups
+with no thread context -> crashed at mono_class_get_checked NULL on main.
+
+Fix (0.42.0) in kv_sysconf: report 1 CPU for bionic 96/97 (plus keep 83/84/0x61/
+0x62 as belt-and-suspenders).  Also removed the provably-wrong process-wide
+sched_setaffinity pin (a host test proved it does NOT change hardware_concurrency
+on glibc - that reads /sys/.../online, not affinity).  kv_pthread_create is
+pass-through (0.41) so no worker wrapper crash.
+
+If the fix works: Unity sees 1 CPU -> 0 job workers -> no worker spawn -> no
+mono_class_get_checked crash -> jobs run inline -> boot proceeds to first frame.
+
+### Prior: 0.40.0 - fire jobfix from the MAIN-THREAD futex wait
 
 The 0.39.x line hit a wall: main thread deadlocks on a RAW futex (Unity job
 system) via kv_syscall, and the jobfix was only hooked in kv_pthread_cond_wait
