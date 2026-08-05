@@ -1643,3 +1643,50 @@ nativeRender:
 - If it appears but maps to a wrong/not-found path, fs_redirect still isn't serving it.
 - If it NEVER appears, il2cpp isn't reaching its metadata open -> Unity's il2cpp_init isn't
   running/loading metadata -> different init problem.
+
+---
+
+## 0.43.4 — PROVEN: il2cpp never opens global-metadata.dat (on-device, 0.43.3)
+
+### Hard evidence from 0.43.3 log
+The 0.43.3 log (boot restored to 0.42.1 timing: initJni OK -> nativeRecreateGfxState OK ->
+nativeRender loop -> JobWorker spawn -> crash at libil2cpp+0xcfccd4, NULL class) shows
+**NO `[fs] open(global-metadata.dat ...)` line anywhere**.  So il2cpp's metadata open does
+NOT go through our routed kv_open/kv_fopen.  Two possible causes:
+  (a) il2cpp_init isn't running at all (metadata never requested), or
+  (b) il2cpp reads the metadata via a path that bypasses our kv_open (raw syscall / a
+      mechanism we don't route).
+
+### Root cause framing (this is the REAL wall, not a metadata-path typo)
+The NULL class in mono_class_get_checked is the symptom of il2cpp not having its classes
+registered = metadata not loaded = il2cpp_init not completing in our loader.  The working
+2022.3 reference (hitmango-nextos) triggers il2cpp init via the game's OWN boot path:
+  hgo_load_modules() -> libmain JNI_OnLoad -> **NativeLoader.load(libdir)** -> run_unity().
+Its loader has a **handle-aware dlopen bridge** so NativeLoader.load's dlopen of
+libunity/libil2cpp returns the already-mapped modules, and libunity's init_array/JNI_OnLoad
+(which is what registers il2cpp classes) runs in the Android-canonical order.  Our loader
+skips NativeLoader.load entirely and drives initJni->nativeRender directly -> il2cpp_init
+never completes.
+
+### 0.43.4 (pushed, commit dfbbda1) — set_data_dir + routing audit
+- Calls ONLY il2cpp_set_data_dir("data") before initJni (plain string store; the 0.43.2
+  crash was from ALSO calling set_config/set_temp/set_cli/domain_get pre-init).  So Unity's
+  own il2cpp_init should open data/Managed/Metadata/global-metadata.dat.
+- Added open/fopen/mmap/stat/read to the GOT route audit -> next log shows whether il2cpp's
+  file IO is actually routed to kv_* shims (the key unknown).
+- Kept the [fs] open/fopen(global-metadata.dat ...) diagnostics.
+- Added kv_dlopen (returns already-loaded game modules) as the groundwork for the
+  reference-aligned NativeLoader.load boot step; NOT yet wired in.
+
+### Next log interpretation
+- `[il2cpp] set_data_dir("data")` + `[fs] open(global-metadata.dat 'data/Managed/...')`
+  resolving correctly -> metadata loads, crash should be GONE.
+- audit shows GOT[open]=kv ptr but no metadata open -> il2cpp_init not reaching the open.
+- audit shows GOT[open]=libc (NOT routed) -> il2cpp's open bypasses our shims -> need raw
+  syscall interception or the dlopen-bridge NativeLoader.load boot path.
+
+### The fresh-start the user asked for (prepared, not yet wired)
+Match hitmango's boot: after loading the 3 modules, call the game's `NativeLoader.load(libdir)`
+(registered by libmain) with kv_dlopen returning the already-mapped modules, so libunity's
+init_array/JNI_OnLoad runs in the Android-canonical order that registers il2cpp classes.
+kv_dlopen is now in place; the call site + avoiding double-JNI_OnLoad is the next step.
