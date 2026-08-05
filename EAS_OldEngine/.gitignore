@@ -1,0 +1,4 @@
+# build/ is produced by ./build.sh from base64.txt (APK, extracted DEX, frames)
+build/
+__pycache__/
+node_modules/

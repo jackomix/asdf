@@ -1,0 +1,28 @@
+{
+    "version": 2,
+    "name": "gamedevstory.zip",
+    "items": [
+        "Game Dev Story.sh",
+        "gamedevstory"
+    ],
+    "items_opt": null,
+    "attr": {
+        "title": "Game Dev Story",
+        "desc": "Run a game development studio! Hire and train staff, research new game genres, and create hit games to become the #1 game company in the world. Played natively on the R36S via a custom ARM64 Android loader.",
+        "inst": "Ready to run.",
+        "genres": [
+            "strategy",
+            "simulation"
+        ],
+        "porter": [
+            "jackomix"
+        ],
+        "image": {},
+        "rtr": true,
+        "runtime": null,
+        "reqs": [],
+        "arch": [
+            "aarch64"
+        ]
+    }
+}

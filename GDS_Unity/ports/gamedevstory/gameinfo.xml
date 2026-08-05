@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./Game Dev Story.sh</path>
+    <name>Game Dev Story</name>
+    <desc>Run a game development studio! Hire and train staff, research new game genres, and create hit games to become the #1 game company in the world. Played natively on the R36S via a custom ARM64 Android loader.</desc>
+    <releasedate>20260803T000000</releasedate>
+    <developer>Kairosoft</developer>
+    <publisher>Kairosoft</publisher>
+    <genre>Simulation</genre>
+    <image>./cover.png</image>
+  </game>
+</gameList>

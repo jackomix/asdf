@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0b0d12">
+<title>Epic Astro Story</title>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<!-- load order matters:
+     dex-meta   defines $DEXMETA, read by the runtime's name mangler
+     runtime    java.* / android.* implemented on top of the browser
+     dex-classes the recompiled application (needs every runtime class)
+     boot       licence patch + DOM bridge + scheduler pump            -->
+<script src="dex/dex-meta.js"></script>
+<script src="runtime.js"></script>
+<script src="dex/dex-classes.js"></script>
+<script src="boot.js"></script>
+<script>$EAS.boot();</script>
+</body>
+</html>

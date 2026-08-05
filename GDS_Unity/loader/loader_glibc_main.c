@@ -1,0 +1,1042 @@
+/* loader.c - load an Android arm64 .so the way the device linker would, inside
+ * our own process, so libil2cpp.so / libunity.so run on a glibc Linux box (the
+ * R36S) without Android's linker.
+ *
+ * Strategy (matching terraria-nextos / native Android loaders):
+ *   1. map PT_LOAD segments of libil2cpp.so at a relocatable base
+ *   2. build a symbol table; for every GLOB_DAT/JUMP_SLOT/COPY relocation that
+ *      points at a libc/libm/bionic symbol, resolve it via dlsym() against the
+ *      host (glibc on the device; musl under the Unicorn test bench)
+ *   3. apply RELATIVE relocs
+ *   4. run DT_INIT_ARRAY / DT_INIT
+ *   5. hand control to the engine (libunity.so) in stage 2
+ *
+ * Stage 1 here: load libil2cpp.so, run its init array, prove the relocation +
+ * symbol resolution works, and call il2cpp_runtime_invoke() to show the C
+ * runtime inside the shipped .so is alive.  Tested headless under Unicorn via
+ * tools/run_aarch64.py (no GPU needed).
+ */
+#include "kv_elf.h"
+#include "kv_libc.h"
+#include <stdint.h>
+#include <stddef.h>
+
+/* kv_libc.h declares fopen/printf/etc. with freestanding signatures, so we
+ * can't include the real <stdio.h>.  It does declare setvbuf/fflush (void*
+ * FILE, which is ABI-compatible).  Declare just the stdout/stderr globals we
+ * need to keep the fresh loader.log unbuffered (so a hard crash doesn't drop
+ * the banner). */
+extern void *stdout;
+extern void *stderr;
+#define _IONBF 2
+
+/* Raw syscall for kv_pin_to_one_cpu (kv_libc.h doesn't declare syscall). */
+extern long syscall(long n, ...);
+
+/* Declarations for the watchdog (manual, no <dirent.h> due to the
+ * freestanding kv_libc.h decls).  pthread_create/pthread_detach/nanosleep/
+ * snprintf are already declared in kv_libc.h.  ABI-compatible with glibc. */
+typedef struct DIR DIR;
+struct dirent {
+    long d_ino;                /* offset 0  */
+    long d_off;                /* offset 8  */
+    unsigned short d_reclen;   /* offset 16 */
+    unsigned char d_type;      /* offset 18 */
+    char d_name[256];          /* offset 19 (glibc aarch64 layout) */
+};
+extern DIR *opendir(const char *path);
+extern struct dirent *readdir(DIR *dirp);
+extern int closedir(DIR *dirp);
+typedef unsigned long kv_pthread_t;   /* matches kv_libc.h */
+struct timespec { long tv_sec; long tv_nsec; };
+
+/* ptrace approach failed on darkOSre R36S (every attach returns EPERM even
+ * from same-process sibling threads — prctl PR_SET_PTRACER doesn't help
+ * without yama either; the kernel appears hardened against self-attach).
+ *
+ * BUT: /proc/<tid>/syscall already prints the user-space PC + SP as its
+ * LAST TWO fields (after the 6 syscall args: syscall#, arg0..arg5, sp, pc).
+ * So we have the PC.  To turn it into a (file, offset) we just need the
+ * current /proc/self/maps snapshot; we read it ONCE per dump and resolve
+ * each thread's PC against it. */
+/* Stream /proc/self/maps line-by-line on demand.  Previous static buffer
+ * approach truncated at 64KB/256KB and missed the libc.so.6 r-xp segment
+ * at the top of the file (printed rw-p/r--p tail only), so the resolved
+ * offset fell in the wrong segment.  See also maps_resolve(). below. */
+
+static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
+    /* Stream /proc/self/maps line-by-line.  Avoids buffer truncation, gives
+     * full coverage of all mapped segments including libc.so.6 r-xp line at
+     * the top (which the static 64/256KB snapshot was eating).  Path stored
+     * in static per-call line buffer, NUL-terminated, returned to caller. */
+    static char line[640];
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return 0;
+    const char *lib = 0; unsigned long off = 0;
+    int total = 0;
+    char readbuf[1024];
+    /* read chunks; newline ends a line; parse each. */
+    while (1) {
+        ssize_t n = read(fd, readbuf, sizeof readbuf);
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            if (readbuf[i] == '\n' || total >= (int)sizeof line - 1) {
+                line[total] = 0;
+                total = 0;
+            } else {
+                line[total++] = readbuf[i];
+                continue;
+            }
+            /* parse one maps line: "lo-hi perm offset dev inode pathname".
+             * Use 5 single-space-delimited tokens then skip whitespace to pathname. */
+            char *p = line, *t[5];
+            for (int ti = 0; ti < 5; ti++) {
+                while (*p == ' ') p++;
+                t[ti] = p;
+                while (*p && *p != ' ') p++;
+                if (!*p) goto next_line;
+                *p++ = 0;
+            }
+            /* t[0]='lo-hi', t[1]=perm, t[2]=offset, t[3]=dev, t[4]=inode.
+             * parse lo-hi by splitting on '-'. */
+            char *dash = strchr(t[0], '-'); if (!dash) goto next_line;
+            *dash = 0;
+            unsigned long lo = strtoul(t[0], 0, 16);
+            unsigned long hi = strtoul(dash + 1, 0, 16);
+            while (*p == ' ') p++;
+            if (addr >= lo && addr < hi && *p) {
+                lib = p; off = addr - lo;
+                char *nl = strchr(p, '\n'); if (!nl) nl = p + strlen(p);
+                *nl = 0;
+                printf("[wd-resolve] hit lo=%lx hi=%lx path=%s off=%lx\n", lo, hi, p, off);
+            }
+        next_line:;
+        }
+    }
+    close(fd);
+    if (off_out) *off_out = off;
+    return lib;
+}
+
+
+/* Bump this on every release so gds_deploy.sh can verify the device has the
+ * latest loader (and so we can tell stale zips apart in logs). */
+#define GDS_BUILD_VERSION "0.50.4-glibc"
+
+/* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
+ * needs.  Declared here so loader.c can drive the Unity boot. */
+void *kv_jni_java_vm(void);
+void *kv_jni_env(void);
+void *kv_jni_find_native(const char *name);
+void kv_run_native_loader_load(void);   /* jni_shim.c: NativeLoader.load boot step */
+void kv_set_asset_dir(const char *dir);
+void kv_set_game_dir(const char *dir);      /* jni_shim.c */
+void kv_fs_set_data_dir(const char *dir);   /* fs_redirect.c */
+int kv_log_open(const char *path);
+void kv_install_crash_handler(void);
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+typedef struct Module {
+    char           name[128];
+    uint8_t       *base;
+    uint64_t       bias;
+    uint64_t       load_vaddr;
+    Elf64_Dyn     *dynamic;
+    Elf64_Sym     *symtab;
+    const char    *strtab;
+    size_t         strsz;
+    Elf64_Rela    *rela;
+    size_t         rela_count;
+    Elf64_Rela    *jmprel;
+    size_t         jmprel_count;
+    uint8_t       *init_array;
+    size_t         init_array_sz;
+    void (*init)(void);
+    int            defer_init;          /* don't run init_array at load time */
+    uint64_t     **unres_slot;          /* GOT slots left unresolved at load */
+    char         **unres_name;
+    int            unres_count, unres_cap;
+    struct Module *next;
+} Module;
+
+static Module *g_modules;
+static uint8_t *g_brk = (uint8_t *)0x200000000UL;
+static int g_defer_next_init = 0;   /* set before load_object to defer its init */
+
+static void *xmmap(uint8_t *hint, size_t len, int prot) {
+    void *p = mmap(hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                   -1, 0);
+    if (p == MAP_FAILED) {
+        printf( "[loader] mmap(%p,%zu) failed: %m\n", hint, len);
+        exit(2);
+    }
+    return p;
+}
+
+static void *read_all(const char *path, size_t *out_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { printf( "[loader] open %s: %m\n", path); exit(2); }
+    /* Size the file first (lseek END) and allocate exactly once.  The real .so
+     * is tens of MB (libil2cpp.so 33 MB, libunity.so 16 MB), so this must not
+     * leak a doubling-growth buffer for every .so or the bump allocator
+     * exhausts and later modules get malloc(0). */
+    long sz = lseek(fd, 0, SEEK_END);
+    if (sz < 0) sz = (1 << 20);
+    lseek(fd, 0, SEEK_SET);
+    uint8_t *buf = malloc(sz ? (size_t)sz : 1);
+    if (!buf) { printf("[loader] malloc(%ld) failed for %s\n", sz, path); exit(2); }
+    ssize_t got = 0;
+    while (got < sz) {
+        ssize_t r = read(fd, buf + got, sz - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    close(fd);
+    *out_len = got;
+    return buf;
+}
+
+static Module *module_new(const char *name) {
+    Module *m = calloc(1, sizeof *m);
+    strncpy(m->name, name, sizeof m->name - 1);
+    m->next = g_modules;
+    g_modules = m;
+    return m;
+}
+
+/* Look up a DEFINED dynamic symbol (e.g. an export) in module `m` and return
+ * its runtime address, or 0.  Used to find entry points like JNI_OnLoad. */
+static void *module_export(Module *m, const char *wanted) {
+    if (!m->symtab || !m->strtab || !m->strsz) return 0;
+    uintptr_t s0 = (uintptr_t)m->strtab;
+    uintptr_t s1 = s0 + m->strsz;
+    for (size_t i = 0; i < 1000000; i++) {
+        Elf64_Sym *sym = &m->symtab[i];
+        const char *nm = m->strtab + sym->st_name;
+        /* the dynamic symtab ends at a null (st_name=0, st_shndx=0, st_value=0)
+         * entry - stop there; also stop if the name points outside the strtab */
+        if (sym->st_name == 0 && sym->st_shndx == 0 && sym->st_value == 0 &&
+            sym->st_size == 0 && i > 4) break;
+        if ((uintptr_t)nm < s0 || (uintptr_t)nm >= s1) break;
+        if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0 &&
+            strcmp(nm, wanted) == 0) {
+            return (void *)(m->bias + sym->st_value);
+        }
+    }
+    return 0;
+}
+
+/* Look up a DEFINED dynamic symbol across ALL loaded modules.  This is what
+ * dlopen/dlsym need so libmain.so's JNI_OnLoad can dlsym into libunity.so /
+ * libil2cpp.so the way Android's linker would. */
+void *loader_lookup_export(const char *wanted) {
+    for (Module *m = g_modules; m; m = m->next) {
+        void *p = module_export(m, wanted);
+        if (p) return p;
+    }
+    return 0;
+}
+
+void *kv_egl_route(const char *name);
+void *kv_bionic_route(const char *name);
+void *kv_fs_route(const char *name);
+int kv_is_main_thread(void);
+
+/* 0.43.4: dlopen bridge (reference-aligned, per hitmango-nextos).
+ * libmain's NativeLoader.load() dlopens libunity/libil2cpp and dlsyms their
+ * JNI_OnLoad.  On Android this is the canonical way the engine gets initialised
+ * (including il2cpp_init).  We already map those modules ourselves, so return
+ * the already-loaded Module* for them; kv_dlsym then resolves exports out of it.
+ * Everything else falls through to the real dlopen. */
+void *kv_dlopen(const char *filename, int flags) {
+    (void)flags;
+    if (filename) {
+        const char *fb = strrchr(filename, '/'); fb = fb ? fb + 1 : filename;
+        for (Module *m = g_modules; m; m = m->next) {
+            const char *mb = strrchr(m->name, '/'); mb = mb ? mb + 1 : m->name;
+            if (strcmp(mb, fb) == 0) {
+                return m;
+            }
+        }
+    }
+    return dlopen(filename, flags);
+}
+
+void *kv_dlsym(void *handle, const char *name) {
+    if (name) {
+        if (strcmp(name, "dlsym") == 0) return (void *)kv_dlsym;
+        if (strcmp(name, "dlopen") == 0) return (void *)kv_dlopen;
+        /* if handle is one of our already-mapped modules, resolve inside it */
+        for (Module *m = g_modules; m; m = m->next) {
+            if ((void *)m == handle) {
+                void *p = module_export(m, name);
+                if (p) return p;
+                break;
+            }
+        }
+        void *r = kv_egl_route(name);
+        if (r) return r;
+        r = kv_bionic_route(name);
+        if (r) return r;
+        r = kv_fs_route(name);
+        if (r) return r;
+    }
+    return dlsym(handle, name);
+}
+
+static void *resolve(const char *sym) {
+    if (sym) {
+        if (strcmp(sym, "dlsym") == 0) return (void *)kv_dlsym;
+        if (strcmp(sym, "dlopen") == 0) return (void *)kv_dlopen;
+        void *r = kv_egl_route(sym);
+        if (r) return r;
+        r = kv_bionic_route(sym);
+        if (r) return r;
+        r = kv_fs_route(sym);
+        if (r) return r;
+    }
+    return dlsym(0, sym);
+}
+
+/* Resolve relocation symbol `symidx` in module `m`.  Prefer the module's own
+ * dynamic symbol table (a GLOB_DAT/JUMP_SLOT may reference a symbol that is
+ * DEFINED in this same .so - e.g. kairo_marker), else fall back to the host
+ * symbol table (libc/libm/bionic shims) for genuinely imported symbols. */
+static void *resolve_sym(Module *m, uint64_t symidx, const char *name) {
+    Elf64_Sym *sym = &m->symtab[symidx];
+    if (sym->st_shndx != SHN_UNDEF && sym->st_value != 0) {
+        return (void *)(m->bias + sym->st_value);
+    }
+    return resolve(name);
+}
+
+static void kv_module_run_init(Module *m);
+static void kv_reresolve_unresolved(Module *m);
+
+static Module *load_object(const char *path) {
+    size_t len = 0;
+    uint8_t *file = read_all(path, &len);
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)file;
+    if (memcmp(eh->e_ident, "\177ELF", 4) != 0) { printf("[loader] %s: not ELF\n", path); exit(2); }
+    if (eh->e_machine != 0xB7) { printf("[loader] %s: not aarch64\n", path); exit(2); }
+
+    uint64_t minv = ~0ULL, maxv = 0;
+    for (Elf64_Half i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type != 1) continue;
+        if (ph->p_vaddr < minv) minv = ph->p_vaddr;
+        if (ph->p_vaddr + ph->p_memsz > maxv) maxv = ph->p_vaddr + ph->p_memsz;
+    }
+    uint64_t aligned_min = minv & ~(KV_PAGE - 1);
+    size_t span = (maxv - aligned_min + KV_PAGE - 1) & ~(KV_PAGE - 1);
+
+    uint8_t *base = xmmap(g_brk, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+    g_brk += span + KV_PAGE * 16;
+    mprotect(base, span, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    Module *m = module_new(path);
+    m->base = base;
+    m->load_vaddr = aligned_min;
+    m->bias = (uint64_t)base - aligned_min;
+
+    for (Elf64_Half i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type != 1) continue;
+        uint8_t *dst = base + (ph->p_vaddr - aligned_min);
+        if (ph->p_filesz) memcpy(dst, file + ph->p_offset, ph->p_filesz);
+        if (ph->p_memsz > ph->p_filesz) memset(dst + ph->p_filesz, 0, ph->p_memsz - ph->p_filesz);
+    }
+
+    Elf64_Dyn *dyn = NULL;
+    for (Elf64_Half i = 0; i < eh->e_phnum; i++) {
+        Elf64_Phdr *ph = (Elf64_Phdr *)(file + eh->e_phoff + i * eh->e_phentsize);
+        if (ph->p_type != 2) continue;
+        dyn = (Elf64_Dyn *)(base + (ph->p_vaddr - aligned_min));
+    }
+    m->dynamic = dyn;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_SYMTAB: m->symtab = (Elf64_Sym *)(m->bias + d->d_un.d_ptr); break;
+        case DT_STRTAB: m->strtab = (const char *)(m->bias + d->d_un.d_ptr); break;
+        case DT_STRSZ:  m->strsz = d->d_un.d_val; break;
+        case DT_RELA:   m->rela    = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+        case DT_RELASZ: m->rela_count = d->d_un.d_val / sizeof(Elf64_Rela); break;
+        case DT_JMPREL: m->jmprel  = (Elf64_Rela *)(m->bias + d->d_un.d_ptr); break;
+        case DT_PLTRELSZ: m->jmprel_count = d->d_un.d_val / sizeof(Elf64_Rela); break;
+        case DT_INIT:   m->init = (void (*)(void))(m->bias + d->d_un.d_ptr); break;
+        case DT_INIT_ARRAY: m->init_array = (uint8_t *)(m->bias + d->d_un.d_ptr); break;
+        case DT_INIT_ARRAYSZ: m->init_array_sz = d->d_un.d_val; break;
+        }
+    }
+
+    /* Relocations.  Apply .rela.dyn (DT_RELA) then .rela.plt (DT_JMPREL). */
+    int unresolved = 0;
+    const Elf64_Rela *rela_sets[2] = { m->rela, m->jmprel };
+    const size_t rela_lens[2] = { m->rela_count, m->jmprel_count };
+    for (int set = 0; set < 2; set++) {
+        for (size_t i = 0; i < rela_lens[set]; i++) {
+            Elf64_Rela *r = (Elf64_Rela *)rela_sets[set] + i;
+            uint32_t type = r->r_info & 0xffffffffULL;
+            uint64_t symidx = r->r_info >> 32;
+            uint64_t *slot = (uint64_t *)(m->bias + r->r_offset);
+            if (type == R_AARCH64_RELATIVE) {
+                *slot = m->bias + r->r_addend;
+            } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT ||
+                       type == R_AARCH64_ABS64 || type == R_AARCH64_ABS32) {
+                const char *name = m->strtab + m->symtab[symidx].st_name;
+                void *p = resolve_sym(m, symidx, name);
+                if (!p) {
+                    if (unresolved++ < 12) printf( "[loader]   unresolved %s\n", name);
+                    /* record for deferred re-resolution (libunity's il2cpp
+                     * imports resolve after libil2cpp is loaded) */
+                    if (m->unres_count >= m->unres_cap) {
+                        int nc = m->unres_cap ? m->unres_cap * 2 : 64;
+                        m->unres_slot = realloc(m->unres_slot, nc * sizeof(void*));
+                        m->unres_name = realloc(m->unres_name, nc * sizeof(char*));
+                        m->unres_cap = nc;
+                    }
+                    m->unres_slot[m->unres_count] = (uint64_t*)slot;
+                    m->unres_name[m->unres_count] = (char*)name;
+                    m->unres_count++;
+                    *slot = 0;
+                }
+                else *slot = (uint64_t)p;
+            } else if (type == R_AARCH64_COPY) {
+                /* handled by host linker; skip */
+            }
+            /* other types (IRELATIVE, TLS_*) are skipped - not needed to boot
+             * init_array in stage 1. */
+        }
+    }
+    if (unresolved) printf( "[loader] %d unresolved symbols in %s\n", unresolved, m->name);
+
+    printf("[loader] %s mapped @%p span=%#zx relas=%zu\n", m->name, (void *)base, span, m->rela_count);
+
+    /* run init + init_array now, unless deferred (rewrite: libunity's init runs
+     * AFTER libil2cpp is loaded so its il2cpp imports are resolved first) */
+    m->defer_init = m->defer_init || g_defer_next_init;
+    g_defer_next_init = 0;
+    if (!m->defer_init) kv_module_run_init(m);
+    return m;
+}
+
+/* run a module's DT_INIT + DT_INIT_ARRAY (separated from load_object so we can
+ * defer libunity's init until after libil2cpp is loaded, matching oceanhorn) */
+static void kv_module_run_init(Module *m) {
+    if (m->init) m->init();
+    if (m->init_array) {
+        size_t n = m->init_array_sz / sizeof(uint64_t);
+        for (size_t i = 0; i < n; i++) {
+            uint64_t fn = ((uint64_t *)m->init_array)[i];
+            if (fn) ((void (*)(void))fn)();
+        }
+        printf("[loader] %s init_array ran (%zu ctors)\n", m->name, n);
+    }
+}
+
+/* re-resolve a module's unresolved GOT slots now that more modules are loaded */
+static void kv_reresolve_unresolved(Module *m) {
+    if (!m) return;
+    int fixed = 0;
+    for (int i = 0; i < m->unres_count; i++) {
+        void *p = loader_lookup_export(m->unres_name[i]);
+        if (!p) p = dlsym(0, m->unres_name[i]);   /* RTLD_DEFAULT */
+        if (p) { *m->unres_slot[i] = (uint64_t)p; fixed++; }
+        else printf("[loader]   STILL unresolved %s\n", m->unres_name[i]);
+    }
+    if (fixed) printf("[loader] re-resolved %d deferred imports in %s\n", fixed, m->name);
+    m->unres_count = 0;
+}
+
+/* aarch64 Linux passes argc/argv in x0/x1 at the entry point (this is true both
+ * under the real kernel and under run_aarch64.py, which now sets them).  So the
+ * same binary takes the .so path from the command line, e.g.
+ *   python3 tools/run_aarch64.py loader/loader2 /abs/path/libil2cpp.so
+ */
+static void sys_exit0(void) {
+    register long x8 __asm__("x8") = 93;   /* exit */
+    register long x0 __asm__("x0") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    for (;;) {}
+}
+
+/* ---- Stage 2b: drive the IL2CPP runtime directly ----
+ * libil2cpp.so exports the il2cpp C embedding API.  Call it the same way
+ * kairovm/boot.py does, so the *actual game runtime* initialises and, if we can
+ * reach it, the managed entry point runs - even without a GPU (simulation
+ * logic, not rendering).  Under the bench fopen/fread resolve via the loader's
+ * fd syscalls to the extracted APK, so global-metadata.dat + assemblies load.
+ */
+typedef void *(*kv_f1)(void);
+typedef void *(*kv_f2)(void *, void *);
+typedef void *(*kv_f3)(void *, void *, void *);
+typedef int   (*kv_fi)(void);
+typedef int   (*kv_fc)(const char *);
+typedef void *(*kv_fc2)(const char *, const char *);
+typedef void *(*kv_fv2)(void *, void *);
+
+void *kv_il_sym(const char *name) {
+    void *p = loader_lookup_export(name);
+    if (!p) printf("[il2cpp] missing export %s\n", name);
+    return p;
+}
+
+/* Set data/config/temp dirs then il2cpp_init, mirroring kairovm/session.py.
+ * il2cpp_init returns 1 on success.  data_dir is relative so the bench's openat
+ * (which resolves relative paths) finds the assets; on the device it's the
+ * data/ dir next to the loader. */
+static int kv_il_boot(const char *data_dir) {
+    void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+    void *(*set_cfg)(const char *) = kv_il_sym("il2cpp_set_config_dir");
+    void *(*set_temp)(const char *) = kv_il_sym("il2cpp_set_temp_dir");
+    void *(*set_cli)(int, void *, void *) = kv_il_sym("il2cpp_set_commandline_arguments");
+    int (*init)(const char *) = kv_il_sym("il2cpp_init");
+    if (!set_data || !init) return -1;
+    if (data_dir) {
+        printf("[il2cpp] data_dir=%s\n", data_dir);
+        set_data(data_dir);
+    }
+    if (set_cfg) set_cfg("etc");
+    if (set_temp) set_temp("/tmp");
+    if (set_cli) {
+        /* argv = {"GameDevStory"} in guest memory */
+        char **av = calloc(2, sizeof(char *));
+        av[0] = strdup("GameDevStory");
+        set_cli(1, av, 0);
+    }
+    printf("[il2cpp] calling il2cpp_init ...\n");
+    int rc = init("IL2CPP Root Domain");
+    printf("[il2cpp] il2cpp_init -> %d\n", rc);
+    if (rc != 1) { printf("[il2cpp] WARNING: expected rc==1\n"); }
+    return rc;
+}
+
+/* After init: disable the stop-the-world GC (green threads; collection stays
+ * off, as in kairovm), attach the current thread, then find and invoke the
+ * game's managed entry point. */
+static void kv_il_run_entry(void) {
+    void *(*gc_disable)(void) = kv_il_sym("il2cpp_gc_disable");
+    void *(*domain_get)(void) = kv_il_sym("il2cpp_domain_get");
+    void *(*thread_attach)(void *) = kv_il_sym("il2cpp_thread_attach");
+    void *(*asm_open)(void *, const char *) = kv_il_sym("il2cpp_domain_assembly_open");
+    void *(*asm_img)(void *) = kv_il_sym("il2cpp_assembly_get_image");
+    void *(*img_entry)(void *) = kv_il_sym("il2cpp_image_get_entry_point");
+    void *(*runtime_invoke)(void *, void *, void *, void **) = kv_il_sym("il2cpp_runtime_invoke");
+    void *(*method_name)(void *) = kv_il_sym("il2cpp_method_get_name");
+    if (gc_disable) gc_disable();
+    void *dom = domain_get ? domain_get() : 0;
+    if (!dom) { printf("[il2cpp] no domain\n"); return; }
+    if (thread_attach) { void *t = thread_attach(dom); (void)t; }
+    if (!asm_open || !asm_img || !img_entry || !runtime_invoke) {
+        printf("[il2cpp] entry-point symbols unavailable, skipping\n");
+        return;
+    }
+    /* Try the game's own assembly first, then the default "Assembly-CSharp". */
+    const char *asms[] = { "Assembly-CSharp", "Assembly-CSharp-firstpass", 0 };
+    void *img = 0;
+    for (int i = 0; asms[i] && !img; i++) {
+        void *a = asm_open(dom, asms[i]);
+        if (a) img = asm_img(a);
+    }
+    if (!img) { printf("[il2cpp] no game image opened\n"); return; }
+    void *mth = img_entry(img);
+    if (!mth) { printf("[il2cpp] no entry point\n"); return; }
+    printf("[il2cpp] invoking entry point (%s)\n",
+           method_name ? (const char *)method_name(mth) : "?");
+    void **exc = (void **)calloc(1, 8);
+    void *r = runtime_invoke(mth, 0, 0, exc);
+    if (exc && *exc) printf("[il2cpp] managed exception during entry: %p\n", *exc);
+    else printf("[il2cpp] entry point returned %p\n", r);
+}
+
+/* ---- Stage 2c: drive Unity's player loop (the correct boot path) ----
+ * Following terraria-nextos: after JNI_OnLoad registers the native methods,
+ * call initJni then loop nativeRender.  This drives the whole engine (including
+ * il2cpp init internally) instead of calling il2cpp_init directly, which hits
+ * uninitialized globals. */
+void egl_shim_create_window(void);   /* egl_shim.c */
+int egl_shim_ensure_current(void);
+
+/* ---- watchdog: dump all threads' blocked syscall after a timeout ----
+ * The boot hangs inside the first nativeRender with NO further JNI calls and NO
+ * crash - Unity is blocked on a native wait (pthread/futex/cond) that no JNI
+ * shim reaches.  This thread wakes after N seconds and prints each thread's
+ * /proc/self/task/<tid>/syscall (the syscall + args, e.g. futex/cond_wait) and
+ * wchan, so we can see exactly where the process is stuck. */
+static void *kv_watchdog(void *arg) {
+    (void)arg;
+    for (int dump = 0; dump < 5; dump++) {
+        struct timespec ts; ts.tv_sec = 12; ts.tv_nsec = 0;
+        nanosleep(&ts, 0);
+        /* 0.50.2: interrupt the main thread (busy-spinning, so its /proc/.../syscall
+         * says "running") with SIGUSR1 to dump its actual PC + backtrace. */
+        syscall(129 /*SYS_kill*/, (long)getpid(), 10 /*SIGUSR1*/);
+        { struct timespec s2; s2.tv_sec = 0; s2.tv_nsec = 100000000; nanosleep(&s2, 0); }
+        printf("[watchdog] === thread dump #%d (blocked syscalls + wchan + kstack) ===\n", dump);
+    DIR *d = opendir("/proc/self/task");
+    if (!d) { printf("[watchdog] cannot open /proc/self/task\n"); return 0; }
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char p[128], buf[512];
+        char sysbuf[512] = "";   /* raw /proc/<tid>/syscall text */
+        /* state: /proc/self/task/<tid>/stat, field 3 (R running, S sleeping,
+         * D io-wait).  comm is field 2 in parens; find last ')' then skip space. */
+        snprintf(p, sizeof p, "/proc/self/task/%s/stat", de->d_name);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = 0;
+                char *rp = strrchr(buf, ')');
+                if (rp) printf("[watchdog] tid=%s state=%c\n", de->d_name, rp[2]);
+                else printf("[watchdog] tid=%s state=?\n", de->d_name);
+            }
+        }
+        snprintf(p, sizeof p, "/proc/self/task/%s/syscall", de->d_name);
+        fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) { buf[n] = 0; printf("[watchdog] tid=%s syscall: %s", de->d_name, buf); snprintf(sysbuf, sizeof sysbuf, "%s", buf); }
+        }
+        /* From the raw syscall we can extract PC (user-space return IP after
+         * `svc`).  Format: "98 arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n".
+         * Tokenize by whitespace, count to 9th, parse as hex. */
+        if (sysbuf[0]) {
+            char *tok = sysbuf; int idx = 0; unsigned long pc = 0, sp = 0;
+            for (; idx < 9; idx++) {
+                while (*tok == ' ') tok++;
+                if (!*tok || *tok == '\n') break;
+                char *e = tok;
+                while (*e && *e != ' ' && *e != '\n') e++;
+                if (idx == 7) sp = strtoul(tok, 0, 16);
+                if (idx == 8) pc = strtoul(tok, 0, 16);
+                tok = e;
+            }
+            if (pc) {
+                unsigned long off = 0;
+                const char *lib = maps_resolve(pc, &off);
+                printf("[watchdog] tid=%s user-pc=0x%lx sp=0x%lx  in %s +0x%lx\n",
+                       de->d_name, pc, sp, lib ? lib : "[unknown]", off);
+            }
+        }
+        /* wchan: kernel wait site name (e.g. "futex_wait_queue_me"). */
+        snprintf(p, sizeof p, "/proc/self/task/%s/wchan", de->d_name);
+        fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) { buf[n] = 0; if (buf[n-1] == '\n') buf[n-1] = 0; printf(" wchan=%s\n", buf); }
+            else printf(" wchan=?\n");
+        }
+        /* kernel stack: shows the call chain inside the kernel (must be root
+         * or have /proc/sys/kernel/yama/ptrace_scope <= 1; on darkOSre R36S the
+         * ark user typically has it).  Truncated to 4 lines to bound log. */
+        snprintf(p, sizeof p, "/proc/self/task/%s/stack", de->d_name);
+        fd = open(p, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof buf - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = 0;
+                int lines = 0;
+                char *q = buf, *nl;
+                while (lines < 5 && q && *q && (nl = strchr(q, '\n'))) {
+                    *nl = 0;
+                    printf("[watchdog] tid=%s kstack: %s\n", de->d_name, q);
+                    q = nl + 1; lines++;
+                }
+            }
+        }
+    }
+    closedir(d);
+    printf("[watchdog] === end dump #%d ===\n", dump);
+    }
+    return 0;
+}
+static void kv_start_watchdog(void) {
+    kv_pthread_t t;
+    if (pthread_create(&t, 0, kv_watchdog, 0) == 0) pthread_detach(t);
+}
+
+/* ---- TER_JOBWORKERS0: force Unity's job system to run inline ----
+ * Unity sizes its job-worker pool from the CPU count, but under our loader the
+ * workers deadlock (they call glibc's internal futex which we can't intercept).
+ * The horizonchase-nextos port solves this by calling
+ *   JobsUtility.set_JobWorkerCount(0)
+ *   JobsUtility.SetJobQueueMaximumActiveThreadCount(0)
+ *   JobsUtility.SetJobQueueMaximumWarpThreadCount(0)
+ * via il2cpp_runtime_invoke after the runtime is initialized.  This tells Unity
+ * to run all jobs inline on the calling thread — no workers needed.
+ *
+ * We call this lazily from the nativeRender loop because il2cpp_init runs
+ * inside the first nativeRender call, so the domain/assemblies aren't available
+ * until after at least one render frame. */
+static int kv_jobworkers_done = 0;
+/* Called from kv_syscall (bionic_bridge.c) to avoid re-firing the jobfix once
+ * it has already been attempted/completed. */
+int kv_jobworkers_is_done(void) { return kv_jobworkers_done; }
+void *kv_set_job_workers_zero(void *unused) {
+    (void)unused;
+    /* 0.50.1: Game Dev Story's JobsUtility has NO set_JobWorkerCount /
+     * SetJobQueueMaximumActiveThreadCount / SetJobQueueMaximumWarpThreadCount
+     * (metadata-verified), so this jobfix can never reduce the worker count.
+     * The old body ran a heavy re-entrant il2cpp reflection scan (dom_get /
+     * dom_asms / class_from_name over all 39 assemblies) on the MAIN thread
+     * WHILE Unity was initialising the job system inside nativeRender - pure
+     * overhead and a potential re-entrant il2cpp deadlock.  Since it cannot
+     * succeed, skip the scan entirely.  (The worker-spawn problem is handled by
+     * reporting 1 CPU + the worker-TLS trampoline in bionic_bridge.c.) */
+    kv_jobworkers_done = 1;
+    return 0;
+}
+
+/* 0.43.0/0.43.1: metadata-path fix is in fs_redirect.c (global-metadata.dat ->
+ * <data_dir>/Managed/Metadata/global-metadata.dat) and is applied via the
+ * open/fopen route table when il2cpp loads the metadata during its OWN
+ * il2cpp_init (inside initJni / first nativeRender).  We must NOT call any
+ * il2cpp_set_* / il2cpp_init / il2cpp_domain_get before Unity's own
+ * il2cpp_init: those functions do class lookups against an uninitialized
+ * runtime and crash in mono_class_get_checked(NULL) themselves (observed
+ * on-device in 0.43.2). */
+
+static void kv_unity_boot(void) {
+    void *env = kv_jni_env();
+    /* Give Unity real, zeroed thiz/ctx/surf objects instead of tiny fake
+     * addresses.  nativeRecreateGfxState does things like
+     *   x0 = [thiz+0x148]; strb 1,[x0]
+     * so thiz must be a writable buffer and [thiz+0x148] must be a valid
+     * pointer (here: 0).  A zeroed 0x200-byte buffer keeps those reads safe. */
+    static unsigned char thiz[0x200];
+    static unsigned char ctx[0x200], surf[0x200];
+    void *thizp = thiz;
+    unsigned char (*render)(void *, void *) = (unsigned char (*)(void *, void *))kv_jni_find_native("nativeRender");
+    if (!render) { printf("[unity] no nativeRender registered - cannot drive player loop\n"); return; }
+
+    /* THE fix for nativeRecreateGfxState (the graphics-init wall): per
+     * terraria-nextos, create the REAL SDL2 window + GLES2 context and make it
+     * current BEFORE Unity's graphics init runs, and route libunity's
+     * egl + ANativeWindow imports to that real context.  Without a current GL
+     * context Unity's graphics init derefs garbage and SIGSEGVs. */
+    egl_shim_create_window();
+    egl_shim_ensure_current();
+    /* terraria-nextos RE-ARMS on_crash here: SDL_Init(VIDEO) on kmsdrm and the
+     * Mali blob's libEGL.so loader both install their OWN default SIGSEGV
+     * handler during window/context creation, OVERWRITING ours.  Without this
+     * re-install, a segfault in nativeRecreateGfxState or nativeRender goes to
+     * the SDL/Mali default action (exit 139, silent), not our on_crash dumper.
+     * Even though we set ours in main(), we have to set it again RIGHT here,
+     * between GPU init and the graphics-heavy native calls. */
+    kv_install_crash_handler();
+
+    /* 0.43.4: set ONLY il2cpp_set_data_dir("data") before initJni, so Unity's
+     * own il2cpp_init (inside initJni/first nativeRender) opens the metadata at
+     * data/Managed/Metadata/global-metadata.dat.  0.43.2 crashed because it
+     * ALSO called set_config_dir/set_temp_dir/set_commandline_arguments/
+     * domain_get pre-init; set_data_dir alone is a plain string store and is
+     * safe (verified: it returns/logs fine and does not do a class lookup). */
+    { void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+      if (set_data) { set_data("data/Managed"); printf("[il2cpp] set_data_dir(\"data/Managed\")\n"); }
+      else printf("[il2cpp] il2cpp_set_data_dir not found\n"); }
+
+    /* 0.43.5: reference-aligned (hitmango-nextos) boot step - call the game's
+     * NativeLoader.load(libdir) so libunity initialises in the Android-canonical
+     * order (which triggers il2cpp_init + metadata load).  See jni_shim.c. */
+    kv_run_native_loader_load();
+
+    void *fn;
+    if ((fn = kv_jni_find_native("initJni"))) {
+        printf("[unity] initJni...\n");
+        ((void (*)(void *, void *, void *))fn)(env, thizp, ctx);
+        printf("[unity] initJni OK\n");
+    }
+    /* REWRITE: explicitly drive il2cpp_init on the main thread now that the
+     * data dir is set and the JNI context exists.  The engine (libunity) is
+     * supposed to do this internally before nativeRender, but in our loader it
+     * never happens (no metadata is ever opened).  Calling it here loads
+     * global-metadata.dat -> classes resolve -> the job spawn no longer gets a
+     * NULL class.  il2cpp_init returns (it does NOT hang by itself).  Unity's
+     * own later call is idempotent. */
+    { void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+      int (*init)(const char *) = kv_il_sym("il2cpp_init");
+      if (set_data) set_data("data/Managed");
+      if (init) {
+          printf("[il2cpp] calling il2cpp_init explicitly...\n");
+          int rc = init("IL2CPP Root Domain");
+          printf("[il2cpp] explicit il2cpp_init -> %d\n", rc);
+      }
+    }
+    /* Surface lifecycle: nativeRecreateGfxState installs the GL surface that
+     * nativeRender draws into; without it Unity hits a null surface.  Called
+     * twice (surfaceCreated + surfaceChanged), then surface-changed event. */
+    if ((fn = kv_jni_find_native("nativeRecreateGfxState"))) {
+        printf("[unity] nativeRecreateGfxState...\n");
+        ((void (*)(void *, void *, int, void *))fn)(env, thizp, 0, surf);
+        ((void (*)(void *, void *, int, void *))fn)(env, thizp, 0, surf);
+        printf("[unity] nativeRecreateGfxState OK\n");
+    }
+    if ((fn = kv_jni_find_native("nativeSendSurfaceChangedEvent"))) {
+        ((void (*)(void *, void *))fn)(env, thizp);
+    }
+    if ((fn = kv_jni_find_native("nativeResume"))) {
+        ((void (*)(void *, void *))fn)(env, thizp);
+    }
+    /* oceanhorn-nextos parity: the APK's UnityPlayer also calls
+     * nativeRestartActivityIndicator in the lifecycle, before focus. */
+    if ((fn = kv_jni_find_native("nativeRestartActivityIndicator"))) {
+        ((void (*)(void *, void *))fn)(env, thizp);
+    }
+    if ((fn = kv_jni_find_native("nativeFocusChanged"))) {
+        ((void (*)(void *, void *, int))fn)(env, thizp, 1);
+    }
+    printf("[unity] nativeRender loop...\n");
+    kv_start_watchdog();   /* dump blocked threads if we hang in the loop */
+    /* 0.39.5: jobzero is now invoked from kv_pthread_cond_wait the FIRST time
+     * it's called on the main thread (main reaches cond_wait inside the
+     * first nativeRender AFTER Unity's il2cpp_init has completed).  By then
+     * cur main thread context is fully attached, dom_get works, and
+     * il2cpp_runtime_invoke(set_JobWorkerCount, 0) succeeds.  Spurious-return-0
+     * from cond_wait also unblocks Unity's predicate loop. */
+    for (int f = 0; f < 1000000; f++) {
+        unsigned char keep = render(env, thizp);
+        if (!keep) { printf("[unity] nativeRender requested quit at frame %d\n", f); break; }
+        /* job fix is handled by the fixer thread spawned before the loop */
+
+        /* Periodic liveness: confirms nativeRender is actually looping (and not
+         * stuck inside one call).  Also tells us how fast frames are being
+         * produced relative to real time. */
+        if (f == 1 || f == 60 || f == 600 || (f > 0 && f % 6000 == 0))
+            printf("[unity] nativeRender frame %d alive\n", f);
+    }
+    printf("[unity] player loop ended\n");
+}
+
+int real_main(int argc, char **argv);
+
+/* ---- TLS setup ----
+ * libunity.so's init_array reads the current thread's stack bounds + stack
+ * guard from thread-local storage via tpidr_el0 (mrs x19, tpidr_el0; then
+ * reads slots).  On the bench this was set up by the harness; on the REAL
+ * device the loader must set up its own TLS block and point tpidr_el0 at it,
+ * because the kernel's initial TLS (intended for glibc) has no thread info.
+ * tpidr_el0 is user-writable, so we do it directly.
+ *
+ * bionic/il2cpp TLS layout (8-byte slots from tpidr_el0):
+ *   slot 1 (off 0x08) thread id
+ *   slot 5 (off 0x28) stack guard magic (GC checks this)
+ *   slot 6 (off 0x30) stack lo
+ *   slot 7 (off 0x38) stack hi
+ */
+/* ---- Bionic TLS guard pad ---- *
+ * libil2cpp/libunity are bionic binaries: they read the bionic thread-info
+ * slots directly off tpidr_el0 (thread id @+0x08, stack guard @+0x28, stack
+ * lo @+0x30, stack hi @+0x38).  Under glibc, tpidr_el0 points at glibc's TLS,
+ * which has a different layout - so those reads get garbage, and the GC can
+ * make bad allocations.  We CANNOT overwrite tpidr_el0 (that breaks glibc's
+ * TLS -> pc=0 crash).  Instead, reserve a 256-byte TLS variable that, being
+ * the first TLS var in this executable, lands right after the glibc TCB at
+ * tpidr_el0+0x28 - exactly where bionic reads its slots - and pre-fill the
+ * bionic slots inside it (same trick as terraria-nextos g_bionic_guard_pad). */
+__attribute__((aligned(16))) static _Thread_local unsigned char kv_bionic_pad[256] = {1};
+
+static void kv_setup_tls(void) {
+    /* Keep glibc's tpidr_el0 (do NOT msr it - that broke glibc).  The bionic
+     * slots that libil2cpp reads are at tp+0x08/+0x28/+0x30/+0x38; our
+     * 256-byte TLS pad must cover the ones after the TCB.  Initialize the
+     * bionic stack-guard + stack bounds within it. */
+    unsigned long tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    unsigned long pad_lo = (unsigned long)kv_bionic_pad;
+    unsigned long pad_hi = pad_lo + sizeof(kv_bionic_pad);
+    /* bionic stack-guard slot @ tp+0x28, stack lo/hi @ tp+0x30/+0x38 */
+    if (tp + 0x38 + 8 <= pad_hi && tp + 0x28 >= pad_lo) {
+        unsigned long sp;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        unsigned long hi = (sp + 0x400000) & ~0xffffUL;
+        unsigned long lo = (sp - 0x800000) & ~0xffffUL;
+        *(unsigned long *)(tp + 0x28) = 0x0BADC0DEDEADBEEFUL;   /* stack guard */
+        *(unsigned long *)(tp + 0x30) = lo;
+        *(unsigned long *)(tp + 0x38) = hi;
+        printf("[loader] bionic TLS slots set in guard pad (tp=%#lx pad=[%#lx..%#lx])\n",
+               tp, pad_lo, pad_hi);
+    } else {
+        printf("[loader] WARNING: bionic TLS slots (tp+0x28=%#lx) outside guard pad [%#lx..%#lx]\n",
+               tp + 0x28, pad_lo, pad_hi);
+    }
+}
+
+void kv_egl_dlopen(void);   /* glibc_shims.c: load real Mali GPU drivers */
+void kv_ctype_init(void);  /* glibc_shims.c: fill bionic _ctype_/_tolower_tab_/_toupper_tab_ */
+
+/* 0.50.1: set up bionic TLS slots for the CURRENT thread (called at the top of
+ * each worker's trampoline from kv_pthread_create).  Same logic as kv_setup_tls
+ * but silent (no per-worker log spam).  kv_bionic_pad is _Thread_local, so each
+ * worker's copy lands right after ITS glibc TCB at tp+0x28 - exactly where
+ * libunity's JobWorker start (mrs tpidr_el0; ldr [x23,#0x28]) reads. */
+void kv_setup_worker_tls(void) {
+    unsigned long tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    unsigned long pad_lo = (unsigned long)kv_bionic_pad;
+    unsigned long pad_hi = pad_lo + sizeof(kv_bionic_pad);
+    if (tp + 0x38 + 8 <= pad_hi && tp + 0x28 >= pad_lo) {
+        unsigned long sp;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        unsigned long hi = (sp + 0x400000) & ~0xffffUL;
+        unsigned long lo = (sp - 0x800000) & ~0xffffUL;
+        *(unsigned long *)(tp + 0x28) = 0x0BADC0DEDEADBEEFUL;   /* stack guard */
+        *(unsigned long *)(tp + 0x30) = lo;
+        *(unsigned long *)(tp + 0x38) = hi;
+    }
+}
+
+int main(int argc, char **argv) {
+    kv_ctype_init();            /* fill tables BEFORE any libunity/libil2cpp ctor runs
+                                 * (ctors read these via the GOT).  Without this the
+                                 * old empty-function stub crashes the loader in
+                                 * nativeRender during string processing. */
+    kv_install_crash_handler();
+    kv_setup_tls();
+    kv_egl_dlopen();        /* dlopen libEGL/libGLESv2/SDL2 RTLD_GLOBAL */
+    return real_main(argc, argv);
+}
+
+/* Resolve `path` against the directory of argv[0] (the loader executable), so
+ * the game can be dropped in a folder next to the loader without cwd magic.
+ * Returns the joined path in a static buffer. */
+static const char *kv_abspath(const char *argv0, const char *path) {
+    static char buf[3][512];   /* one per slot so the three calls don't clobber */
+    static int idx = 0;
+    char *dst = buf[idx++ % 3];
+    const char *slash = 0;
+    for (const char *p = argv0; *p; p++) if (*p == '/') slash = p;
+    unsigned i = 0;
+    if (slash) {
+        unsigned n = (unsigned)(slash - argv0) + 1;
+        if (n > 480) n = 480;
+        for (i = 0; i < n; i++) dst[i] = argv0[i];
+    }
+    const char *s = path;
+    while (*s && i < 510) dst[i++] = *s++;
+    dst[i] = 0;
+    return dst;
+}
+
+int real_main(int argc, char **argv) {
+    /* Device layout (drop next to the loader on the R36S SD card):
+     *   loader2
+     *   libil2cpp.so   libunity.so   libmain.so
+     *   data/          (the APK's assets/bin/Data, or the whole extracted APK)
+     * Defaults resolve relative to argv[0]; override with explicit args:
+     *   loader2 libil2cpp.so libunity.so libmain.so
+     */
+    const char *argv0 = argc > 0 && argv[0] ? argv[0] : "loader2";
+    /* Mirror all output into a log file next to the executable, so a device
+     * test always produces a diagnostic log even if the shell can't capture it.
+     */
+    kv_log_open(kv_abspath(argv0, "loader.log"));
+    /* stdout/stderr now point at the fresh loader.log (kv_log_open dup2'd
+     * them).  Keep stdout unbuffered so a hard crash doesn't lose the lines
+     * that led up to it. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    kv_set_asset_dir(kv_abspath(argv0, "data"));
+    kv_set_game_dir(kv_abspath(argv0, "."));
+    kv_fs_set_data_dir(kv_abspath(argv0, "data"));
+    printf("[loader] === Game Dev Story native loader ===\n");
+    printf("[loader] build: %s\n", GDS_BUILD_VERSION);
+    const char *libs[3];
+    int libc = 0;
+    if (argc >= 4) {
+        libs[0] = argv[1]; libs[1] = argv[2]; libs[2] = argv[3]; libc = 3;
+    } else {
+        libs[0] = kv_abspath(argv0, "libil2cpp.so");
+        libs[1] = kv_abspath(argv0, "libunity.so");
+        libs[2] = kv_abspath(argv0, "libmain.so");
+        libc = 3;
+    }
+    int n = 0;
+    Module *m_il2cpp = 0, *m_unity = 0, *m_main = 0;
+    const char *p_unity = 0, *p_il2cpp = 0, *p_main = 0;
+    for (int i = 0; i < libc; i++) {
+        if (strstr(libs[i], "libunity")) p_unity = libs[i];
+        else if (strstr(libs[i], "libil2cpp")) p_il2cpp = libs[i];
+        else if (strstr(libs[i], "libmain")) p_main = libs[i];
+    }
+    /* REWRITE (oceanhorn order): load libunity first but DEFER its init_array +
+     * JNI_OnLoad until after libil2cpp is loaded, so libunity's il2cpp imports
+     * resolve before libunity's init runs.  Then libil2cpp's init runs.  This
+     * matches how the working 2022.3 references bring up the engine. */
+    if (p_unity) {
+        printf("[loader] loading %s (init deferred)\n", p_unity);
+        g_defer_next_init = 1;
+        Module *m = load_object(p_unity);
+        if (m) { n++; m_unity = m; }
+    }
+    if (p_il2cpp) {
+        printf("[loader] loading %s\n", p_il2cpp);
+        Module *m = load_object(p_il2cpp);
+        if (m) { n++; m_il2cpp = m; }
+    }
+    if (m_unity) {
+        kv_reresolve_unresolved(m_unity);   /* resolve libunity's il2cpp imports */
+        kv_module_run_init(m_unity);        /* now run libunity init_array */
+    }
+    if (p_main) {
+        printf("[loader] loading %s\n", p_main);
+        Module *m = load_object(p_main);
+        if (m) { n++; m_main = m; }
+    }
+    printf("[loader] OK: %d module(s) loaded and initialised\n", n);
+
+    /* Stage 1.5: GOT route audit - print GOT slot values for key symbols. */
+    static const char *audit_syms[] = {"pthread_create","sysconf","sem_wait","sem_post","syscall","sched_getaffinity","pthread_cond_wait","pthread_cond_timedwait","open","fopen","mmap","stat","read"};
+    for (Module *m = m_il2cpp; m; m = (m == m_il2cpp) ? m_unity : (m == m_unity ? m_main : 0)) {
+        if (!m) break;
+        for (int set = 0; set < 2; set++) {
+            Elf64_Rela *rels = set ? m->jmprel : m->rela;
+            size_t cnt = set ? m->jmprel_count : m->rela_count;
+            for (size_t i = 0; i < cnt; i++) {
+                uint32_t type = rels[i].r_info & 0xffffffffULL;
+                if (type != 1024 && type != 1026) continue;  /* R_AARCH64_GLOB_DAT=1024, JUMP_SLOT=1026 */
+                uint64_t symidx = rels[i].r_info >> 32;
+                const char *nm = m->strtab + m->symtab[symidx].st_name;
+                for (size_t k = 0; k < sizeof audit_syms/sizeof*audit_syms; k++) {
+                    if (strcmp(nm, audit_syms[k]) == 0) {
+                        uint64_t *slot = (uint64_t *)(m->bias + rels[i].r_offset);
+                        printf("[audit] %s GOT[%s] = %p (kv ptr range=0x10000000-0x13000000, libc=0x7f...)\n",
+                               m->name, nm, (void *)*slot);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Stage 2: Unity boot.  JNI_OnLoad for EACH lib is what registers the
+     * native methods.  libunity's JNI_OnLoad registers initJni/nativeRender/
+     * nativeResume/... (needed to drive the player loop); libil2cpp's and
+     * libmain's register their own.  Order matters (libunity first). */
+    void *vm = kv_jni_java_vm();
+    void *(*onload)(void *, void *);
+    if (m_unity && (onload = module_export(m_unity, "JNI_OnLoad"))) {
+        printf("[loader] libunity JNI_OnLoad...\n");
+        printf("[loader]   -> %#lx\n", (unsigned long)onload(vm, 0));
+    }
+    if (m_il2cpp && (onload = module_export(m_il2cpp, "JNI_OnLoad"))) {
+        printf("[loader] libil2cpp JNI_OnLoad...\n");
+        printf("[loader]   -> %#lx\n", (unsigned long)onload(vm, 0));
+    }
+    if (m_main && (onload = module_export(m_main, "JNI_OnLoad"))) {
+        printf("[loader] libmain JNI_OnLoad...\n");
+        printf("[loader]   -> %#lx\n", (unsigned long)onload(vm, 0));
+    }
+
+    /* Stage 2b/c: drive Unity's player loop (correct boot path per
+     * terraria-nextos).  initJni + nativeRender loop boots il2cpp internally. */
+    kv_unity_boot();
+    return 0;
+}
