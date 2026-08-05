@@ -121,7 +121,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.43.3-glibc"
+#define GDS_BUILD_VERSION "0.43.4-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -239,9 +239,38 @@ void *kv_bionic_route(const char *name);
 void *kv_fs_route(const char *name);
 int kv_is_main_thread(void);
 
+/* 0.43.4: dlopen bridge (reference-aligned, per hitmango-nextos).
+ * libmain's NativeLoader.load() dlopens libunity/libil2cpp and dlsyms their
+ * JNI_OnLoad.  On Android this is the canonical way the engine gets initialised
+ * (including il2cpp_init).  We already map those modules ourselves, so return
+ * the already-loaded Module* for them; kv_dlsym then resolves exports out of it.
+ * Everything else falls through to the real dlopen. */
+void *kv_dlopen(const char *filename, int flags) {
+    (void)flags;
+    if (filename) {
+        const char *fb = strrchr(filename, '/'); fb = fb ? fb + 1 : filename;
+        for (Module *m = g_modules; m; m = m->next) {
+            const char *mb = strrchr(m->name, '/'); mb = mb ? mb + 1 : m->name;
+            if (strcmp(mb, fb) == 0) {
+                return m;
+            }
+        }
+    }
+    return dlopen(filename, flags);
+}
+
 void *kv_dlsym(void *handle, const char *name) {
     if (name) {
         if (strcmp(name, "dlsym") == 0) return (void *)kv_dlsym;
+        if (strcmp(name, "dlopen") == 0) return (void *)kv_dlopen;
+        /* if handle is one of our already-mapped modules, resolve inside it */
+        for (Module *m = g_modules; m; m = m->next) {
+            if ((void *)m == handle) {
+                void *p = module_export(m, name);
+                if (p) return p;
+                break;
+            }
+        }
         void *r = kv_egl_route(name);
         if (r) return r;
         r = kv_bionic_route(name);
@@ -255,6 +284,7 @@ void *kv_dlsym(void *handle, const char *name) {
 static void *resolve(const char *sym) {
     if (sym) {
         if (strcmp(sym, "dlsym") == 0) return (void *)kv_dlsym;
+        if (strcmp(sym, "dlopen") == 0) return (void *)kv_dlopen;
         void *r = kv_egl_route(sym);
         if (r) return r;
         r = kv_bionic_route(sym);
@@ -755,6 +785,16 @@ static void kv_unity_boot(void) {
      * between GPU init and the graphics-heavy native calls. */
     kv_install_crash_handler();
 
+    /* 0.43.4: set ONLY il2cpp_set_data_dir("data") before initJni, so Unity's
+     * own il2cpp_init (inside initJni/first nativeRender) opens the metadata at
+     * data/Managed/Metadata/global-metadata.dat.  0.43.2 crashed because it
+     * ALSO called set_config_dir/set_temp_dir/set_commandline_arguments/
+     * domain_get pre-init; set_data_dir alone is a plain string store and is
+     * safe (verified: it returns/logs fine and does not do a class lookup). */
+    { void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
+      if (set_data) { set_data("data"); printf("[il2cpp] set_data_dir(\"data\")\n"); }
+      else printf("[il2cpp] il2cpp_set_data_dir not found\n"); }
+
     void *fn;
     if ((fn = kv_jni_find_native("initJni"))) {
         printf("[unity] initJni...\n");
@@ -942,7 +982,7 @@ int real_main(int argc, char **argv) {
     printf("[loader] OK: %d module(s) loaded and initialised\n", n);
 
     /* Stage 1.5: GOT route audit - print GOT slot values for key symbols. */
-    static const char *audit_syms[] = {"pthread_create","sysconf","sem_wait","sem_post","syscall","sched_getaffinity","pthread_cond_wait","pthread_cond_timedwait"};
+    static const char *audit_syms[] = {"pthread_create","sysconf","sem_wait","sem_post","syscall","sched_getaffinity","pthread_cond_wait","pthread_cond_timedwait","open","fopen","mmap","stat","read"};
     for (Module *m = m_il2cpp; m; m = (m == m_il2cpp) ? m_unity : (m == m_unity ? m_main : 0)) {
         if (!m) break;
         for (int set = 0; set < 2; set++) {
