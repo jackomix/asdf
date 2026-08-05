@@ -93,7 +93,7 @@ if [ ! -s "$ZIP" ] || ! unzip -t "$ZIP" >/dev/null 2>&1; then
   echo "!! Downloaded zip corrupt/missing. Try again."; exit 1
 fi
 # Show the loader version baked into this zip so we can spot a stale/cached zip
-GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+(-glibc)?" | head -1 || true)
+GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+(-[a-z0-9]+)?" | head -1 || true)
 echo "  zip loader2: build ${GZVER:-version unknown}"
 # Hard check: the zip MUST contain the current loader build or the deploy is
 # pointless (the device would run stale code again).  Retry with the branch URL.
@@ -103,7 +103,7 @@ if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
   sleep 2
   curl -sL --progress-bar -o "$ZIP" "https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/gamedevstory.zip?ts=$(date +%s%N)"
   echo
-  GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+(-glibc)?" | head -1 || true)
+  GZVER=$(unzip -p "$ZIP" gamedevstory/loader2 2>/dev/null | grep -a -oE "0\.[0-9]+\.[0-9]+(-[a-z0-9]+)?" | head -1 || true)
   echo "  retry: zip loader2 build ${GZVER:-unknown}"
   if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
     echo "!! Still got '${GZVER:-none}' (expected $GDS_EXPECT_VER). Aborting."
