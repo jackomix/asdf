@@ -20,6 +20,8 @@ extern int gds_trace_gl;     /* GDS_GLLOG    : GL calls and shader sources   */
 extern long gds_max_frames;  /* GDS_FRAMES=N : stop after N frames           */
 extern int gds_capture_mode; /* always zero; retained by the EGL abstraction */
 
+void gds_setup_tls(void);
+void gds_install_fault_handler(void);
 void gds_bionic_init(void);
 size_t gds_bionic_count(void);
 void gds_pthread_init(void);

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <sys/stat.h>
 #include <link.h>
@@ -22,6 +23,8 @@
 
 #include "nx_elf.h"
 #include "gds.h"
+
+#define GDS_BUILD_VERSION "0.60.1-ref"
 
 char gds_gamedir[1024];
 char gds_datadir[1024];
@@ -40,6 +43,23 @@ int gds_capture_mode = 0;
  * layout used by the proven Horizon Chase multi-firmware runtime. */
 __attribute__((aligned(16), used))
 _Thread_local char g_bionic_guard_pad[256] = { 1 };
+
+void gds_setup_tls(void)
+{
+    unsigned long tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    unsigned long pad_lo = (unsigned long)g_bionic_guard_pad;
+    unsigned long pad_hi = pad_lo + sizeof(g_bionic_guard_pad);
+    if (tp + 0x38 + 8 <= pad_hi && tp + 0x28 >= pad_lo) {
+        unsigned long sp;
+        __asm__ volatile("mov %0, sp" : "=r"(sp));
+        unsigned long hi = (sp + 0x400000) & ~0xffffUL;
+        unsigned long lo = (sp - 0x800000) & ~0xffffUL;
+        *(unsigned long *)(tp + 0x28) = 0x0BADC0DEDEADBEEFUL; /* stack guard */
+        *(unsigned long *)(tp + 0x30) = lo;
+        *(unsigned long *)(tp + 0x38) = hi;
+    }
+}
 
 /* Game Dev Story 1.18.1 is a normal, unprotected Unity IL2CPP build.  Keep the
  * exact NativeLoader order and do not introduce a synthetic bootstrap. */
@@ -280,7 +300,32 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
     fprintf(stderr, "[gds]   lr=%016lx sp=%016lx probe_slot=%u\n",
             (unsigned long)u->uc_mcontext.regs[30],
             (unsigned long)u->uc_mcontext.sp, nx_probe_slot);
+    fprintf(stderr, "[gds] backtrace (x29 chain):\n");
+    unsigned long fp = (unsigned long)u->uc_mcontext.regs[29];
+    int frame = 0;
+    while (fp && frame < 32) {
+        unsigned long lr = 0;
+        int memfd = open("/proc/self/mem", O_RDONLY);
+        if (memfd >= 0) {
+            if (lseek(memfd, (off_t)(fp + 8), SEEK_SET) == (off_t)(fp + 8) &&
+                read(memfd, &lr, 8) == 8) { } else { lr = 0; }
+            close(memfd);
+        }
+        if (!lr) break;
+        fprintf(stderr, "[gds]   #%d lr=0x%lx\n", frame, lr);
+        unsigned long nextfp = 0;
+        int m2 = open("/proc/self/mem", O_RDONLY);
+        if (m2 >= 0) {
+            if (lseek(m2, (off_t)fp, SEEK_SET) == (off_t)fp &&
+                read(m2, &nextfp, 8) != 8) nextfp = 0;
+            close(m2);
+        }
+        if (nextfp <= fp) break;
+        fp = nextfp;
+        frame++;
+    }
     fflush(stderr);
+    fflush(stdout);
     _exit(2);
 }
 
@@ -290,24 +335,61 @@ static void on_exit_signal(int sig)
     gds_input_request_exit();
 }
 
-static void install_fault_handler(void)
+static char gds_altstack_buf[256 * 1024] __attribute__((aligned(16)));
+
+void gds_install_fault_handler(void)
 {
+    stack_t ss;
+    ss.ss_sp = gds_altstack_buf;
+    ss.ss_size = sizeof gds_altstack_buf;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_fault;
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+#ifdef SIGSYS
+    sigaction(SIGSYS, &sa, NULL);
+#endif
 
-    /* SIGTERM/SIGINT seguem o caminho do SELECT+START (pause/save/saída),
-     * nunca morte seca: frontends e supervisores mandam TERM primeiro. */
     struct sigaction quit;
     memset(&quit, 0, sizeof quit);
     quit.sa_handler = on_exit_signal;
     sigemptyset(&quit.sa_mask);
     sigaction(SIGTERM, &quit, NULL);
     sigaction(SIGINT, &quit, NULL);
+}
+
+static int gds_log_fd = -1;
+static void gds_log_open(const char *argv0)
+{
+    char logpath[1024];
+    const char *slash = strrchr(argv0, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - argv0) + 1;
+        if (n > sizeof(logpath) - 16) n = sizeof(logpath) - 16;
+        memcpy(logpath, argv0, n);
+        strcpy(logpath + n, "loader.log");
+    } else {
+        strcpy(logpath, "loader.log");
+    }
+    gds_log_fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (gds_log_fd < 0)
+        gds_log_fd = open("/tmp/gamedevstory_loader.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (gds_log_fd >= 0) {
+        dup2(gds_log_fd, 1);
+        dup2(gds_log_fd, 2);
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 }
 
 static void run_unity(void)
@@ -317,6 +399,8 @@ static void run_unity(void)
     void *activity = gds_jni_activity();
     void *surface = gds_jret_obj("android/view/Surface");
     void *fn;
+
+    gds_install_fault_handler(); /* re-arm crash handler after window creation */
 
     gds_jni_set_unity_player(player);
 
@@ -420,7 +504,7 @@ static void run_unity(void)
 
 int main(int argc, char **argv)
 {
-    setvbuf(stderr, NULL, _IOLBF, 0);
+    gds_log_open(argc > 0 && argv[0] ? argv[0] : "loader2");
 
     /* EmulationStation's application wrapper exports C.UTF-8.  This Android
      * Unity player was built against Bionic's locale ABI; when its native
@@ -433,11 +517,13 @@ int main(int argc, char **argv)
     setenv("MALLOC_ARENA_MAX", "2", 0);
 
     read_env();
-    install_fault_handler();
+    gds_install_fault_handler();
+    gds_setup_tls();
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.60.0-ref)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port %s)\n", gds_gamedir, GDS_BUILD_VERSION);
+    printf("[gds] Game Dev Story for NextOS -- gamedir %s (reference-port %s)\n", gds_gamedir, GDS_BUILD_VERSION);
 
     gds_jni_init();
     gds_egl_init();

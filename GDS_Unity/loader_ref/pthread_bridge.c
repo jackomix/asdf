@@ -357,6 +357,19 @@ static int b_getattr_np(pthread_t t, void *a)
     return 0;
 }
 
+struct gds_worker_ctx {
+    void *(*orig_start)(void *);
+    void *orig_arg;
+};
+
+static void *gds_worker_tramp(void *p)
+{
+    struct gds_worker_ctx b = *(struct gds_worker_ctx *)p;
+    free(p);
+    gds_setup_tls();
+    return b.orig_start(b.orig_arg);
+}
+
 static int b_create(pthread_t *th, const void *attr, void *(*fn)(void *), void *arg)
 {
     pthread_attr_t g;
@@ -372,7 +385,19 @@ static int b_create(pthread_t *th, const void *attr, void *(*fn)(void *), void *
         if (b->flags & BIONIC_ATTR_DETACHED)
             pthread_attr_setdetachstate(&g, PTHREAD_CREATE_DETACHED);
     }
-    int r = pthread_create(th, &g, fn, arg);
+    struct gds_worker_ctx *ctx = malloc(sizeof *ctx);
+    int r;
+    if (ctx) {
+        ctx->orig_start = fn;
+        ctx->orig_arg = arg;
+        r = pthread_create(th, &g, gds_worker_tramp, ctx);
+        if (r != 0) {
+            free(ctx);
+            r = pthread_create(th, &g, fn, arg);
+        }
+    } else {
+        r = pthread_create(th, &g, fn, arg);
+    }
     if (getenv("GDS_THREADLOG"))
         nx_log("pthread_create attr=%p stack=%zu flags=%#x fn=%p arg=%p"
                " -> %d thread=%p",

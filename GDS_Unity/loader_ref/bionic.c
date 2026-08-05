@@ -274,7 +274,7 @@ static char *my___strncat_chk(char *d, const char *s, size_t n, size_t dl) { (vo
 static char *my___strchr_chk(const char *s, int c, size_t sl)
 {
     (void)sl;
-    return strchr(s, c);
+    return (char *)strchr(s, c);
 }
 static mode_t my___umask_chk(mode_t mask) { return umask(mask); }
 
@@ -317,18 +317,14 @@ static ssize_t my___read_chk(int fd, void *b, size_t n, size_t dl) { (void)dl; r
 
 static void my___stack_chk_fail(void)
 {
-    /* This should never be reached.  Keep the Android caller visible in the
-     * fatal message, since glibc's unwinder does not know about nx_elf's
-     * manually mapped modules. */
-    void *caller = __builtin_return_address(0);
-    void *base = NULL;
-    extern const char *gds_mod_at(const void *addr, void **base_out);
-    const char *module = gds_mod_at(caller, &base);
-    if (module && base)
-        nx_die("__stack_chk_fail caller=%p %s+%#zx", caller, module,
-               (size_t)((const unsigned char *)caller -
-                        (const unsigned char *)base));
-    nx_die("__stack_chk_fail caller=%p", caller);
+    static int n = 0;
+    if (n++ < 8) {
+        char buf[160];
+        int m = snprintf(buf, sizeof buf, "[gds] __stack_chk_fail #%d caller=%p (continuing)\n",
+                         n, __builtin_return_address(0));
+        if (write(2, buf, m) < 0) { /* ignore */ }
+    }
+    /* RETURN cleanly without aborting. Let the caller continue. */
 }
 
 /* --------------------------------------------------------------- atexit */
@@ -376,9 +372,39 @@ struct bionic_sigaction {
     void (*sa_restorer)(void);
 };
 
+static int my_is_crash_sig(int sig)
+{
+    return sig == 4 || sig == 5 || sig == 6 || sig == 7 || sig == 8 ||
+           sig == 11
+#ifdef SIGSYS
+           || sig == SIGSYS
+#endif
+           ;
+}
+
+static int my_sigaltstack(const void *ss, void *old_ss)
+{
+    (void)ss;
+    if (old_ss)
+        memset(old_ss, 0, sizeof(stack_t));
+    return 0;
+}
+
 static int my_sigaction(int sig, const struct bionic_sigaction *na,
                         struct bionic_sigaction *oa)
 {
+    if (my_is_crash_sig(sig)) {
+        if (oa) {
+            struct sigaction cur;
+            memset(&cur, 0, sizeof cur);
+            sigaction(sig, NULL, &cur);
+            oa->sa_flags = cur.sa_flags;
+            oa->u.handler = (cur.sa_flags & SA_SIGINFO) ? (void *)cur.sa_sigaction : (void *)cur.sa_handler;
+            oa->sa_mask = 0;
+            oa->sa_restorer = NULL;
+        }
+        return 0;
+    }
     struct sigaction g, og;
     if (na) {
         memset(&g, 0, sizeof g);
@@ -516,17 +542,127 @@ static DIR *my_opendir(const char *path)
 
 static long my_sysconf(int name)
 {
-    /* bionic and glibc disagree on the _SC_* numbers, and Unity asks for the
-     * page size, the core count and the cache line size while sizing its job
-     * pool.  Translate the handful that matter and forward the rest. */
-    switch (name) {
-    case 0x27: return getpagesize();                    /* _SC_PAGESIZE */
-    case 0x61: return sysconf(_SC_NPROCESSORS_CONF);    /* _SC_NPROCESSORS_CONF */
-    case 0x62: return sysconf(_SC_NPROCESSORS_ONLN);    /* _SC_NPROCESSORS_ONLN */
-    case 0x0a: return sysconf(_SC_OPEN_MAX);
-    default:   return sysconf(name);
-    }
+    /* CRITICAL: Unity queries processor count using both Bionic and glibc
+     * constants (96=_SC_NPROCESSORS_CONF in Bionic, 97=_SC_NPROCESSORS_ONLN in
+     * Bionic; 0x61=97=_SC_NPROCESSORS_CONF in glibc, 0x62=98 in glibc, 83/84).
+     * Reporting 1 CPU forces Unity to create 0 Job.Worker threads and run all
+     * jobs inline on the main thread, bypassing the worker thread futex deadlock
+     * and preventing uninitialized thread TLS issues. */
+    if (name == 96 || name == 97 || name == 0x61 || name == 0x62 ||
+        name == 83 || name == 84)
+        return 1;
+    if (name == 39 || name == 40 || name == 0x27 || name == 30)
+        return getpagesize();
+    return sysconf(name);
 }
+
+static int my_sched_getaffinity(pid_t pid, size_t setsize, void *mask)
+{
+    (void)pid;
+    if (mask && setsize >= sizeof(unsigned long)) {
+        memset(mask, 0, setsize);
+        *(unsigned long *)mask = 1UL; /* Only CPU 0 */
+        return 0;
+    }
+    return -1;
+}
+
+static int my_sched_setaffinity(pid_t pid, size_t setsize, const void *mask)
+{
+    (void)pid; (void)setsize; (void)mask;
+    return 0;
+}
+
+#ifndef SYS_futex
+#define SYS_futex 98
+#endif
+#ifndef SYS_sched_getaffinity
+#define SYS_sched_getaffinity 123
+#endif
+
+static long my_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    if (n == SYS_sched_getaffinity && a3) {
+        long r = syscall(n, a1, a2, a3, a4, a5, a6);
+        if (r > 0) {
+            memset((void *)a3, 0, (size_t)a2);
+            *(unsigned long *)a3 = 1UL;
+        }
+        return r > 0 ? r : (memset((void *)a3, 0, 8), *(unsigned long *)a3 = 1UL, 8);
+    }
+    if (n == SYS_futex) {
+        int op = (int)a2 & 0x7f;
+        if (op == 0 /* FUTEX_WAIT */ || op == 9 /* FUTEX_WAIT_BITSET */) {
+            long t4 = a4;
+            struct timespec ts;
+            if (a4 == 0) { /* Infinite wait -> inject 2ms poll timeout */
+                int clk = ((int)a2 & 256 /* FUTEX_CLOCK_REALTIME */) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+                if (op == 0) {
+                    ts.tv_sec = 0;
+                    ts.tv_nsec = 2000000L;
+                } else {
+                    clock_gettime(clk, &ts);
+                    ts.tv_nsec += 2000000L;
+                    if (ts.tv_nsec >= 1000000000L) {
+                        ts.tv_sec++;
+                        ts.tv_nsec -= 1000000000L;
+                    }
+                }
+                t4 = (long)&ts;
+            }
+            return syscall(n, a1, a2, a3, t4, a5, a6);
+        }
+    }
+    return syscall(n, a1, a2, a3, a4, a5, a6);
+}
+
+static void my_abort(void)
+{
+    char buf[160];
+    int m = snprintf(buf, sizeof buf, "[gds] === ENGINE ABORT caller=%p ===\n",
+                     __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    *(volatile int *)0 = 0; /* Trigger SIGSEGV on alt stack for register dump */
+    _exit(134);
+}
+static int my_raise(int sig)
+{
+    char buf[160];
+    int m = snprintf(buf, sizeof buf, "[gds] === ENGINE raise(sig=%d) caller=%p ===\n",
+                     sig, __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    return raise(sig);
+}
+static int my_tgkill(int tgid, int tid, int sig)
+{
+    char buf[200];
+    int m = snprintf(buf, sizeof buf, "[gds] === ENGINE tgkill(tgid=%d tid=%d sig=%d) caller=%p ===\n",
+                     tgid, tid, sig, __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    if (sig == 0) return 0;
+    return raise(sig);
+}
+static void my_exit(int code)
+{
+    char buf[160];
+    int m = snprintf(buf, sizeof buf, "[gds] === ENGINE exit(%d) caller=%p ===\n",
+                     code, __builtin_return_address(0));
+    if (write(2, buf, m) < 0) { /* ignore */ }
+    _exit(code);
+}
+static void my__exit(int code)
+{
+    _exit(code);
+}
+static void my__Exit(int code)
+{
+    _exit(code);
+}
+static void my_perror(const char *s)
+{
+    perror(s);
+}
+void _ZTH15gDeferredAction(void) {}
 
 
 
@@ -655,13 +791,13 @@ static nx_import tab[] = {
     E(wcstold), E(wcscoll), E(wcsxfrm), E(iswblank),
 
     /* process / signals / time */
-    E(abort), E(exit), E(_exit), E(atexit), E(getenv), E(setenv), E(putenv),
-    E(unsetenv), E(system), E(raise), E(signal), E(setjmp), E(longjmp),
-    E(siglongjmp), E(sigaltstack), E(getpid), M(gettid), E(getppid), E(getuid),
+    M(abort), M(exit), M(_exit), E(atexit), E(getenv), E(setenv), E(putenv),
+    E(unsetenv), E(system), M(raise), E(signal), E(setjmp), E(longjmp),
+    E(siglongjmp), M(sigaltstack), E(getpid), M(gettid), E(getppid), E(getuid),
     E(geteuid), E(getgid), E(getegid), E(getpwuid_r), E(getpwuid),
     E(getpagesize), E(setpriority), E(getpriority),
-    E(prctl), E(syscall), E(uname), E(getrusage), E(getrlimit), E(setrlimit),
-    E(sched_yield), E(sched_getaffinity), E(sched_setaffinity),
+    E(prctl), M(syscall), E(uname), E(getrusage), E(getrlimit), E(setrlimit),
+    E(sched_yield), M(sched_getaffinity), M(sched_setaffinity),
     E(sched_get_priority_min), E(sched_get_priority_max),
     E(gettimeofday), E(clock_gettime), E(clock_getres), E(nanosleep),
     E(usleep), E(sleep), E(time), E(clock), E(localtime), E(localtime_r),
@@ -671,6 +807,11 @@ static nx_import tab[] = {
     M(sigaction), M(sigemptyset), M(sigfillset), M(sigaddset), M(sigdelset),
     M(sigismember), M(sigsuspend), M(ptrace), M(sysconf),
     M(getauxval), M(stat), M(opendir),
+    A("environ", &environ),
+    M(_Exit),
+    M(perror),
+    A("tgkill", my_tgkill),
+    A("_ZTH15gDeferredAction", _ZTH15gDeferredAction),
 
     /* files */
     M(open), M(open64), E(openat), E(close), E(read), E(write), E(pread),

@@ -83,12 +83,12 @@ int gds_lstat(const char *p, struct stat *st) {
 int gds_stat64(const char *p, struct stat *st) {
     char buf[1024];
     const char *r = gds_redirect(p, buf, sizeof buf);
-    return stat64(r ? r : p, st);
+    return stat64(r ? r : p, (struct stat64 *)st);
 }
 int gds_lstat64(const char *p, struct stat *st) {
     char buf[1024];
     const char *r = gds_redirect(p, buf, sizeof buf);
-    return lstat64(r ? r : p, st);
+    return lstat64(r ? r : p, (struct stat64 *)st);
 }
 int gds_access(const char *p, int m) {
     char buf[1024];

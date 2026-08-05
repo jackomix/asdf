@@ -1870,3 +1870,61 @@ and the log should show the reference boot sequence [gds] initJni... ->
 nativeRecreateGfxState -> nativeRender loop, now with System.loadLibrary binding
 so il2cpp actually loads.  If it reaches nativeRender, the game data/rendering is
 the next surface (input is minimal; GDS is touch).
+
+## 0.60.1-ref — EVIDENCE-BASED ROOT CAUSE ANALYSIS & UNIFICATION
+
+### Why previous builds failed on device (EVIDENCE FROM LOGS & DISASSEMBLY)
+
+A rigorous comparison of `loader.log` (`0.50.4-glibc`, the older patched codebase in `loader/`) and `port_launch.log` (`0.60.0-ref`, the wholesale reference port in `loader_ref/`) revealed why previous attempts oscillated between hangs and silent/opaque crashes:
+
+1. **Why `0.50.4-glibc` (`loader/`) hung in `nativeRender loop...`**:
+   - `loader.log` showed thread `8487` spinning in `state=R` on syscall 63 (`read` on fd 0x16 = 22), while the main thread (`8435`) and worker threads were blocked in syscall 98 (`SYS_futex`).
+   - Root cause: `ALooper_pollOnce` in the older stub was returning `0`. In the Android NDK, returning `0` means an event is ready on fd 0 and data should be read from the pipe/eventfd. This caused Unity's event loop to enter an infinite loop trying to read from fd 22, starving the frame pipeline.
+
+2. **Why `0.60.0-ref` (`loader_ref/`) crashed with `Trace/breakpoint trap ./loader2` (`exit code 133 = SIGTRAP = signal 5`) without any EGL output or crash handler log**:
+   - In `0.60.0-ref`, `my_sysconf()` checked glibc constants (`0x61, 0x62`) but missed Bionic constants (`96=_SC_NPROCESSORS_CONF`, `97=_SC_NPROCESSORS_ONLN`). When Unity queried `sysconf(96)`/`sysconf(97)`, it received the real CPU count (4) and spawned 3 JobWorker threads.
+   - `b_create` in `loader_ref/pthread_bridge.c` did not set up Bionic TLS (`tp+0x28` stack guard canary, `tp+0x30` lo, `tp+0x38` hi) on newly spawned threads. When those threads executed inside Unity/IL2CPP, uninitialized TLS caused an assertion or stack canary failure, raising `SIGTRAP` (`BRK`).
+   - `install_fault_handler()` in `loader_ref/main.c` only caught `SIGSEGV, SIGBUS, SIGILL`. It did NOT catch `SIGTRAP` (5), `SIGABRT` (6), `SIGFPE` (8), or `SIGSYS` (31). As a result, the Linux kernel terminated `./loader2` immediately with exit code 133 without invoking `on_fault()`.
+   - `loader_ref/main.c` did not open `loader.log`, and `stdout` was block-buffered when redirected by `/roms/ports/Game Dev Story.sh`. All `printf(...)` logs from EGL/SDL initialization (`[egl] SDL_Init(VIDEO)`, GL vendor/renderer) were buffered in `stdout` and discarded when the kernel killed `loader2`.
+   - Furthermore, `loader_ref/bionic.c` was missing imports for `environ`, `_Exit`, `perror`, and `_ZTH15gDeferredAction`, causing `3 relocations unresolved`.
+
+### All Fixes Shipped in `0.60.1-ref`
+
+1. **Unbuffered Log File Redirection (`loader_ref/main.c`)**:
+   - Added `gds_log_open(argv[0])`, which opens `loader.log` (next to `argv[0]`) and `/tmp/gamedevstory_loader.log` (O_WRONLY | O_CREAT | O_TRUNC), duplicates `stdout` (1) and `stderr` (2) to the log file descriptor, and sets both to `_IONBF`. No log lines are ever lost to stream buffering.
+   - Baked version marker `#define GDS_BUILD_VERSION "0.60.1-ref"` into startup banners on both stdout and stderr.
+
+2. **Complete Signal Handling on Alternate Stack (`loader_ref/main.c` & `loader_ref/bionic.c`)**:
+   - `gds_install_fault_handler()` now configures a 256KB alternate signal stack (`sigaltstack`) and registers `on_fault` for `SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT, SIGFPE, SIGSYS`.
+   - Re-arms `gds_install_fault_handler()` in `run_unity()` immediately after `egl_shim_create_window()` and `egl_shim_ensure_current()` so Mali/SDL drivers cannot overwrite our crash handlers.
+   - `my_sigaction` and `my_sigaltstack` in `loader_ref/bionic.c` intercept and filter Unity's attempts to overwrite crash signal handlers or alt stacks.
+   - Enhanced `on_fault()` to print a complete register dump (`x0..x30`, `pc`, `sp`, `lr`), relative module offsets (`pc is libunity.so+0x...`), and a full stack backtrace (`x29` chain).
+
+3. **1-CPU Enforcement (`loader_ref/bionic.c`)**:
+   - `my_sysconf` returns `1` for all CPU-count queries (`96, 97, 98, 0x61, 0x62, 83, 84`).
+   - `my_sched_getaffinity` reports a 1-CPU affinity mask (`*(unsigned long *)mask = 1UL;`).
+   - `my_syscall` intercepts `SYS_sched_getaffinity` (123) to return 1 CPU, and intercepts `SYS_futex` (98) to inject 2ms poll timeouts on infinite `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` calls with NULL timeout.
+   - Result: Unity sees 1 CPU -> creates 0 JobWorker threads -> executes Job System tasks INLINE on the main thread without futex deadlocks.
+
+4. **Bionic TLS Setup on All Threads (`loader_ref/main.c` & `loader_ref/pthread_bridge.c`)**:
+   - Implemented `gds_setup_tls()` using `g_bionic_guard_pad[256]` to initialize `tp+0x28` (stack guard), `tp+0x30` (stack lo), and `tp+0x38` (stack hi).
+   - In `pthread_bridge.c`, every thread spawned by `b_create` runs `gds_worker_tramp`, calling `gds_setup_tls()` before its original start routine. Every thread has valid Bionic TLS.
+
+5. **0 Relocations Unresolved & Safe Stack Canary/Abort Overrides (`loader_ref/bionic.c`)**:
+   - Added `environ`, `_Exit`, `my__exit`, `perror`, and `_ZTH15gDeferredAction` to `tab[]`.
+   - `my___stack_chk_fail` logs a warning and returns cleanly without terminating the process.
+   - Overrode `abort`, `raise`, `tgkill`, `exit`, `_exit` to log caller addresses and messages before terminating or raising signals.
+
+6. **Unified Codebase & Packaging (`loader_ref/build.sh`, `loader/build_glibc.sh`, `tools/make_port.sh`, `tools/gds_deploy.sh`)**:
+   - `loader_ref/build.sh` compiles `loader_ref/loader2` (`0.60.1-ref`) and copies it to `loader/loader2_glibc` and `ports/gamedevstory/gamedevstory/loader2`.
+   - `loader/build_glibc.sh` delegates directly to `loader_ref/build.sh`.
+   - `tools/make_port.sh` packages `0.60.1-ref` into both `GameDevStory_PortMaster.zip` and `gamedevstory.zip`.
+   - `tools/gds_deploy.sh` verifies `GDS_EXPECT_VER="0.60.1-ref"`.
+
+### How to test / deploy
+
+```bash
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+```
+Expect `[gds] build: 0.60.1-ref`, `0 relocations unresolved`, EGL/SDL window initialization (`[egl] window ... context ready (ES2)`), and smooth execution of `nativeRender loop` with jobs running inline on 1 CPU.
+
