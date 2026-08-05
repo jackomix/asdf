@@ -1370,3 +1370,39 @@ caused heavy wifi traffic).  User needs to reboot R36S to recover WiFi.
   spawns the worker pool runs in the spawned thread itself (recursion)
   via libc's pthread_create (NOT via libil2cpp's GOT).  Needs disasm of
   `start=0x202737174` libil2cpp offset 0x2737174 to confirm.
+
+## 0.39.6 → 0.39.10 — Unity JobWorker spawn + il2cpp thread-attach (BLOCKED)
+
+### Findings
+- **Worker spawn site IDENTIFIED**: libunity `0x5c3490` ("JobWorker bootstrap"). Calls `pthread_create` at `0x5c3528` with `start = libunity+0x508174` (= 0x508174 in the stripped .text). Disasm of `0x508174` shows the worker bootstrap loads `arg` into x19, reads a global job-control struct via `.got+0x148`, then loops `0xf` times (CPU spin loop), then calls `bl 0x39a0f0` (= libunity init wrapper).
+- **Crash signature** (0.39.7, with REAL spawn + kv_worker_wrapper logging): pc=`libil2cpp+0xcfccd4` (inside `mono_class_get_checked+0x17b3c`), lr=`libil2cpp+0xd11c24` (= `mono_class_get_checked+0x2ca70` wrapper). x0=NULL (MonoClass*). Crash tid = MAIN thread (kv_engine_abort/main=1 confirms).
+- **Worker actually DOES start** — `[kv_worker] wrapper entered tid=6710 dispatching orig_start` prints before crash. Crash is on main, not worker. Means main calls `mono_class_get_checked` directly from inside `pthread_create@plt→kv_pthread_create`? NO — main only enters il2cpp class lookup somewhere AFTER pthread_create returns.
+- **Vacuous main wait loop**: After pthread_create returns, main runs `pthread_mutex_lock; ldr w8,[x20+32]; cbz...,loop` then `kv_pthread_cond_wait` returns 0 spurious (dom_get still NULL → jobfix skipped, no print) → loop back. This does NOT call libil2cpp. So the crash must come from INSIDE `pthread_create` itself, somewhere in the post-spawn path in libil2cpp.
+- **Wait — re-test with crash handler tid + main=1**: confirmed tid=6702 (main) AND main=1. So MAIN entered libil2cpp class lookup somewhere. Likely MAIN thread is the one actually RUNNING the worker bootstrap (single-threaded execution after pthread_create returned without spawning worker)? No — wrapper dispatched orig_start which crashes.
+- **Definitive mapping (0.39.7 LOG)**:
+  ```
+  [kv_pthread_create] n=1 tid=8646 start=0x202737174 arg=0x7f5020f630
+  [kv_pthread_create] Unity-internal worker spawn (start=... mod=libunity offset=0x508174) — wrapping with thread_attach
+  [kv_worker] wrapper entered tid=8654 orig_start=0x202737174 arg=0x7f5020f630
+  [kv_sysconf] routed! name=39 tid=8646
+  [kv_worker] dispatching orig_start
+  [loader] === CRASH sig=11 tid=8646 pthread_self=0x7f9d8a1440 main=1 ===
+  ```
+  - tid=8646 = MAIN (also logged in the kv_pthread_create line; both prints agree on tid).
+  - tid=8654 = WORKER (kv_worker_wrapper ran on tid 8654).
+  - Crash tid=8646 = MAIN. The crash is NOT in the worker. Main reaches `mono_class_get_checked+0x17b3c` (pc=0xcfccd4) without our `[jobfix]` traces printing — meaning the cond_wait spurious-return path is NOT what main is in when it crashes. Main is executing SOMETHING ELSE (presumably the JobWorker bootstrap aftermath) that immediately calls an il2cpp class lookup with NULL MonoClass*.
+- **Hypothesis**: pthread_create substitutes a "registered" hook BEFORE running worker start. On glibc we drop this hook (Bionic registers a thread via `__libc_pthread_create_hook` or similar automatically). The hook wraps the worker start_routine with `il2cpp_thread_attach(domain)`. Without it, worker start runs without thread context, but we ALSO see the crash on main — so worker MAY signal main via global MonoClass* slot while its OWN frame goes through NULL lookup. Hard to say without diving deeper into 0x508174's full body.
+- **0.39.8**: Tried `il2cpp_thread_attach(domain)` inside `kv_worker_wrapper` BEFORE calling orig_start. dom_get returned `0x7f91fb0fc0` (non-NULL — Unity's il2cpp_init has presumably completed by the time we hit pthread_create). Result: `mono_thread_attach(=il2cpp_thread_attach same impl) => Threads explicit registering is not previously enabled` → Unity engine ABORT (caller=libil2cpp 0xd46248).
+- **0.39.9**: Same with `mono_thread_attach(0)` attempting fallback — `mono_thread_attach` redirects to identical body at 0xcd2380, same assertion. Aborts.
+- **0.39.10**: Gave up on worker attach attempt; replaced with documentation. Worker is spawned WITHOUT attach — crashes at same mono_class_get_checked. JobFix from `kv_pthread_cond_wait` jobfix path is STILL blocked because we never see `[jobfix]` print (presumably main never enters cond_wait, OR main crashes before cond_wait).
+
+### Next session paths
+1. **Inspect libil2cpp's .init_array**: Unity il2cpp_init runs `mono_thread_init`/`mono_threads_install_registered_threads` to enable "Threads explicit registering". Without that init completing on worker thread context, attach fails. Try invoking every `.init_array` function explicitly before spawn.
+2. **Dump worker bootstrap body 0x508174..0x509000 fully** — locate where MonoClass* lookup call is made and what class name string is passed. Likely class="Unity.Collections.JobWorker" or similar. The crash caller is from main, not worker, so this disasm only useful for understanding what MAIN was meant to wait for.
+3. **Disable Worker spawn entirely (return 0xdeadbeef sentinel)** AND simultaneously BLOCK main from looping on cond_wait until dom_get is non-NULL AND `il2cpp_is_vm_thread()` returns true on main (signals registration enabled). Then call the jobfix. See if main eventually runs il2cpp_init internally without worker intervention. (Need `il2cpp_is_vm_thread` export check — `nm -D libil2cpp.so | grep is_vm_thread` shows `il2cpp_is_vm_thread@0xce47f8` jumps to 0xcd31a8).
+4. **Bypass Unity's JobWorker bootstrap altogether**: NEVER let libunity enter `0x5c3490` (JobWorker spawn). This means intercepting before the call site or mprotect+patch the libunity call instruction to a NOP. Hard (we don't own libunity code).
+
+### Build/deploy state
+- HEAD of arena/019fc860-asdf: `0.39.10-glibc` (pushed but HANDOFF.md updates pending).
+- See HANDOFF.md sections above (0.39.5) for the kv_pthread_cond_wait jobfix gate — still in code, only triggers when dom_get() non-NULL on MAIN.
+- Crash handler updated to log tid + pthread_self + `kv_is_main_thread()` so the crashing thread is unambiguous (commit `0105bd9`).
