@@ -121,13 +121,14 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.43.4-glibc"
+#define GDS_BUILD_VERSION "0.43.5-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
 void *kv_jni_java_vm(void);
 void *kv_jni_env(void);
 void *kv_jni_find_native(const char *name);
+void kv_run_native_loader_load(void);   /* jni_shim.c: NativeLoader.load boot step */
 void kv_set_asset_dir(const char *dir);
 void kv_set_game_dir(const char *dir);      /* jni_shim.c */
 void kv_fs_set_data_dir(const char *dir);   /* fs_redirect.c */
@@ -794,6 +795,11 @@ static void kv_unity_boot(void) {
     { void *(*set_data)(const char *) = kv_il_sym("il2cpp_set_data_dir");
       if (set_data) { set_data("data"); printf("[il2cpp] set_data_dir(\"data\")\n"); }
       else printf("[il2cpp] il2cpp_set_data_dir not found\n"); }
+
+    /* 0.43.5: reference-aligned (hitmango-nextos) boot step - call the game's
+     * NativeLoader.load(libdir) so libunity initialises in the Android-canonical
+     * order (which triggers il2cpp_init + metadata load).  See jni_shim.c. */
+    kv_run_native_loader_load();
 
     void *fn;
     if ((fn = kv_jni_find_native("initJni"))) {

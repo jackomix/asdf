@@ -183,6 +183,26 @@ void *kv_jni_find_native(const char *name) {
     return 0;
 }
 
+/* 0.43.5: reference-aligned (hitmango-nextos) boot step.
+ * On Android the game's NativeLoader.load(libdir) is the canonical way libunity
+ * gets initialised (init_array + JNI_OnLoad in the right order), which is what
+ * triggers il2cpp_init + metadata load.  Our loader skipped it, so il2cpp never
+ * initialised -> no classes -> the mono_class_get_checked(NULL) crash.  The
+ * loader's kv_dlopen returns the already-mapped modules so the dlopen inside
+ * NativeLoader.load is idempotent; the extra JNI_OnLoad re-call is what hitmango
+ * does and is harmless (RegisterNatives is idempotent). */
+void kv_run_native_loader_load(void) {
+    void *nl = kv_jni_find_native("load");
+    if (!nl) { printf("[unity] NativeLoader.load not registered\n"); return; }
+    JNIEnv env = kv_jni_env();
+    jclass nlcls = kv_FindClass(env, "com/unity3d/player/NativeLoader");
+    char cwd[1024]; cwd[0] = 0;
+    if (!getcwd(cwd, sizeof cwd - 1)) strcpy(cwd, ".");
+    jstring libdir = kv_make_jstring(cwd);
+    int r = ((int (*)(JNIEnv, jclass, jstring))nl)(env, nlcls, libdir);
+    printf("[unity] NativeLoader.load(\"%s\") -> %d\n", cwd, r);
+}
+
 static jint kv_RegisterNatives(JNIEnv env, jclass c, const void *methods, jint n) {
     (void)env; (void)c;
     const uintptr_t *m = (const uintptr_t *)methods;   /* {name, sig, fnPtr} x n */
