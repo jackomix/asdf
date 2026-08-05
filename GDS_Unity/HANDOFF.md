@@ -1612,3 +1612,34 @@ zeroing the count).  Options: (a) set_JobWorkerCount(0) via il2cpp as early as p
 (post-il2cpp-init, before the first job), or (b) identify the specific NULL class via Cpp2IL
 dump and patch, or (c) match oceanhorn's exact boot/JNI surface.  The bench repro now makes
 (a)/(b)/(c) testable headlessly.
+
+---
+
+## 0.43.3 — REGRESSION FOUND in 0.43.2 and reverted (on-device)
+
+### The 0.43.2 regression (important diagnostic)
+0.43.2's `kv_il_prepare_dirs()` called `il2cpp_set_data_dir/set_config_dir/set_temp_dir/
+set_commandline_arguments/domain_get` BEFORE Unity's own il2cpp_init.  On-device the
+crash MOVED to right after `[il2cpp] set_config_dir("data/etc")`, i.e. DURING those
+pre-init calls, BEFORE initJni — same site (pc=libil2cpp+0xcfccd4, mono_class_get_checked
+NULL).  Lesson: **any il2cpp_* call before Unity's il2cpp_init crashes in
+mono_class_get_checked(NULL)** because the runtime's classes aren't registered yet.  This
+also CONFIRMS the crash mechanism: it is the same NULL-class fault triggered whenever il2cpp
+is touched before its classes are registered.
+
+### 0.43.3 (pushed, commit 901ae7e)
+- Removed `kv_il_prepare_dirs()` entirely (restores 0.42.1 boot timing so Unity's OWN
+  il2cpp_init runs inside initJni/first nativeRender).
+- KEPT the fs_redirect `global-metadata.dat -> <data_dir>/Managed/Metadata/global-metadata.dat`
+  path fix (the real mechanism — applied when il2cpp opens the metadata during its own init).
+- Added `[fs] open/fopen(global-metadata.dat '...')` diagnostics in kv_open/kv_fopen.
+- Dropped the unsafe domain_get diagnostics (also pre-init risk).
+
+### What the 0.43.3 log should tell us
+Look for `[fs] open(global-metadata.dat '...')` (or fopen) lines during initJni/first
+nativeRender:
+- If it appears AND resolves to the correct data/Managed/Metadata path, metadata loads and
+  classes should resolve -> the NULL-class crash should be GONE (metadata was the cause).
+- If it appears but maps to a wrong/not-found path, fs_redirect still isn't serving it.
+- If it NEVER appears, il2cpp isn't reaching its metadata open -> Unity's il2cpp_init isn't
+  running/loading metadata -> different init problem.
