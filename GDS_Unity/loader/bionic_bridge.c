@@ -347,10 +347,18 @@ static void *kv_worker_wrapper(void *ctxv) {
   fflush(stdout);
   void *(*att)(void *) = (void *(*)(void *))kv_il_sym("il2cpp_thread_attach");
   void *(*dom)(void)   = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
-  if (att && dom) {
-    void *d = dom();
-    if (d) { att(d); printf("[kv_worker] attached new thread to domain %p\n", d); fflush(stdout); }
-    else   { printf("[kv_worker] dom_get(NULL) - cannot attach new thread\n"); fflush(stdout); }
+  if (att) {
+    void *d = dom ? dom() : 0;
+    if (!d) {
+      printf("[kv_worker] dom_get NULL before launch — passing NULL to thread_attach (will auto-create)\n");
+      fflush(stdout);
+      att(0);
+    } else {
+      printf("[kv_worker] attaching to existing domain %p\n", d);
+      fflush(stdout);
+      att(d);
+    }
+    printf("[kv_worker] attach returned\n"); fflush(stdout);
   }
   printf("[kv_worker] dispatching orig_start\n"); fflush(stdout);
   void *(*s)(void *) = ctx->orig_start; void *a = ctx->orig_arg;
