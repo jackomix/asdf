@@ -1371,6 +1371,29 @@ caused heavy wifi traffic).  User needs to reboot R36S to recover WiFi.
   via libc's pthread_create (NOT via libil2cpp's GOT).  Needs disasm of
   `start=0x202737174` libil2cpp offset 0x2737174 to confirm.
 
+## LATEST STATUS (build 0.40.0-glibc) - fire jobfix from the MAIN-THREAD futex wait
+
+The 0.39.x line hit a wall: main thread deadlocks on a RAW futex (Unity job
+system) via kv_syscall, and the jobfix was only hooked in kv_pthread_cond_wait
+which main NEVER reaches.  So set_JobWorkerCount(0) never fired, Unity kept
+dispatching jobs to workers that never run them, and main futex-waited forever.
+
+Terraria fires its ter_jobworkers0 from the eglSwapBuffers hook (re-entrant into
+the render path).  Our main never reaches eglSwapBuffers (it deadlocks first), so
+the equivalent hook point is the MAIN-THREAD futex WAIT.  Fix (0.40.0):
+- bionic_bridge.c kv_syscall: when the MAIN thread (tid==getpid) issues a
+  FUTEX_WAIT/WAIT_BITSET and il2cpp_domain_get() is non-NULL, fire
+  kv_set_job_workers_zero(0) ONCE (jf_tried guard, and kv_jobworkers_is_done()
+  guard).  Setting JobWorkerCount=0 makes Unity run jobs INLINE, so the job
+  completes, main's futex predicate becomes true, and main advances past the
+  first nativeRender.  Matches terraria's eglSwapBuffers-hook re-entrancy.
+- loader_glibc_main.c: expose kv_jobworkers_is_done() accessor for the static
+  kv_jobworkers_done flag.
+- JobWorkerCount=0 + the existing kv_syscall 2ms futex poll + kv_pthread_cond_wait
+  poll together should finally break the job deadlock.
+
+### Prior: 0.39.10 - Unity JobWorker spawn + il2cpp thread-attach (BLOCKED)
+
 ## 0.39.6 → 0.39.10 — Unity JobWorker spawn + il2cpp thread-attach (BLOCKED)
 
 ### Findings

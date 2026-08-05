@@ -34,6 +34,7 @@
 
 void *kv_set_job_workers_zero(void *unused);  /* defined in loader_glibc_main.c */
 void *kv_il_sym(const char *name);              /* ditto */
+int kv_jobworkers_is_done(void);                /* ditto */
 
 /* ---- statfs shim: defeat Unity's "Not enough storage space" dialog ----
  * libunity.so imports statfs and checks the free space on the target volume
@@ -491,6 +492,27 @@ static long kv_syscall(long n, long a1, long a2, long a3, long a4, long a5, long
         int op = (int)a2 & 0x7f;
         if (op == 0 /*FUTEX_WAIT*/ || op == 9 /*FUTEX_WAIT_BITSET*/) {
             long tid = syscall(178 /*SYS_gettid*/);
+            /* CRITICAL: the MAIN thread deadlocks on a raw futex (Unity's job
+             * system), never reaching kv_pthread_cond_wait where the jobfix
+             * lives.  So set_JobWorkerCount(0) never fires, Unity keeps
+             * dispatching jobs to workers that never run them, and main futex-
+             * waits forever.  FIRE the jobfix from the main-thread futex wait,
+             * exactly as terraria fires its ter_jobworkers0 from eglSwapBuffers
+             * (both are re-entrant into Unity's render path).  When
+             * JobWorkerCount=0, Unity runs jobs INLINE -> the job completes ->
+             * main's futex predicate becomes true -> main advances. */
+            if (tid == (long)getpid() && !kv_jobworkers_is_done()) {
+                static int jf_tried = 0;
+                if (!jf_tried) {
+                    void *(*dom_get)(void) = (void *(*)(void))kv_il_sym("il2cpp_domain_get");
+                    if (dom_get && dom_get()) {
+                        jf_tried = 1;
+                        printf("[jobfix] main futex-wait + dom_get OK - set_JobWorkerCount(0)\n");
+                        fflush(stdout);
+                        kv_set_job_workers_zero(0);
+                    }
+                }
+            }
             printf("[kv_syscall] SYS_futex tid=%ld op=%d a4=%p\n", tid, op, (void*)a4);
             /* FUTEX_WAIT: (uaddr, op, val, timeout). FUTEX_WAIT_BITSET: (uaddr,
              * op, val, timeout, bitset).  a4 = timeout (0 = infinite). */

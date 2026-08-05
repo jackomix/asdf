@@ -118,7 +118,7 @@ static const char *maps_resolve(unsigned long addr, unsigned long *off_out) {
 
 /* Bump this on every release so gds_deploy.sh can verify the device has the
  * latest loader (and so we can tell stale zips apart in logs). */
-#define GDS_BUILD_VERSION "0.39.10-glibc"
+#define GDS_BUILD_VERSION "0.40.0-glibc"
 
 /* JNI shim (jni_shim.c) - provides the JavaVM/JNIEnv the engine's JNI_OnLoad
  * needs.  Declared here so loader.c can drive the Unity boot. */
@@ -596,6 +596,9 @@ static void kv_start_watchdog(void) {
  * inside the first nativeRender call, so the domain/assemblies aren't available
  * until after at least one render frame. */
 static int kv_jobworkers_done = 0;
+/* Called from kv_syscall (bionic_bridge.c) to avoid re-firing the jobfix once
+ * it has already been attempted/completed. */
+int kv_jobworkers_is_done(void) { return kv_jobworkers_done; }
 void *kv_set_job_workers_zero(void *unused) {
     (void)unused;
     int (*il_init_void)(const char *) = (int (*)(const char *))kv_il_sym("il2cpp_init");
