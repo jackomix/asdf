@@ -54,7 +54,14 @@ static const char *fs_redirect(const char *p, char *buf, size_t bufsz) {
             !strncmp(base, "level", 5) || !strncmp(base, "sharedassets", 12) ||
             strstr(base, ".assets") || strstr(base, ".resS") || strstr(base, ".resource") ||
             strstr(base, "-resources.dat")) {
-            rel = base;
+            /* global-metadata.dat lives under Managed/Metadata/, NOT at the data
+             * dir root.  A bare open of "global-metadata.dat" (when il2cpp runs
+             * with an unset/relative data dir) MUST land at
+             * <asset_dir>/Managed/Metadata/global-metadata.dat or il2cpp loads
+             * no metadata -> every class resolves NULL -> the
+             * mono_class_get_checked(NULL) crash. */
+            if (!strcmp(base, "global-metadata.dat")) rel = "Managed/Metadata/global-metadata.dat";
+            else rel = base;
         }
     }
     if (!rel) return NULL;

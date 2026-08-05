@@ -360,6 +360,24 @@ def main():
 
     uc.hook_add(unicorn.UC_HOOK_CODE, _code)
 
+    # probe: log when exported mono_class_get_checked (libil2cpp+0xce5190) is
+    # entered with x0==NULL, to catch who passes the NULL class.
+    def _mcgc(uc, addr, size, data):
+        from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30
+        x0 = uc.reg_read(UC_ARM64_REG_X0)
+        if x0 == 0:
+            print('[mcgc] mono_class_get_checked(NULL) caller(x30)=%#x' % (
+                uc.reg_read(UC_ARM64_REG_X30)), file=sys.stderr)
+    uc.hook_add(unicorn.UC_HOOK_CODE, _mcgc, begin=0x200ce5190, end=0x200ce5194)
+
+    # probe: log calls into libil2cpp+0xd11c14 (calls the crashing 0xcfcccc)
+    # with their x0 (class) and x30 (caller) to trace the NULL origin.
+    def _d11c14(uc, addr, size, data):
+        from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X30
+        print('[d11c14] entered x0=%#x caller(x30)=%#x' % (
+            uc.reg_read(UC_ARM64_REG_X0), uc.reg_read(UC_ARM64_REG_X30)), file=sys.stderr)
+    uc.hook_add(unicorn.UC_HOOK_CODE, _d11c14, begin=0x200d11c14, end=0x200d11c18)
+
     def _memerr(uc, access, addr, size, value, user):
         # Lazy commit for sparse regions (GC heap reservation): if the faulting
         # address lies inside a sparse range, map a CHUNK covering the whole
@@ -383,15 +401,41 @@ def main():
         print('[unicorn MEM %s @%#x sz %d pc=%#x]' % (
             {0: 'READ', 1: 'WRITE', 2: 'FETCH', 3: 'READ*', 4: 'WRITE*'}.get(access, access), addr, size,
             uc.reg_read(UC_ARM64_REG_PC)), file=sys.stderr)
-        # dump key regs to pinpoint null derefs
+        # dump full regs + frame-pointer backtrace
         try:
-            from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, \
-                UC_ARM64_REG_X8, UC_ARM64_REG_X19, UC_ARM64_REG_X20, UC_ARM64_REG_X30, UC_ARM64_REG_SP
-            print('   x0=%#x x1=%#x x2=%#x x8=%#x x19=%#x x20=%#x x30=%#x sp=%#x' % (
-                uc.reg_read(UC_ARM64_REG_X0), uc.reg_read(UC_ARM64_REG_X1),
-                uc.reg_read(UC_ARM64_REG_X2), uc.reg_read(UC_ARM64_REG_X8),
-                uc.reg_read(UC_ARM64_REG_X19), uc.reg_read(UC_ARM64_REG_X20),
-                uc.reg_read(UC_ARM64_REG_X30), uc.reg_read(UC_ARM64_REG_SP)), file=sys.stderr)
+            from unicorn.arm64_const import (UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2,
+                UC_ARM64_REG_X3, UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6,
+                UC_ARM64_REG_X7, UC_ARM64_REG_X8, UC_ARM64_REG_X9, UC_ARM64_REG_X10,
+                UC_ARM64_REG_X11, UC_ARM64_REG_X12, UC_ARM64_REG_X13, UC_ARM64_REG_X14,
+                UC_ARM64_REG_X15, UC_ARM64_REG_X16, UC_ARM64_REG_X17, UC_ARM64_REG_X18,
+                UC_ARM64_REG_X19, UC_ARM64_REG_X20, UC_ARM64_REG_X21, UC_ARM64_REG_X22,
+                UC_ARM64_REG_X23, UC_ARM64_REG_X24, UC_ARM64_REG_X25, UC_ARM64_REG_X26,
+                UC_ARM64_REG_X27, UC_ARM64_REG_X28, UC_ARM64_REG_X29, UC_ARM64_REG_X30,
+                UC_ARM64_REG_SP)
+            regs = [uc.reg_read(r) for r in (UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2,
+                UC_ARM64_REG_X3, UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6,
+                UC_ARM64_REG_X7, UC_ARM64_REG_X8, UC_ARM64_REG_X9, UC_ARM64_REG_X10,
+                UC_ARM64_REG_X11, UC_ARM64_REG_X12, UC_ARM64_REG_X13, UC_ARM64_REG_X14,
+                UC_ARM64_REG_X15, UC_ARM64_REG_X16, UC_ARM64_REG_X17, UC_ARM64_REG_X18,
+                UC_ARM64_REG_X19, UC_ARM64_REG_X20, UC_ARM64_REG_X21, UC_ARM64_REG_X22,
+                UC_ARM64_REG_X23, UC_ARM64_REG_X24, UC_ARM64_REG_X25, UC_ARM64_REG_X26,
+                UC_ARM64_REG_X27, UC_ARM64_REG_X28)]
+            print('   regs: ' + ' '.join('x%d=%#x'%(i,v) for i,v in enumerate(regs)), file=sys.stderr)
+            print('   x29(fc)=%#x x30(lr)=%#x sp=%#x' % (
+                uc.reg_read(UC_ARM64_REG_X29), uc.reg_read(UC_ARM64_REG_X30),
+                uc.reg_read(UC_ARM64_REG_SP)), file=sys.stderr)
+            # walk frame-pointer chain: fp -> [fp] = prev fp, [fp+8] = saved lr
+            fp = uc.reg_read(UC_ARM64_REG_X29); lr0 = uc.reg_read(UC_ARM64_REG_X30)
+            print('   backtrace: [pc=%#x] -> lr=%#x' % (uc.reg_read(UC_ARM64_REG_PC), lr0), file=sys.stderr)
+            for depth in range(16):
+                try:
+                    prevfp = uc.mem_read(fp, 8); savlr = uc.mem_read(fp + 8, 8)
+                    prevfp = int.from_bytes(prevfp, 'little'); savlr = int.from_bytes(savlr, 'little')
+                    print('     #%d fp=%#x saved_lr=%#x' % (depth + 1, prevfp, savlr), file=sys.stderr)
+                    if prevfp == 0 or prevfp == fp: break
+                    fp = prevfp
+                except Exception:
+                    break
         except Exception:
             pass
         return False
