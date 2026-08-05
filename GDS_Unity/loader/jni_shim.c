@@ -398,15 +398,28 @@ static jobject kv_CallObjectMethodV(JNIEnv env, jobject obj, jmethodID mid, void
      * sane values instead of dereferencing 0x6000 as a JNI string handle. */
     if (strcmp(nm, "getPackageName") == 0) return kv_make_jstring("net.kairosoft.android.gamedev3en");
     if (strcmp(nm, "getPackageCodePath") == 0) return kv_make_jstring(kv_get_game_dir());
-    /* findLibrary(name) -> path to a native lib.  Returning NULL tells Unity
-     * the library is already loaded in the process (which it is — our loader
-     * mapped it).  Returning a PATH causes Unity to try dlopen(path) which
-     * fails (it's not a real Android install) → AlertDialog → deadlock. */
+    /* findLibrary(name) -> path to a native lib.  0.50.4: mirror hitmango's
+     * j_ClassLoader_findLibrary: return a REAL path string (NOT NULL).  Our
+     * old code returned NULL, which Unity's NativeLoader.load interpreted as
+     * "IL2CPP failed to load" -> showed the "Failed to load IL2CPP"
+     * AlertDialog and blocked (the hang after reaching the findLibrary call).
+     * Returning a path makes Unity System.load(path); our kv_dlopen bridge
+     * resolves it by basename to the already-mapped module. */
     if (strcmp(nm, "findLibrary") == 0) {
         void *arg0 = args.n ? (void *)args.a[0] : 0;
-        const char *libname = arg0 ? kv_resolve_jstring((jstring)arg0) : "?";
-        printf("[jni] findLibrary(\"%s\") -> NULL (already loaded)\n", libname);
-        return NULL;
+        const char *libname = arg0 ? kv_resolve_jstring((jstring)arg0) : "";
+        const char *file = NULL;
+        if (!strcmp(libname, "il2cpp") || !strcmp(libname, "libil2cpp.so")) file = "libil2cpp.so";
+        else if (!strcmp(libname, "main") || !strcmp(libname, "libmain.so")) file = "libmain.so";
+        else if (!strcmp(libname, "unity") || !strcmp(libname, "libunity.so")) file = "libunity.so";
+        if (!file) {
+            printf("[jni] findLibrary(\"%s\") -> empty\n", libname);
+            return kv_make_jstring("");
+        }
+        static char fpath[640];
+        snprintf(fpath, sizeof fpath, "%s/%s", kv_get_game_dir(), file);
+        printf("[jni] findLibrary(\"%s\") -> %s\n", libname, fpath);
+        return kv_make_jstring(fpath);
     }
     if (strcmp(nm, "toString") == 0) return kv_make_jstring("");
     if (strcmp(nm, "getName") == 0 || strcmp(nm, "getCanonicalName") == 0 ||
