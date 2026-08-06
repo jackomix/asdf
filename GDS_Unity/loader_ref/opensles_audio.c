@@ -186,6 +186,12 @@ typedef struct {
     int decoder_done;
     volatile uint32_t frames_played;
 
+    /* 0.92 preroll gate (music intro echo): nonzero while we withhold mixing
+     * until the ring holds this many bytes.  Rearmed automatically whenever
+     * the fmod stream ring fully starves (song start, track change). */
+    uint32_t preroll_bytes;
+    uint32_t preroll_ticks;
+
     volatile SLuint32 play_state;
     float volume;
     int active;
@@ -208,6 +214,7 @@ typedef struct {
 } AudioPlayer;
 
 static AudioPlayer g_players[MAX_PLAYERS];
+static AudioPlayer *g_fmod_player;   /* set up at fmod pump init (below) */
 static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_audio_dev = 0;
 static int g_audio_initialized = 0;
@@ -299,6 +306,31 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         AudioPlayer *p = &g_players[i];
         if (!p->active || p->play_state != SL_PLAYSTATE_PLAYING) continue;
+
+        /* 0.92 preroll (music intro echo): the title song used to start
+         * against a nearly-empty ring -- the first replenishing quantum(s)
+         * were consumed while still underrun, audibly replaying the opening
+         * ~1s.  On every TOTAL starve of the fmod stream we rearm a 2-quantum
+         * gate (4096B = 2x 512-frame stereo16) and sit silent until it is
+         * met; ~43ms of music is then buffered before the first audible frame.
+         * After 12 callbacks (~0.55s @46ms) without meeting it we flush
+         * anyway, so a lone <2-quantum blip can never get stuck in the ring.
+         * Steady-state ring fill is ~40KB -- the gate only ever matters at
+         * stream start / track change, never mid-song. */
+        if (p == g_fmod_player) {
+            uint32_t rd = ring_readable(p);
+            if (p->preroll_bytes) {
+                if (rd >= p->preroll_bytes || ++p->preroll_ticks > 12) {
+                    p->preroll_bytes = 0;
+                    p->preroll_ticks = 0;
+                } else {
+                    continue;   /* gated: leave data in ring, stay silent */
+                }
+            } else if (rd == 0) {
+                p->preroll_bytes = 4096;
+                p->preroll_ticks = 0;
+            }
+        }
 
         uint32_t src_rate = p->sample_rate ? p->sample_rate : SDL_OUTPUT_RATE;
         uint32_t src_channels = p->num_channels ? p->num_channels : 2;
@@ -489,6 +521,8 @@ static void ensure_audio_initialized(void) {
 static void player_reset_meta(AudioPlayer *p) {
     p->ring_head = 0;
     p->ring_tail = 0;
+    p->preroll_bytes = 0;
+    p->preroll_ticks = 0;
     queue_reset(p);
     p->queue_capacity = 0;
     p->callback = NULL;
@@ -581,6 +615,8 @@ static SLresult play_SetPlayState(void *self, SLuint32 state) {
         p->headatend_fired = 0;
         p->decoder_done = 0;
         p->ring_head = p->ring_tail = 0;
+        p->preroll_bytes = 0;
+        p->preroll_ticks = 0;
         queue_reset(p);
     }
     if (state == SL_PLAYSTATE_PLAYING && p->play_state != SL_PLAYSTATE_PLAYING)
@@ -677,6 +713,8 @@ static SLresult bq_Clear(void *self) {
     if (!p) return SL_RESULT_SUCCESS;
     if (g_audio_dev && p_SDL_LockAudioDevice) p_SDL_LockAudioDevice(g_audio_dev);
     p->ring_head = p->ring_tail = 0;
+    p->preroll_bytes = 0;
+    p->preroll_ticks = 0;
     queue_reset(p);
     p->enqueue_counter = 0;
     p->ever_enqueued = 0;
@@ -1131,7 +1169,6 @@ static void fmod_dump_state(const char *why)
     fflush(stderr);
 }
 
-static AudioPlayer *g_fmod_player;
 
 void gds_audio_fmod_config(int rate, int channels, int blockframes)
 {

@@ -275,13 +275,35 @@ int gds_load_modules(void)
  * the very next invoke anyway, so no real behavior is lost. */
 static void arm_fep_fix(uintptr_t il2b)
 {
-    /* 0.91: the 0.90 pokes (string[2] alloc + elem[1] store in the UIMethod
-     * at 0x1809498) are WITHDRAWN: the 0.90.0 device run proved the
-     * delivered result array was still len=1 with the same trace -- F3 is
-     * the show-side initial-text path, not the result builder.  Harness and
-     * byte-verification kept for the next (delegate-identified) poke. */
+    /* 0.92: company-name crash FIXED at the consumer (FepPanel::Update).
+     * Verified disassembly of the result-consume path (libil2cpp 2.6.9):
+     *   0x17f4a3c  cbz x0, 0x17f4aa8        ; null result -> NRE
+     *   0x17f4a40  ldr w8, [x0, #0x18]      ; w8 = String[] Length
+     *   0x17f4a44  cmp w8, #1
+     *   0x17f4a48  b.ls 0x17f4aac           ; Length<=1 -> raiseAOREchk (!!)
+     *   0x17f4a4c  ldr x8, [x19, #0x18]     ; x8 = this->textLabel
+     *   0x17f4a54  ldr x9, [x0, #0x28]      ; x9 = result[1]  (expected text)
+     *   0x17f4a58  str x9, [x8, #0x10]      ; label.text = result[1]
+     *   0x17f4a5c  ldr x8, [x0, #0x20]      ; x8 = result[0]
+     *   0x17f4a60  cbz x8, -> negative listener  (else positive/OK listener)
+     * Our OSK always yields String[1]={text} (device-proved three runs:
+     * len=1, [0]=<entered name>, e.g. "Sunny Studios").  The managed len-for-
+     * mat on this Android build evidently isn't the 2-slot {marker,text}
+     * shape FepPanel::Update was compiled against -- and patching the array
+     * builder site turned out to be a stale attribution twice (0.90 wrong,
+     * 0.91 delegate dump unreadable).  So accept len-1 at the reader:
+     *  - b.ls -> b.lo: only Length==0 still AOREs (2.6.9 semantics today);
+     *  - text taken from result[0] instead of result[1];
+     *  - result[0]!=NULL then picks the POSITIVE (OK) listener -- exactly the
+     *    real-device post-OK flow (label text = entered name, game proceeds
+     *    to the tutorial).  The legacy len-2/legacy-fep paths are untouched
+     *    (their [0]==[1], and flag paths never run here anyway). */
     static const struct { uint32_t va; uint32_t expect; uint32_t patch;
                           const char *what; } P[] = {
+        { 0x17f4a48, 0x54000329u, 0x54000323u,
+          "fep len gate b.ls->b.lo (len 1 legal)" },
+        { 0x17f4a54, 0xf9401409u, 0xf9401009u,
+          "fep text src result[1]->result[0]" },
     };
     for (size_t i = 0; i < sizeof P / sizeof *P; i++) {
         uintptr_t a = il2b + P[i].va;
@@ -1096,12 +1118,11 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                     if (st && trap_mapped(st + 0x199))
                         fprintf(stderr, "[trap]   fepflag(statics+0x199)=%d\n",
                                 *(volatile unsigned char *)(st + 0x199));
-                    /* 0.91: the 1-elem array is built by a DELEGATE invoked
-                     * from b__91_0's tail branch (0.90's F3 attribution was
-                     * WRONG -- pokes applied but delivered array unchanged).
-                     * Dump the delegate at compat-statics[0x10]: its klass,
-                     * target and METHOD POINTER = the real builder, which I
-                     * can then read offline instead of attributing on faith. */
+                    /* 0.92: RESOLVED downstream -- the builder attribution
+                     * chase ended (0.91 dump showed statics+0x10 is not a
+                     * delegate anyway: unaligned ASCII garbage).  arm_fep_fix
+                     * now legalises len-1 AT THE READER; this dump is kept
+                     * purely as live proof (want: len=1, [0]=name, no AORE). */
                     if (st && trap_mapped(st + 0x10)) {
                         uintptr_t d = *(uintptr_t *)(st + 0x10);
                         fprintf(stderr, "[trap]   result-delegate=%#lx", (unsigned long)d);
@@ -1516,7 +1537,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.91.0-fepfix2)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.92.0-fepfix3)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */

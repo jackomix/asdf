@@ -76,6 +76,20 @@ int my___android_log_write(int prio, const char *tag, const char *msg)
 {
     if (!gds_log_level)
         return 0;
+    /* 0.92: the [V/Unity] "AndroidJNIHelper: ... obsolete" warning + managed
+     * stack trace fires per LateUpdate-ish JNI call (hundreds per boot) and
+     * dominates the log even after 1-in-8 dedupe.  Show the first, then one
+     * tally line every 256. */
+    if (prio == 5 && tag && !strcmp(tag, "Unity") && msg &&
+        strstr(msg, "AndroidJNIHelper")) {
+        static unsigned n;
+        n++;
+        if (n > 1 && n % 256 != 0)
+            return 0;
+        if (n % 256 == 0)
+            fprintf(stderr,
+                    "[logcat] (AndroidJNIHelper warning x%u, muted)\n", n);
+    }
     /* 0.91 dedupe: Unity spams the same multi-line AndroidJNIHelper warning
      * + stack every LateUpdate (dozens per boot).  Exact-same (prio,tag,msg)
      * repeats collapse to one in 8, with a count line when the run ends. */

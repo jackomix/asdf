@@ -722,9 +722,21 @@ static void gds_capture_real_egl(void) {
 static int g_trc_cap = 400;
 static int g_trc_n = 0;
 static void TR(const char *msg) {
+  /* 0.92: identical repeats flood the boot log (Unity re-queries the very
+   * same config attrs/surface attribs hundreds of times): show the first of
+   * each exact string, then one per 32 with a marker. */
+  static char last[192];
+  static unsigned streak;
+  if (!strcmp(msg, last)) {
+    streak++;
+    if (streak % 32 != 1) return;
+  } else {
+    streak = 1;
+    snprintf(last, sizeof last, "%s", msg);
+  }
   if (g_trc_n >= g_trc_cap) return;
   g_trc_n++;
-  fprintf(stderr, "[egl] %s\n", msg);
+  fprintf(stderr, "[egl] %s%s\n", msg, streak > 1 ? "  (x32 cadence)" : "");
 }
 
 
