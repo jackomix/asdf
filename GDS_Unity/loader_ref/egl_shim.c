@@ -235,6 +235,7 @@ static const char *(*r_eglQueryString)(void *, int);
 static unsigned (*r_eglSwapInterval)(void *, int);
 static void *g_real_dpy = NULL;    /* SDL's real EGLDisplay */
 static void *g_real_cfg = NULL;    /* real EGLConfig meeting Unity's RGBA8888 contract */
+static void *g_win_cfg = NULL;     /* real EGLConfig EQUAL to SDL's window config (raw ctx creation) */
 static void *g_win_surf = NULL;    /* real EGLSurface of SDL's window */
 static void *g_pbuf = NULL;        /* real 16x16 pbuffer for Unity worker contexts */
 static int g_best_es_major = 0;    /* highest ES version the RAW driver actually hands out */
@@ -487,6 +488,68 @@ static void gds_capture_real_egl(void) {
     } /* GDS_FLASH */
     /* NB: capture runs AFTER the SDL GL identity snapshot; create_window
      * finishes its own bookkeeping below (final state: nothing current). */
+  }
+
+  /* 0.74 WINDOW-MATCHING CONFIG.  Unity's window-bound context must be
+   * created from a config EQUAL to SDL's real window config (d%d/s%d as
+   * negotiated), not from the d24/s8 contract config used only to satisfy
+   * Unity's minimum-spec matcher.  0.73 device evidence: raw ctx on the
+   * contract config bound to the window renders into driver-private buffers
+   * (preswap readPixels show perfect frames) while the GBM bo SDL flips
+   * stays black -- identical signature to the invisible raw Phase-A flashes
+   * vs the visible Phase-B flashes (whose share root shares the surface's
+   * own config). */
+  if (g_real_cfg && r_eglChooseConfig && r_eglGetConfigAttrib) {
+    int want_rbits = g_best_es_major >= 3 ? HC_EGL_OPENGL_ES3_BIT_KHR
+                                          : HC_EGL_OPENGL_ES2_BIT;
+    int wa[] = {
+        HC_EGL_RED_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
+        HC_EGL_GREEN_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
+        HC_EGL_BLUE_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
+        HC_EGL_ALPHA_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
+        HC_EGL_DEPTH_SIZE, g_depth_size,
+        HC_EGL_STENCIL_SIZE, g_stencil_size,
+        HC_EGL_SURFACE_TYPE, HC_EGL_WINDOW_BIT | HC_EGL_PBUFFER_BIT,
+        HC_EGL_RENDERABLE_TYPE, want_rbits,
+        HC_EGL_NONE
+    };
+    void *wcfgs[32];
+    int wn = 0;
+    if (r_eglChooseConfig(g_real_dpy, wa, wcfgs, 32, &wn) && wn > 0) {
+      for (int i = 0; i < wn && i < 32; i++) {
+        int dr = -1, st = -1, rb = 0, surf = 0, nv = 0;
+        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_DEPTH_SIZE, &dr);
+        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_STENCIL_SIZE, &st);
+        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_RENDERABLE_TYPE, &rb);
+        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_SURFACE_TYPE, &surf);
+        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_NATIVE_VISUAL_TYPE, &nv);
+        /* EXACT depth/stencil equality against SDL's negotiated window --
+         * "at least" reintroduces the mismatch-invisible-render problem. */
+        if (dr == g_depth_size && st == g_stencil_size &&
+            (rb & want_rbits) == want_rbits &&
+            (surf & HC_EGL_WINDOW_BIT) && nv != 0x108) {
+          g_win_cfg = wcfgs[i];
+          break;
+        }
+      }
+      fprintf(stderr,
+              "[egl] window-matching cfg (d%d s%d rb=0x%x) -> %p (candidates=%d)\n",
+              g_depth_size, g_stencil_size, want_rbits, g_win_cfg, wn);
+    } else {
+      fprintf(stderr,
+              "[egl] window-matching cfg choose failed n=%d -- raw ctxs keep "
+              "contract cfg (present may stay black)\n", wn);
+    }
+    if (g_win_cfg && r_eglCreatePbufferSurface) {
+      static const int pb2[] = { 0x3057, 16, 0x3056, 16, HC_EGL_NONE };
+      void *pb = r_eglCreatePbufferSurface(g_real_dpy, g_win_cfg, pb2);
+      if (pb) {
+        fprintf(stderr,
+                "[egl] window-matching worker pbuffer = %p (replaces %p)\n",
+                pb, g_pbuf);
+        g_pbuf = pb;
+      }
+    }
   }
 }
 
@@ -1046,15 +1109,20 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
     if (share_context && ((_egl_context *)share_context)->real_ctx)
       shr = ((_egl_context *)share_context)->real_ctx;
     int tries[3] = { want, 2, g_best_es_major >= 2 ? g_best_es_major : 2 };
+    /* 0.74: create from the SDL window-matching config so rendering lands in
+     * the real GBM bo that SDL flips (contract config = invisible-render
+     * buffers on this Mali blob). */
+    void *pick_cfg = g_win_cfg ? g_win_cfg : g_real_cfg;
     void *rc = 0;
     for (int a = 0; a < 3 && !rc; a++) {
       if (a > 0 && tries[a] == tries[a - 1]) continue;
       if (a > 0 && tries[a] < 2) break;
       int ca[] = { 0x3098, tries[a], 0x3038 };
-      rc = r_eglCreateContext(g_real_dpy, g_real_cfg, shr, ca);
+      rc = r_eglCreateContext(g_real_dpy, pick_cfg, shr, ca);
       int err = r_eglGetError ? r_eglGetError() : 0;
-      printf("[egl] r_eglCreateContext es%d share=%p -> %p (err=0x%x tid=%lx)\n",
-             tries[a], shr, rc, err, (unsigned long)pthread_self());
+      printf("[egl] r_eglCreateContext es%d share=%p cfg=%p%s -> %p (err=0x%x tid=%lx)\n",
+             tries[a], shr, pick_cfg, g_win_cfg ? "" : " (CONTRACT fallback)",
+             rc, err, (unsigned long)pthread_self());
     }
     if (rc) {
       c->real_ctx = rc; c->is_real = 1; c->id = next_context_id++;
