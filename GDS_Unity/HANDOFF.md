@@ -1949,22 +1949,28 @@ so il2cpp actually loads.  If it reaches nativeRender, the game data/rendering i
 the next surface (input is minimal; GDS is touch).
 
 ---
-## 2026-08-06 AM -- "didn't get past the subtitle screen" diagnosis (NO CODE CHANGE)
+## 2026-08-06 -- 0.78.0-display: DISPLAY SOLVED (shrswap is the present route)
 
-- User report: shipped loader gets past the company logo but stalls at the
-  subtitle/title screen; past experiments (incl. SDL warm-up probes around
-  0.93) sometimes reached/her the actual title screen.
-- Investigation invoked the subtitle layout/Stella rule (Probe-pending set):
-  first suspect = low fps starving Progressor (sub 1/8/3/5/4 progression),
-  maybe mix framebuffer/presentation of splash->whole screen in subtitle.
-- Examined evidence: qemu runs (0.90-0.93 family) all show stable keep=1
-  frames with GPU busy (draw calls/swap present), rendering OK; device warm/
-  cold runs likewise button-verify.
-- Device-specific timing: SUBTITLE depends on a fixed number of frames
-  progressing within the deadline. Past "got to title" runs sit in warmed-up
-  caches (fast early frames); fresh APK-extract cold run (deploy always
-  re-extracts, so "fresh files" staging was a red herring / no-op) has slow
-  early frames (shader compile/texture upload IO) and subtitles expire.
-- CONCLUSION: timing difference, not a code regression. No code changes made.
-  Awaiting user A/B (repeat runs same binary) to confirm warm-vs-cold timing;
-  if it reproduces on warmed cache too, next probe is Progressor on device.
+- RETRACTED: the "didn't get past the subtitle screen / subtitle timing"
+  diagnosis above was wrong (kept no longer).  There was never a subtitle
+  timing issue -- the game reached and rendered `TitleForm:Init()` every run;
+  the frames simply never reached the panel.
+- Root cause of the black panel, proven by the 0.77 experiment cycler on
+  device: Unity renders through its RAW Mali EGL context into the real window
+  surface (preswap readPixels perfect), but which context is CURRENT when the
+  swap happens decides what SDL's GBM/KMSDRM page-flip presents.  Raw
+  `eglSwapBuffers` never flips (0.72); SDL `GL_SwapWindow` with the raw ctx
+  unbound-but-not-share-root-current presents "an untouched black buffer"
+  (Horizon Chase's own comment, verbatim); SDL-created contexts are ES1.1 on
+  this blob and crash Unity 2022 (0.69/0.76 + 0.77 BLUE).
+- THE FIX (0.77 GREEN experiment, user-confirmed: loading AND title screen
+  visible): per-frame in our eglSwapBuffers -- unbind the raw ctx
+  (`r_eglMakeCurrent(NULL)`), bind SDL's share-root via `SDL_GL_MakeCurrent`,
+  `SDL_GL_SwapWindow`, unbind, re-bind Unity's raw ctx.  0.78 makes this
+  "shrswap" route the DEFAULT (`GDS_PRESENT` unset; sdl/raw still reachable
+  via gds_env.cfg).  Per-frame cost: 4 MakeCurrents + 1 swap; fps stayed
+  healthy through the run.
+- What now works end-to-end on device: boot -> Kairo logo -> loading -> title
+  screen, live on the panel.  Remaining chapters: INPUT (R36S has no
+  touchscreen; dpad/analog -> virtual cursor + tap buttons; leads in kairovm
+  SurfaceBase/MotionEventRecord + Horizon jni input) then AUDIO.

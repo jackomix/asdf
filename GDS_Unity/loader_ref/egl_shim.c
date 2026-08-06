@@ -269,7 +269,12 @@ static int gds_flash_enabled(void) {
  * We ARE KMSDRM.  GDS_CTXMODEL=sdl reproduces Horizon's shipped KMSDRM
  * model (SDL-created contexts, SDL_GL_MakeCurrent, SDL_GL_SwapWindow);
  * =raw keeps our 0.73/74 model as control.  GDS_PRESENT toggles the swap
- * route inside the raw model.  GDS_RTFLASH=1 runs mid-game flash probes:
+ * route inside the raw model.  0.77 DEVICE RESOLUTION (experiment cycler):
+ * shrswap (raw draw, share-root swap, raw rebind) is the ONLY route that
+ * displays game frames -- loading and title screens confirmed on the panel;
+ * pure-SDL ctxmodel still dies (ES1.1 contexts), raw present stays black.
+ * 0.78 makes shrswap the default present mode.  GDS_RTFLASH=1 runs mid-game
+ * flash probes (kept for future regression digging):
  * frame 60 clears MAGENTA through Unity's own raw context (does raw-ctx
  * content reach the panel at all?), frames 120/180 clear YELLOW/CYAN
  * through the SDL share root (does share-root content still display
@@ -286,8 +291,15 @@ static int ctx_model_sdl(void) {
 static int present_mode(void) {
   static int p = -1;
   if (p < 0) {
+    /* 0.78: shrswap is the DEFAULT -- 0.77 device cycle, GREEN experiment:
+     * raw-ctx draw -> unbind -> SDL share-root swap -> rebind raw displayed
+     * the loading AND title screens on the panel (the only route that ever
+     * showed game frames).  sdl/raw stay reachable via gds_env.cfg. */
     const char *e = getenv("GDS_PRESENT");
-    p = e && strcmp(e, "raw") == 0 ? 1 : e && strcmp(e, "shrswap") == 0 ? 2 : 0;
+    if (!e || !*e) p = 2;
+    else if (strcmp(e, "raw") == 0) p = 1;
+    else if (strcmp(e, "sdl") == 0) p = 0;
+    else p = 2;
   }
   return p;
 }
@@ -1543,10 +1555,12 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
           printf("[egl] SwapBuffers(real, SDL window)\n");
       } else if (present_mode() == 2 && egl_window && egl_share_root &&
                  S.GL_MakeCurrent && S.GL_SwapWindow) {
-        /* 0.77 shrswap: Unity's raw-ctx frame is complete; swap the window
-         * with the SDL share root current (0.76 compose-era hypothesis:
-         * only the swap's current-ctx identity decides what the KMS flip
-         * shows).  Then re-bind Unity's ctx so the game never notices. */
+        /* 0.77 shrswap (0.78 DEFAULT): Unity's raw-ctx frame is complete;
+         * swap the window with the SDL share root current (0.77 device
+         * GREEN experiment: this exact dance displayed loading + title --
+         * the raw ctx's bytes ARE the bytes the KMS flip presents, and only
+         * the swap's current-ctx bookkeeping decides what SDL flips).
+         * Then re-bind Unity's ctx so the game never notices. */
         static int shrlog = 0;
         r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
         if (S.GL_MakeCurrent(egl_window, egl_share_root) == 0) {
