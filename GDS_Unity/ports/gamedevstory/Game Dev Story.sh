@@ -82,6 +82,20 @@ cd "$GAMEDIR" || { echo "cannot cd $GAMEDIR" >> "$LOG"; exit 1; }
 {
 echo "=== launching ./loader2 from $(pwd) ==="
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+# Kill stale loaders BEFORE the launch too: a leftover loader2 from a
+# previous session holds the ALSA device open, and the fresh loader's
+# SDL_OpenAudioDevice then fails with "Device or resource busy" (silent
+# second boot -- seen on the 0.85.1 run).  The post-launch kill below is
+# kept as insurance; it can't hit our own loader (excluded by PID).
+# PID-reuse can't kill us here because no kill happens between this
+# pre-kill and the launch.
+pre_killed=0
+for p in $(pgrep -x loader2 2>/dev/null); do
+  echo "  killing stale loader2 pid $p (pre-launch)"
+  kill -9 "$p" 2>/dev/null || true
+  pre_killed=1
+done
+[ "$pre_killed" = 1 ] && sleep 1
 # Launch FIRST, then kill any OTHER loader2 instances (a leftover one holds the
 # DRM/GL display -> black screen).  Launching before the kill means our own
 # fresh loader can never be killed by PID reuse (which happened when the kill

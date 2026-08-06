@@ -441,15 +441,23 @@ static void ensure_audio_initialized(void) {
         if (p_SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
             fprintf(stderr, "[SL] SDL_InitSubSystem(AUDIO): %s\n",
                     p_SDL_GetError ? p_SDL_GetError() : "?");
-    g_audio_dev = p_SDL_OpenAudioDevice(NULL, 0, &want, &have,
-                                        SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
-    if (!g_audio_dev) {
-        fprintf(stderr, "[SL] SDL_OpenAudioDevice FAILED: %s (driver=%s)\n",
-                p_SDL_GetError ? p_SDL_GetError() : "?",
+    /* 0.86: a just-killed stale loader can hold ALSA for a few hundred ms;
+     * retry briefly instead of going permanently silent (0.85.1 second-boot
+     * "Device or resource busy"). */
+    for (int attempt = 1; attempt <= 4; attempt++) {
+        g_audio_dev = p_SDL_OpenAudioDevice(NULL, 0, &want, &have,
+                                            SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
+        if (g_audio_dev)
+            break;
+        fprintf(stderr, "[SL] SDL_OpenAudioDevice attempt %d FAILED: %s (driver=%s)\n",
+                attempt, p_SDL_GetError ? p_SDL_GetError() : "?",
                 (p_SDL_GetCurrentAudioDriver && p_SDL_GetCurrentAudioDriver())
                     ? p_SDL_GetCurrentAudioDriver() : "?");
-        return;
+        if (attempt < 4)
+            usleep(250000);
     }
+    if (!g_audio_dev)
+        return;
     fprintf(stderr, "[SL] SDL audio open: %dHz %dch %d samples (driver=%s)\n",
             have.freq, have.channels, have.samples,
             (p_SDL_GetCurrentAudioDriver && p_SDL_GetCurrentAudioDriver())
@@ -1098,18 +1106,30 @@ static void *fmod_java_thread(void *arg)
         }
         if (!g_fmod_player) {
             g_fmod_player = alloc_player();
+            /* experiment knobs for the pitch/stutter report (0.86): force
+             * the rate/channel label used when mixing FMOD's stream.
+             * GDS_FMOD_RATE=22050 / GDS_FMOD_CH=1 A/B-test the two classic
+             * octave-up causes without a redeploy. */
+            unsigned knob_rate = 0, knob_ch = 0;
+            const char *er = getenv("GDS_FMOD_RATE"), *ec = getenv("GDS_FMOD_CH");
+            if (er) knob_rate = (unsigned)atoi(er);
+            if (ec) knob_ch   = (unsigned)atoi(ec);
+            unsigned eff_rate = knob_rate ? knob_rate
+                : (g_fmod_rate > 0 ? (unsigned)g_fmod_rate : 44100);
+            unsigned eff_ch = knob_ch ? knob_ch
+                : (g_fmod_channels > 0 ? (unsigned)g_fmod_channels : 2);
             if (g_fmod_player) {
-                g_fmod_player->sample_rate     = (SLuint32)(g_fmod_rate > 0 ? g_fmod_rate : 44100);
-                g_fmod_player->num_channels    = (SLuint32)(g_fmod_channels > 0 ? g_fmod_channels : 2);
+                g_fmod_player->sample_rate     = (SLuint32)eff_rate;
+                g_fmod_player->num_channels    = (SLuint32)eff_ch;
                 g_fmod_player->bits_per_sample = 16;
                 g_fmod_player->play_state      = SL_PLAYSTATE_PLAYING;
                 g_fmod_player->volume          = 0.8f;
             }
             ensure_audio_initialized();
-            fprintf(stderr, "[audio] fmod-thread: pumping (rate=%d ch=%d blockframes=%d bufsize=%d)\n",
-                    g_fmod_rate > 0 ? g_fmod_rate : 44100,
-                    g_fmod_channels > 0 ? g_fmod_channels : 2,
-                    g_fmod_blockframes, gds_jni_fmod_buffer_size());
+            fprintf(stderr, "[audio] fmod-thread: pumping (rate=%u ch=%u blockframes=%d bufsize=%d%s)\n",
+                    eff_rate, eff_ch, g_fmod_blockframes,
+                    gds_jni_fmod_buffer_size(),
+                    (knob_rate || knob_ch) ? " [GDS_FMOD_* override]" : "");
         }
         /* 0.85 evidence: fmodProcess returns 0 on SUCCESS (fills the whole
          * direct buffer, zero-padding on underrun like the real Java run()
@@ -1132,13 +1152,31 @@ static void *fmod_java_thread(void *arg)
         int rc = proc(gds_jni_env(), gds_jni_fmod_device(),
                       gds_jni_fmod_bytebuffer());
         if (rc >= 0) {
+            const unsigned char *pcm = gds_jni_fmod_pcm();
+            /* content probe (0.86): 'first-boot music is high-pitched and
+             * stuttery' -- classify the stream w/o guessing.  Zero-pad
+             * fraction tells starvation (readData pads on underrun): ~50%
+             * zeros = FMOD producing at half the rate we consume (i.e.
+             * content labelled 22050 but played 44100 = octave-up + gaps);
+             * 100% = mixer silent; near-0% with nonzero peaks = dense PCM
+             * and the problem is downstream (SDL/ALSA rate). */
+            unsigned zeros = 0;
+            int peak = 0;
+            for (unsigned i = 0; i < bufsz; i += 2) {
+                short v = (short)(pcm[i] | (pcm[i + 1] << 8));
+                if (v == 0) zeros++;
+                int a = v < 0 ? -v : v;
+                if (a > peak) peak = a;
+            }
+            unsigned zpct = zeros * 100 / (bufsz / 2);
             if (g_fmod_player)
-                ring_write(g_fmod_player, gds_jni_fmod_pcm(), bufsz);
+                ring_write(g_fmod_player, pcm, bufsz);
             blocks++;
-            if (blocks <= 3 || blocks % 600 == 0) {
-                fprintf(stderr, "[audio] fmod block #%lu (rc=%d %u bytes, rate=%u, fill=%u)\n",
-                        blocks, rc, bufsz, rate,
-                        g_fmod_player ? ring_readable(g_fmod_player) : 0);
+            if (blocks <= 60 || blocks % 600 == 0) {
+                fprintf(stderr, "[audio] fmod block #%lu (rc=%d %uB, fill=%u, zeros=%u%%, peak=%d)\n",
+                        blocks, rc, bufsz,
+                        g_fmod_player ? ring_readable(g_fmod_player) : 0,
+                        zpct, peak);
                 fflush(stderr);
             }
             err_n = 0;

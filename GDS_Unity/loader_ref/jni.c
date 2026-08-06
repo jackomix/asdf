@@ -2682,6 +2682,8 @@ static void gds_dump_managed_frames(const char *why)
     fprintf(stderr, "[gds] end of frames\n");
 }
 
+static void gds_jni_ring_dump(void);
+
 static int64_t j_Kairo_showDialog(jctx *c)
 {
     int type = jarg_int(c);
@@ -2698,6 +2700,18 @@ static int64_t j_Kairo_showDialog(jctx *c)
             message && message->str ? message->str : "(null)",
             audience && audience->cls ? audience->cls : "(none)",
             result, (v && *v) ? " (GDS_DIALOG_RESULT)" : "");
+    fflush(stderr);
+    /* 0.86: on the generic error dialog, dump the recently-dispatched JNI
+     * calls so the failing contract is visible without GDS_JNILOG=1. */
+    {
+        static int ring_dumped;
+        const char *tt = title && title->str ? title->str : "";
+        const char *mm = message && message->str ? message->str : "";
+        if (!ring_dumped && (strstr(tt, "rror") || strstr(mm, "rror"))) {
+            ring_dumped = 1;
+            gds_jni_ring_dump();
+        }
+    }
     /* Zombie archaeology probes (audience/catch-type sniff, frame walker)
      * kill the render thread with SEGVs (gds_is_exception_object funnel) and
      * have never produced evidence.  Off by default; GDS_PROBE_JUNK=1 re-arms.
@@ -4220,6 +4234,21 @@ static int64_t j_Unity_hideSoftInput(jctx *c)
     return 0;
 }
 
+/* shared with the Kairosoft showDialog handler for the error dump */
+static char g_jni_ring[32][112];
+static unsigned g_jni_ring_pos;
+
+static void gds_jni_ring_dump(void)
+{
+    fprintf(stderr, "[jni] last dispatched JNI calls (oldest first):\n");
+    for (int k = 0; k < 32; k++) {
+        unsigned i = (g_jni_ring_pos + k) & 31;
+        if (g_jni_ring[i][0])
+            fprintf(stderr, "[jni]   %s\n", g_jni_ring[i]);
+    }
+    fflush(stderr);
+}
+
 static int64_t dispatch(void *e, jobj *self, void *mid, va_list *ap,
                         const uint64_t *args)
 {
@@ -4227,6 +4256,19 @@ static int64_t dispatch(void *e, jobj *self, void *mid, va_list *ap,
     if (!m) {
         JT("call on unknown method id %p", mid);
         return 0;
+    }
+    /* 0.86 forensics: the kairo "An error has occurred." dialog fires with
+     * no JNI evidence in a non-verbose log.  Keep the last 32 dispatched
+     * methods in a tiny ring and dump it when that dialog opens. */
+    {
+        static char ring[32][112];
+        static unsigned ring_pos;
+        snprintf(ring[ring_pos], sizeof ring[0], "%s.%s%s",
+                 m->cls ? m->cls : "?", m->name ? m->name : "?",
+                 m->sig ? m->sig : "");
+        ring_pos = (ring_pos + 1) & 31;
+        memcpy(g_jni_ring, ring, sizeof ring);
+        g_jni_ring_pos = ring_pos;
     }
     /* Reflected Field/Method handles are our numeric registry ids, not jobj
      * pointers: ReflectionHelper.getFieldID returns the id and Unity then
