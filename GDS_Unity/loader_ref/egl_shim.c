@@ -863,6 +863,10 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
       printf("[egl] eglCreateContext -> %p [ctx_id=%d, NullGL]\n", (void *)c, c->id);
       return (EGLContext)c;
     }
+    printf("[egl] eglCreateContext FAILED: no SDL GL_CreateContext usable "
+           "(window=%p fn=%d nullgl=%d tid=%lx)\n",
+           (void *)egl_window, S.GL_CreateContext != NULL, g_nullgl,
+           (unsigned long)pthread_self());
     free(c); return EGL_NO_CONTEXT;
   }
   pthread_mutex_lock(&egl_ctx_mutex);
@@ -887,7 +891,21 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
   S.GL_SetAttribute(SDL_GL_STENCIL_SIZE, g_stencil_size);
   S.GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
   if (egl_share_root) S.GL_MakeCurrent(egl_window, egl_share_root);
+  if (S.GetError) S.GetError();  /* drain */
   c->sdl_context = S.GL_CreateContext(egl_window);
+  if (!c->sdl_context) {
+    /* Seen on R36S/Mali(KMSDRM): shared create fails silently. Log and retry
+     * unshared -- a private context still gets Unity's gfx device up. */
+    printf("[egl] SDL_GL_CreateContext(shared, want_major=%d) failed: %s (tid=%lx)\n",
+           want_major, S.GetError ? S.GetError() : "?", (unsigned long)pthread_self());
+    S.GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    S.GL_MakeCurrent(egl_window, NULL);
+    S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);   /* safest floor */
+    c->sdl_context = S.GL_CreateContext(egl_window);
+    printf("[egl] retry unshared ES2 ctx -> %p %s\n",
+           c->sdl_context,
+           c->sdl_context ? "OK" : (S.GetError ? S.GetError() : "?"));
+  }
   S.GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
   S.GL_MakeCurrent(egl_window, NULL);
   pthread_mutex_unlock(&egl_ctx_mutex);
