@@ -45,6 +45,8 @@
 typedef struct SDL_Window SDL_Window;
 typedef void *SDL_GLContext;
 typedef struct { int format; int w; int h; int refresh_rate; void *driverdata; } SDL_DisplayMode;
+/* SDL_Event is a 56-byte union; we only drain and drop events. */
+typedef union { unsigned char pad[56]; } SDL_Event;
 
 /* SDL2 entry points, resolved once via dlopen/dlsym. */
 static struct {
@@ -67,6 +69,7 @@ static struct {
   void (*GL_GetDrawableSize)(SDL_Window *, int *, int *);
   int (*GetDesktopDisplayMode)(int, SDL_DisplayMode *);
   unsigned (*WasInit)(unsigned);
+  int (*PollEvent)(SDL_Event *);
 } S;
 
 static int sdl_ok(void) { return S.Init && S.CreateWindow && S.GL_CreateContext && S.GL_MakeCurrent; }
@@ -103,6 +106,7 @@ static int sdl_load(void) {
   S.GL_GetDrawableSize= (void (*)(SDL_Window *, int *, int *))sym(h, "SDL_GL_GetDrawableSize");
   S.GetDesktopDisplayMode = (int (*)(int, SDL_DisplayMode *))sym(h, "SDL_GetDesktopDisplayMode");
   S.WasInit           = (unsigned (*)(unsigned))sym(h, "SDL_WasInit");
+  S.PollEvent         = (int (*)(SDL_Event *))sym(h, "SDL_PollEvent");
   return sdl_ok();
 }
 
@@ -319,6 +323,17 @@ int egl_shim_screen_h(void) { return g_screen_h; }
 static char g_gl_str_cache[5][3072]; /* vendor renderer version sl extensions */
 static int g_gl_str_cached = 0;
 const char *gds_gl_string_for_jni(unsigned name) {
+  /* Horizon routes JNI GL queries at the LIVE context whenever the calling
+   * thread has one; the bootstrap cache is just the no-context fallback.
+   * (Unity parses real worker-context strings for capability decisions.) */
+  if (has_real_gl && S.GL_GetProcAddress) {
+    const unsigned char *(*g)(unsigned) =
+      (const unsigned char *(*)(unsigned))S.GL_GetProcAddress("glGetString");
+    if (g) {
+      const unsigned char *s = g(name);
+      if (s) return (const char *)s;
+    }
+  }
   if (g_gl_str_cached) {
     switch (name) {
     case 0x1F00: return g_gl_str_cache[0];
@@ -378,10 +393,15 @@ void egl_shim_create_window(void) {
    * Horizon Chase port: alpha is ALWAYS 8 (that Unity device enumeration does
    * an exact RGBA8888 compare); try ES 3 then ES 2 per window, and reject any
    * context that doesn't report an "OpenGL ES" identity. */
-  static const int versions[] = {3, 2};
   static const int fmts[][2] = { {24,8}, {16,0}, {0,0} };
+  int versions[2] = {3, 2};
+  { const char *force = getenv("GDS_GLES_MAJOR");   /* HC_GLES_MAJOR analog */
+    if (force && (force[0] == '2' || force[0] == '3')) {
+      versions[0] = force[0] - '0'; versions[1] = 0;
+    } }
+  int nversions = versions[1] ? 2 : 1;
   for (size_t f = 0; f < sizeof fmts / sizeof fmts[0] && !egl_share_root; f++) {
-    for (size_t vv = 0; vv < sizeof versions / sizeof versions[0] && !egl_share_root; vv++) {
+    for (size_t vv = 0; vv < (size_t)nversions && !egl_share_root; vv++) {
       S.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
       S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, versions[vv]);
       S.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -407,7 +427,14 @@ void egl_shim_create_window(void) {
                versions[vv], f, fmts[f][0], fmts[f][1], S.GetError());
         continue;
       }
-      /* verify the identity: must be real GLES, not desktop GL or ES 1.x CM */
+      /* Identity check: must be GLES, not desktop GL.  Accept "OpenGL ES-CM"
+       * (the R36S Mali/KMSDRM share-root string) EXACTLY like the shipped,
+       * working Horizon Chase port does -- its ctx_is_gles() is just
+       * strstr(version, "OpenGL ES").  This share root is only SDL's bond
+       * between Unity's worker contexts; the game renders through its own
+       * SDL-created contexts, never through this one.  Rejecting ES-CM here
+       * (<=0.64) is what forced the pointless NullGL fallback on a device
+       * whose GL stack another Unity port drives at 60fps. */
       {
         void *gs = S.GL_GetProcAddress ? S.GL_GetProcAddress("glGetString") : NULL;
         const char *ver = NULL;
@@ -416,13 +443,14 @@ void egl_shim_create_window(void) {
           const unsigned char *s = g(0x1F02);
           ver = s ? (const char *)s : NULL;
         }
-        if (!ver || !strstr(ver, "OpenGL ES") || strstr(ver, "ES-CM")) {
-          printf("[egl] ctx ES%d rejected, GL_VERSION='%s'\n",
-                 versions[vv], ver ? ver : "(null)");
+        if (ver && !strstr(ver, "OpenGL ES")) {
+          printf("[egl] ctx ES%d rejected (desktop GL), GL_VERSION='%s'\n",
+                 versions[vv], ver);
           S.GL_DeleteContext(egl_share_root); egl_share_root = NULL;
           continue;
         }
-        printf("[egl] accepted ES%d ctx, GL_VERSION=%s\n", versions[vv], ver);
+        printf("[egl] accepted ES%d ctx, GL_VERSION=%s\n", versions[vv],
+               ver ? ver : "(unknown)");
       }
       g_es_major = versions[vv];
       /* read back the REALLY negotiated buffer configuration */
@@ -446,7 +474,23 @@ void egl_shim_create_window(void) {
            (void *)egl_window, (void *)egl_share_root);
     printf("[egl] negotiated a%d d%d s%d ES%d\n", g_alpha_size, g_depth_size, g_stencil_size, g_es_major);
 
-    if (S.GL_GetDrawableSize) S.GL_GetDrawableSize(egl_window, &g_screen_w, &g_screen_h);
+    /* KMSDRM settles the drawable a few frames after the context appears;
+     * Horizon polls events and waits for the size to match (30 x 10ms)
+     * before letting the game at the window. */
+  if (S.PollEvent && S.GL_GetDrawableSize) {
+    int dw = 0, dh = 0;
+    for (int i = 0; i < 30; i++) {
+      SDL_Event ev;
+      while (S.PollEvent(&ev)) {}
+      S.GL_GetDrawableSize(egl_window, &dw, &dh);
+      if (dw > 0 && dh > 0) break;
+      struct timespec ts = { 0, 10000000 };
+      nanosleep(&ts, NULL);
+    }
+    if (dw > 0 && dh > 0) { g_screen_w = dw; g_screen_h = dh; }
+  }
+  if (S.GL_GetDrawableSize && (g_screen_w <= 0 || g_screen_h <= 0))
+    S.GL_GetDrawableSize(egl_window, &g_screen_w, &g_screen_h);
   if (g_screen_w <= 0) g_screen_w = width;
   if (g_screen_h <= 0) g_screen_h = height;
   if (S.GL_SetSwapInterval) S.GL_SetSwapInterval(1);
@@ -567,6 +611,12 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
   S.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
   S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, want_major >= 2 && want_major <= 3 ? want_major : g_es_major);
   S.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+  /* Horizon's egl_set_ctx_attrs resets the full RGBA8888 contract for every
+   * context -- SDL's gl_config is global state, so stale values from any
+   * interim user could otherwise leak into Unity's workers. */
+  S.GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+  S.GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+  S.GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
   S.GL_SetAttribute(SDL_GL_ALPHA_SIZE, g_alpha_size);
   S.GL_SetAttribute(SDL_GL_DEPTH_SIZE, g_depth_size);
   S.GL_SetAttribute(SDL_GL_STENCIL_SIZE, g_stencil_size);
@@ -597,6 +647,19 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
   if (!egl_window) return EGL_TRUE;
   if (S.GL_MakeCurrent(egl_window, context->sdl_context) == 0) {
     has_real_gl = 1;
+    /* first-bind identity: what the DRIVER gives Unity's worker contexts.
+     * The share root's GL_VERSION only describes the bootstrap ctx. */
+    static int bind_ver_n = 0;
+    if (bind_ver_n < 4 && S.GL_GetProcAddress) {
+      const unsigned char *(*g)(unsigned) =
+        (const unsigned char *(*)(unsigned))S.GL_GetProcAddress("glGetString");
+      if (g) {
+        const unsigned char *s = g(0x1F02);
+        printf("[egl] worker ctx id=%d bound, GL_VERSION='%s'\n",
+               context->id, s ? (const char *)s : "(null)");
+        bind_ver_n++;
+      }
+    }
   } else {
     has_real_gl = 0;
     printf("[egl] eglMakeCurrent failed: %s\n", S.GetError ? S.GetError() : "?");
@@ -659,8 +722,10 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
   case 0x3027: *value = 0x3038; break;              /* EGL_CONFIG_CAVEAT = EGL_NONE */
   case 0x3028: *value = 1; break;                   /* EGL_CONFIG_ID */
   case 0x3033: *value = 0x0005; break;              /* EGL_SURFACE_TYPE = WINDOW|PBUFFER */
-  case 0x3040: *value = 0x04; break;                /* EGL_RENDERABLE_TYPE = ES2 */
-  case 0x3042: *value = 0x04; break;
+  /* RENDERABLE_TYPE/CONFORMANT: report the actually-negotiated ES level
+   * (Horizon answers ES3-bit once ES3 was the negotiated share root). */
+  case 0x3040: *value = g_es_major >= 3 ? 0x40 : 0x04; break;
+  case 0x3042: *value = g_es_major >= 3 ? 0x40 : 0x04; break;
   /* EGL_DEPTH_ENCODING_NV: a real EGL without the extension returns
    * EGL_BAD_ATTRIBUTE here and Unity's helper substitutes 0x30E3 (NONE).
    * We used to answer 0 -- Unity's config descriptor then recorded

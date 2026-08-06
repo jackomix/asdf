@@ -1306,7 +1306,7 @@ int main(int argc, char **argv)
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.65.0-ref)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.66.0-ref)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
