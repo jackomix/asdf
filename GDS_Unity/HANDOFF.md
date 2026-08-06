@@ -454,7 +454,7 @@ nativeResume → nativeFocusChanged(1) → **loop nativeRender(env,thiz)**.  The
 dialog build happens inside that first nativeRender.
 
 ### How to reproduce / iterate
-- Deploy: `curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20`
+- Deploy: `curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ed-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20`
 - Read `gamedevstory/gamedevstory/loader.log` (fresh each run now).
 - Key files: `loader/loader_glibc_main.c` (boot), `loader/egl_shim.c` (EGL/GL),
   `loader/jni_shim.c` (JNI shim — the dialog is built through here),
@@ -1116,7 +1116,7 @@ Implemented in the glibc build (`loader/loader2_glibc`):
 
 Next on-device test (needs deploy; bench has no GPU/SDL so this can't run headless):
 ```
-curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ed-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 ```
 Expect `[loader] build: 0.7.0-glibc`, then `[egl] GL_VENDOR/RENDERER/VERSION`
 proving the Mali driver is behind the context, then graphics init to proceed.
@@ -1131,7 +1131,7 @@ proving the Mali driver is behind the context, then graphics init to proceed.
 > guard-pad layout instead of overwriting the register.
 
 ### Deploy (works, version-checked)
-    curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fc860-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
+    curl -sL -o gds_deploy.sh https://github.com/jackomix/asdf/raw/arena/019fd2ed-asdf/GDS_Unity/tools/gds_deploy.sh && chmod +x gds_deploy.sh && ./gds_deploy.sh ark@192.168.18.20
 Expect `[loader] build: 0.37.0-glibc` in the log (stale-zip guard aborts otherwise).
 
 ## 0.37 — maps_resolve fixed, deadlock root cause analysed (NOT YET RESOLVED)
