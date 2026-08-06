@@ -1089,6 +1089,12 @@ static void *fmod_java_thread(void *arg)
                 continue;
             }
             fprintf(stderr, "[audio] fmodProcess native at %p\n", (void *)proc);
+            /* fmodProcess(GetDirectBufferCapacity) decides the block size.
+             * Default direct buffer is 65536B (~372ms) -- far too coarse:
+             * shrink to 8192B = 2048 stereo frames at 44.1kHz (~46ms), the
+             * same cadence as the SDL device.  FMOD re-queries capacity on
+             * every call (libunity.so @0xbe8d08), so this is safe. */
+            gds_jni_fmod_set_buffer_size(8192);
         }
         if (!g_fmod_player) {
             g_fmod_player = alloc_player();
@@ -1100,41 +1106,47 @@ static void *fmod_java_thread(void *arg)
                 g_fmod_player->volume          = 0.8f;
             }
             ensure_audio_initialized();
-            fprintf(stderr, "[audio] fmod-thread: pumping (rate=%d ch=%d blockframes=%d)\n",
+            fprintf(stderr, "[audio] fmod-thread: pumping (rate=%d ch=%d blockframes=%d bufsize=%d)\n",
                     g_fmod_rate > 0 ? g_fmod_rate : 44100,
                     g_fmod_channels > 0 ? g_fmod_channels : 2,
-                    g_fmod_blockframes);
+                    g_fmod_blockframes, gds_jni_fmod_buffer_size());
         }
-        /* pace on ring space: one block per fmodProcess call */
+        /* 0.85 evidence: fmodProcess returns 0 on SUCCESS (fills the whole
+         * direct buffer, zero-padding on underrun like the real Java run()
+         * loop which writes `capacity` bytes regardless) and -1 only while
+         * the C++ output object ([0x102b2b0]) doesn't exist yet.  0.85.0
+         * treated 0 as "no data" and never wrote a byte. */
         unsigned rate = g_fmod_rate > 0 ? (unsigned)g_fmod_rate : 44100;
         unsigned ch = g_fmod_channels > 0 ? (unsigned)g_fmod_channels : 2;
-        unsigned blockbytes = g_fmod_blockframes > 0
-            ? (unsigned)g_fmod_blockframes * ch * 2 : 4096;
-        if (g_fmod_player &&
-            ring_writable(g_fmod_player) < blockbytes * 3) {
-            usleep(2000);
-            continue;
+        unsigned bufsz = (unsigned)gds_jni_fmod_buffer_size();
+        if (!bufsz) bufsz = 8192;
+        /* pace like AudioTrack.write(): it blocks while the track is full.
+         * Keep ~5 blocks queued (~232ms worst-case click latency) instead
+         * of the old 'grow until 4MB ring is nearly full' throttle, which
+         * would have stacked up ~24s of audio lag. */
+        while (g_fmod_player &&
+               ring_readable(g_fmod_player) >= bufsz * 5) {
+            if (!gds_jni_fmod_should_run()) break;
+            usleep(4000);
         }
-        int n = proc(gds_jni_env(), gds_jni_fmod_device(),
-                     gds_jni_fmod_bytebuffer());
-        if (n > 0) {
+        int rc = proc(gds_jni_env(), gds_jni_fmod_device(),
+                      gds_jni_fmod_bytebuffer());
+        if (rc >= 0) {
             if (g_fmod_player)
-                ring_write(g_fmod_player, gds_jni_fmod_pcm(), (uint32_t)n);
+                ring_write(g_fmod_player, gds_jni_fmod_pcm(), bufsz);
             blocks++;
-            if (blocks == 1 || blocks % 600 == 0) {
-                fprintf(stderr, "[audio] fmod block #%lu (%d bytes, rate=%u)\n",
-                        blocks, n, rate);
+            if (blocks <= 3 || blocks % 600 == 0) {
+                fprintf(stderr, "[audio] fmod block #%lu (rc=%d %u bytes, rate=%u, fill=%u)\n",
+                        blocks, rc, bufsz, rate,
+                        g_fmod_player ? ring_readable(g_fmod_player) : 0);
                 fflush(stderr);
             }
-            /* block cadence throttle: FMOD's java write() normally paces the
-             * loop; without it a fast mixer fills the ring instantly */
-            unsigned us = (unsigned)((unsigned long long)n * 1000000ULL /
-                                     ((unsigned long long)rate * ch * 2));
-            if (us > 2000) usleep(us - 2000);
+            err_n = 0;
         } else {
             if (err_n < 6) {
                 err_n++;
-                fprintf(stderr, "[audio] fmodProcess -> %d (#%lu)\n", n, blocks);
+                fprintf(stderr, "[audio] fmodProcess -> %d (#%lu; -1 = FMOD output not up yet)\n",
+                        rc, blocks);
                 fflush(stderr);
             }
             usleep(4000);

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <sys/stat.h>
 #include <link.h>
@@ -1115,6 +1116,38 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
     }
     fprintf(stderr, "\n[gds] signal %d (si_code=%d) at pc=%#lx addr=%p\n",
             sig, si ? si->si_code : 0, pc, si ? si->si_addr : NULL);
+    /* crash forensics (0.85.1): the OSK-DONE crash gave pc+addr+regs that
+     * didn't uniquely identify the faulting instruction.  Dump the raw
+     * insn word at pc and walk the x29 frame chain so the caller sequence
+     * is captured too.  Probe readability via write-to-/dev/null (EFAULT)
+     * so a garbage pc/fp can't nest a second fault in the dump. */
+    {
+        static int nullfd = -2;
+        if (nullfd == -2) nullfd = open("/dev/null", O_WRONLY);
+        g_in_dump = 1;
+        int readable = nullfd >= 0 &&
+            write(nullfd, (void *)pc, 4) == 4;
+        if (readable)
+            fprintf(stderr, "[gds]   insn@%#lx = %08lx\n", pc,
+                    (unsigned long)*(volatile uint32_t *)pc);
+        unsigned long fp = (unsigned long)u->uc_mcontext.regs[29];
+        unsigned long sp = (unsigned long)u->uc_mcontext.sp;
+        fprintf(stderr, "[gds]   backtrace:");
+        for (int d = 0; d < 10 && fp; d++) {
+            /* frame must sit on this stack, above sp, aligned */
+            if (fp < sp || fp - sp > (64UL << 20) || (fp & 0xf)) break;
+            if (nullfd < 0 ||
+                write(nullfd, (void *)fp, 16) != 16) break;
+            unsigned long prev = *(volatile unsigned long *)fp;
+            unsigned long lr = *(volatile unsigned long *)(fp + 8);
+            if (!lr) break;
+            fprintf(stderr, " #%d=%#lx", d, lr);
+            if (prev <= fp) break;
+            fp = prev;
+        }
+        fprintf(stderr, "\n");
+        g_in_dump = 0;
+    }
     for (size_t i = 0; i < sizeof LIBS / sizeof *LIBS; i++) {
         nx_mod *m = nx_find_mod(LIBS[i].soname);
         if (!m)
@@ -1344,7 +1377,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.85.0-fmodtrack)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.85.1-fmodfix)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();

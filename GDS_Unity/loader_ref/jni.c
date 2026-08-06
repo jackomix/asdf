@@ -306,6 +306,13 @@ int gds_jni_fmod_pcm_capacity(void)
     return (int)sizeof fmod_pcm;
 }
 
+/* Current direct-buffer size as FMOD sees it via GetDirectBufferCapacity
+ * (shrunk from the 64KiB backing array by the pump thread). */
+int gds_jni_fmod_buffer_size(void)
+{
+    return fmod_buffer_size;
+}
+
 void gds_jni_fmod_set_buffer_size(int bytes)
 {
     if (bytes <= 0 || bytes > (int)sizeof fmod_pcm)
@@ -1554,9 +1561,22 @@ static int64_t j_Utility_getAppWidth(jctx *c)
  * so the game enables its landscape/rotation path like the Steam build. */
 static int64_t j_Utility_isTablet(jctx *c)
 {
+    /* GDS_TABLET env knob (gds_env.cfg on device): default 1 = landscape
+     * toggle verified since 0.82.  Set GDS_TABLET=0 to test whether tablet
+     * mode is what shrinks the tabs/dialog buttons -- with the IsSide
+     * patch owning landscape, tablet=0 should keep the landscape layout
+     * but re-enable whatever phone-scale UI the game has. */
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GDS_TABLET");
+        v = e ? !!atoi(e) : 1;
+        fprintf(stderr, "[jni] Utility.isTablet() -> %d (GDS_TABLET=%s)\n",
+                v, e ? e : "unset, default 1");
+        fflush(stderr);
+    }
     (void)c;
-    JT("Utility.isTablet() -> 1");
-    return 1;
+    JT("Utility.isTablet() -> %d", v);
+    return v;
 }
 
 /* Utility.getSystemBarHeight(): queried by the dex getScaleRatio chain
@@ -2784,22 +2804,38 @@ static int64_t j_kairo_InputPanel(jctx *c)
         return done;
     }
     if (is_fetch) {
-        jobj *arr = j_NewObjectArray(NULL, 2, mk_class("java/lang/String"), NULL);
-        if (arr) {
-            arr->cls = "[Ljava/lang/String;";
-            if (gds_osk_result_ok()) {
-                /* non-NULL [0] = positive branch (FepPanel disasm: cbz on
-                 * [0x20] picks the negative listener; non-null keeps the
-                 * positive one) */
-                arr->elems[0] = mk_string("positive");
+        /* Return the shape the CALLER asked for.  The device-proven dex
+         * surface (0.85.0) requests getInputPanelResult()Ljava/lang/String;
+         * -- a single string (null = canceled).  0.84.x answered with a
+         * String[2] to a ()Ljava/lang/String; requester; the mismatch is
+         * the prime suspect for the DONE-crash (signal 11 inside loader2,
+         * pc in ReflectionHelper.getConstructorID while the managed side
+         * marshaled the result).  Keep the array form for any caller that
+         * actually declares ()[Ljava/lang/String;. */
+        int want_array = sig && strstr(sig, "[Ljava/lang/String;");
+        if (want_array) {
+            jobj *arr = j_NewObjectArray(NULL, 2, mk_class("java/lang/String"), NULL);
+            if (arr) {
+                arr->cls = "[Ljava/lang/String;";
+                if (gds_osk_result_ok()) {
+                    /* non-NULL [0] = positive branch (FepPanel disasm: cbz
+                     * on [0x20] picks the negative listener) */
+                    arr->elems[0] = mk_string("positive");
+                }
+                arr->elems[1] = mk_string(gds_osk_text());
             }
-            arr->elems[1] = mk_string(gds_osk_text());
+            fprintf(stderr, "[osk] Utility.%s%s -> { %s, \"%s\" }\n",
+                    name, sig, gds_osk_result_ok() ? "\"positive\"" : "null",
+                    gds_osk_text());
+            fflush(stderr);
+            return (int64_t)(uintptr_t)arr;
         }
-        fprintf(stderr, "[osk] Utility.%s%s -> { %s, \"%s\" }\n",
-                name, sig, gds_osk_result_ok() ? "\"positive\"" : "null",
-                gds_osk_text());
+        jobj *s = gds_osk_result_ok() ? mk_string(gds_osk_text()) : NULL;
+        fprintf(stderr, "[osk] Utility.%s%s -> %s\"%s\"\n", name, sig,
+                gds_osk_result_ok() ? "" : "(null) ",
+                gds_osk_result_ok() ? gds_osk_text() : "canceled");
         fflush(stderr);
-        return (int64_t)(uintptr_t)arr;
+        return (int64_t)(uintptr_t)s;
     }
     /* One log per unknown member name (the isInputPanelFinish-per-frame
      * spam of 0.84.0 drowned the real evidence). */
@@ -4036,6 +4072,14 @@ static int64_t j_FMOD_stop(jctx *c)
 static int64_t j_FMOD_isRunning(jctx *c)
 {
     (void)c;
+    /* poll-rate evidence: how hard does the C++ side watch the device? */
+    static unsigned calls;
+    calls++;
+    if (calls == 1 || calls % 600 == 0) {
+        fprintf(stderr, "[audio] FMODAudioDevice.isRunning() #%u -> %d\n",
+                calls, gds_jni_fmod_should_run());
+        fflush(stderr);
+    }
     return gds_jni_fmod_should_run() ? 1 : 0;
 }
 

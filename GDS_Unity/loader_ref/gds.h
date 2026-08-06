@@ -55,6 +55,7 @@ void *gds_jni_fmod_device(void);
 void *gds_jni_fmod_bytebuffer(void);
 void *gds_jni_fmod_pcm(void);
 int gds_jni_fmod_pcm_capacity(void);
+int gds_jni_fmod_buffer_size(void);
 void gds_jni_fmod_set_buffer_size(int bytes);
 int gds_jni_fmod_should_run(void);
 int gds_audio_start(void *env);
