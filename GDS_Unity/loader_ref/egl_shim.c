@@ -722,10 +722,15 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
   case 0x3027: *value = 0x3038; break;              /* EGL_CONFIG_CAVEAT = EGL_NONE */
   case 0x3028: *value = 1; break;                   /* EGL_CONFIG_ID */
   case 0x3033: *value = 0x0005; break;              /* EGL_SURFACE_TYPE = WINDOW|PBUFFER */
-  /* RENDERABLE_TYPE/CONFORMANT: report the actually-negotiated ES level
-   * (Horizon answers ES3-bit once ES3 was the negotiated share root). */
-  case 0x3040: *value = g_es_major >= 3 ? 0x40 : 0x04; break;
-  case 0x3042: *value = g_es_major >= 3 ? 0x40 : 0x04; break;
+  /* RENDERABLE_TYPE/CONFORMANT: Unity 2022 does a strict bit-subset test
+   * against the requested bits (evidence: device 0.66 log -- it asks
+   * eglChooseConfig 3040=4 then rejects a config answering 0x40 alone with
+   * "Unable to find a configuration matching minimum spec!").  Answer
+   * ES3-only-when-ES3 like Horizon and this Unity rejects the config.
+   * ES3 hardware is ES2-renderable, so report BOTH bits once ES3 was
+   * negotiated: 0x40 (ES3) | 0x04 (ES2) = 0x44. */
+  case 0x3040: *value = g_es_major >= 3 ? 0x44 : 0x04; break;
+  case 0x3042: *value = g_es_major >= 3 ? 0x44 : 0x04; break;
   /* EGL_DEPTH_ENCODING_NV: a real EGL without the extension returns
    * EGL_BAD_ATTRIBUTE here and Unity's helper substitutes 0x30E3 (NONE).
    * We used to answer 0 -- Unity's config descriptor then recorded

@@ -19,7 +19,7 @@ PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fd2ed-asdf}"
 # The loader build version the deployed zip MUST contain.  Bump alongside
 # loader.c's GDS_BUILD_VERSION so the deploy refuses stale/cached zips.
-GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.66.0-ref}"
+GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.66.1-ref}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 ZIP="$HERE/gamedevstory.zip"
@@ -132,6 +132,11 @@ echo "✓ uploaded"
 echo "Installing and running..."
 "${SSHBASE[@]}" "$HOST" "
   set -e
+  # kill any stale loader2 FIRST: a leftover loader holds the DRM master and
+  # makes SDL_CreateWindow fail for the fresh run (seen on-device: stale
+  # NullGL loader still printing frames during the next test)
+  pkill -9 -x loader2 2>/dev/null || true
+  sleep 1
   rm -rf '$PORTS_DIR/gamedevstory'
   cd '$PORTS_DIR'
   unzip -o gamedevstory.zip >/dev/null 2>&1
