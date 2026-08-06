@@ -1000,6 +1000,19 @@ void *gds_opensles_sym(const char *name) {
             fprintf(stderr, "[SL] GDS_AUDIO=0 -- OpenSL shim disabled\n");
     }
     if (!enabled) return NULL;
+    /* device-visible proof of which SL entry points libunity reaches for
+     * (0.79 logged ZERO of these -> FMOD died before engine creation; after
+     * the AudioManager fix in jni.c these must appear). */
+    {
+        static char seen[256];
+        char tag[40];
+        snprintf(tag, sizeof tag, "|%s|", name ? name : "?");
+        if (!strstr(seen, tag) &&
+            strlen(seen) + strlen(tag) < sizeof seen - 1) {
+            strcat(seen, tag);
+            fprintf(stderr, "[SL] dlsym %s\n", name ? name : "(null)");
+        }
+    }
     if (!strcmp(name, "slCreateEngine")) return (void *)slCreateEngine_impl;
     if (!strcmp(name, "SL_IID_ENGINE")) return (void *)&v_IID_ENGINE;
     if (!strcmp(name, "SL_IID_PLAY")) return (void *)&v_IID_PLAY;

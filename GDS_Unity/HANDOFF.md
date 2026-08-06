@@ -2014,3 +2014,50 @@ Three chapters of the port land together (OSK is the next ship):
   volume + fade-in/underrun fade-out + soft-clip.  GDS_AUDIO=0 disables
   (back to 0.78 silence).  Watch device log for: "[SL] slCreateEngine",
   "[SL] CreateAudioPlayer", "[SL] SDL audio open:", "[SL] bq_Enqueue".
+
+## 0.80.0-gamepad (post-0.79 device verdict: input/landscape/sound all dead)
+
+Device ran 0.79 to TitleForm frame 600 with ZERO cursor feed and zero hook
+evidence.  Root causes found by metadata/disasm, all fixed in this build:
+
+- INPUT HOOKS NEVER INSTALLED in 0.79: UnityEngine.Input lives in
+  **UnityEngine.InputLegacyModule.dll** (asm #20), not CoreModule -- the 0.79
+  il_find_class("CoreModule","UnityEngine","Input") returned NULL and
+  try_install_hooks bailed SILENTLY on a retry-forever path (log: "installing
+  input hooks" and then nothing).  verifiable offline in global-metadata
+  (image_def typeStart/typeCount).  input.c now scans ALL images for
+  (ns,name) and logs which image matched.
+- WRONG ICALL ARITIES (2022.3): GetTouch_Injected takes 2 args (index,
+  out Touch), get_mousePosition_Injected/get_mouseScrollDelta_Injected take
+  1 (out vec), get_anyKeyDown and GetJoystickNames do not exist in this
+  build at all (stripped), GetButton*/GetAxis*/GetKeyString* icalls are the
+  InputUnsafeUtility `__Unmanaged` (utf8,len) variants (+ managed-string
+  wrappers patched too).
+- INSTALL TOO LATE: 0.79 installed at frame>2; SurfaceManager::Setup latches
+  the canvas orientation at frames 1-3.  Hooks now install on the FIRST
+  gds_input_poll, which runs before frame 0's nativeRender.
+- CURSOR default OFF (GDS_CURSOR=1 re-enables): the pad now feeds as a real
+  pad -- Unity JoystickButton keycodes 350-363, raw Android keycodes 19-22 +
+  96-109, arrows/Escape/Return; GetAxis answered by NAME for the Canvas
+  contract (dpad1_horizontal/vertical, axis12/13, Horizontal/Vertical,
+  trigger names), unknown axis/button/string-key names logged on first
+  sight for tightening.  First-hit log per icall family proves hooks fire.
+- LANDSCAPE: kairo.common.cfg.Config.LANDSCAPE_GAME (static bool field #38)
+  set to TRUE at hook-install via il2cpp_field walk +
+  il2cpp_field_static_set_value (il2cpp_field_from_name is NOT exported by
+  this runtime).  The IsSide oracle @0x175aeb0 ORs it first; old targets
+  (GetRotateCheck/IsTablet cache/CheckNativeRotation) are dead code -- zero
+  BL callers (xref scan).  Screen.get_orientation/set_orientation,
+  RequestOrientation, get_dpi=160, autorotateToPortrait=0 still patched.
+- SOUND: zero "[SL]" lines on device in 0.79 == FMOD died before dlopen.
+  libunity.so contains literal JNI strings "AUDIO_SERVICE"/"getSystemService"/
+  "android.media.property.OUTPUT_SAMPLE_RATE"/"OUTPUT_FRAMES_PER_BUFFER" --
+  jni.c now serves Context.AUDIO_SERVICE ("audio") + getSystemService("audio")
+  (fake android/media/AudioManager) + AudioManager.getProperty -> "44100"/
+  "256", each with an unconditional first-hit [audio] log so the device log
+  proves the path.  opensles_audio.c gds_opensles_sym now logs each unique
+  SL symbol dlsym'd ("[SL] dlsym ...").
+
+Watch the 0.80 device log for: "input hooks installed (N/N)",
+"Config.LANDSCAPE_GAME (KairoLibrary.dll): 0 -> 1", "first-hit: Input.*",
+"axis query:", "[audio] getSystemService", "[SL] dlsym slCreateEngine".

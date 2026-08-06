@@ -2738,6 +2738,37 @@ static int64_t j_Display_getMetrics(jctx *c)
     return 0;
 }
 
+/* android/media/AudioManager chain -- libunity's FMOD OpenSL output queries
+ * the platform's preferred output rate/chunk BEFORE creating the OpenSL
+ * engine.  The literal JNI names are in libunity.so: "AUDIO_SERVICE",
+ * "getSystemService", "android.media.property.OUTPUT_SAMPLE_RATE",
+ * "android.media.property.OUTPUT_FRAMES_PER_BUFFER",
+ * "android/media/AudioManager".  Unserved, the audio init folded in on
+ * itself before ever dlsym'ing slCreateEngine -- that is why 0.79 logged
+ * zero [SL] lines and total silence. */
+static jobj *audio_manager_object;
+static int64_t j_Context_AUDIO_SERVICE(jctx *c)
+{
+    (void)c;
+    return (int64_t)(uintptr_t)mk_string("audio");
+}
+static int64_t j_AudioManager_getProperty(jctx *c)
+{
+    jobj *key = jarg_obj(c);
+    const char *k = key && key->str ? key->str : "";
+    const char *v = strstr(k, "FRAMES_PER_BUFFER") ? "256" : "44100";
+    JT("AudioManager.getProperty(\"%s\") -> \"%s\"", k, v);
+    {
+        static int seen;
+        if (!seen) {
+            seen = 1;
+            fprintf(stderr, "[audio] AudioManager.getProperty(key) -> \"%s\" (first query \"%s\")\n",
+                    v, k);
+        }
+    }
+    return (int64_t)(uintptr_t)mk_string(v);
+}
+
 static int64_t j_Context_getSystemService(jctx *c)
 {
     jobj *name = jarg_obj(c);
@@ -2745,6 +2776,19 @@ static int64_t j_Context_getSystemService(jctx *c)
     if (strcmp(s, "window") == 0) {
         JT("getSystemService(\"window\") -> WindowManager");
         return j_Unity_getWindowManager(c);
+    }
+    if (strcmp(s, "audio") == 0) {
+        if (!audio_manager_object)
+            audio_manager_object = mk_object("android/media/AudioManager");
+        JT("getSystemService(\"audio\") -> AudioManager");
+        {
+            static int seen;
+            if (!seen) {
+                seen = 1;
+                fprintf(stderr, "[audio] getSystemService(\"audio\") -> AudioManager\n");
+            }
+        }
+        return (int64_t)(uintptr_t)audio_manager_object;
     }
     /* Every other service stays NULL, exactly as before this binding: callers
      * already handled the missing-service path. */
@@ -4623,6 +4667,12 @@ void gds_jni_init(void)
     gds_jni_bind("com/unity3d/player/UnityPlayer", "getSystemService",
                  "(Ljava/lang/String;)Ljava/lang/Object;",
                  (void *)j_Context_getSystemService);
+    /* FMOD OpenSL audio probe chain (see j_Context_getSystemService) */
+    gds_jni_bind("android/content/Context", "AUDIO_SERVICE",
+                 "Ljava/lang/String;", (void *)j_Context_AUDIO_SERVICE);
+    gds_jni_bind("android/media/AudioManager", "getProperty",
+                 "(Ljava/lang/String;)Ljava/lang/String;",
+                 (void *)j_AudioManager_getProperty);
     gds_jni_bind("kairo/android/plugin/Utility", "showDialog",
                  "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/Object;)I",
                  (void *)j_Kairo_showDialog);
