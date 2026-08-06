@@ -17,9 +17,15 @@ HOST="${GDS_R36S_HOST:-${1:-ark@10.1.1.2}}"
 PASS="${GDS_SSH_PASS:-ark}"
 PORTS_DIR="${GDS_PORTS_DIR:-/roms/ports}"
 BRANCH="${GDS_BRANCH:-arena/019fd2ed-asdf}"
-# The loader build version the deployed zip MUST contain.  Bump alongside
-# loader.c's GDS_BUILD_VERSION so the deploy refuses stale/cached zips.
-GDS_EXPECT_VER="${GDS_EXPECT_VER:-0.68.0-ref}"
+# The loader build version the deployed zip MUST contain.  This baked value is
+# ONLY a last-resort fallback: at deploy time the script re-reads the real
+# expected version from GDS_Unity/loader_ref/VERSION at the exact commit it
+# downloads from (SHA URLs are immutable, so GitHub's raw CDN can never serve
+# a stale one).  That closes the old failure mode where a cached copy of THIS
+# script validated a stale zip against a stale baked version and everything
+# looked "fine".  Set GDS_EXPECT_VER env to force a value manually.
+GDS_EXPECT_VER_BAKED="0.68.0-ref"
+GDS_EXPECT_VER_ENV="${GDS_EXPECT_VER:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
 ZIP="$HERE/gamedevstory.zip"
@@ -80,6 +86,27 @@ echo "Downloading gamedevstory.zip..."
 # a cached stale zip for a newer build.  The branch-tip URL (?ts= cache-buster) is
 # only a fallback.  This is what kept the device on an old loader2 before.
 DOWNLOAD_SHA="${GDS_SHA:-$GH_SHA}"
+
+# ---- learn the real expected loader version from the repo (not from this script) ----
+# GDS_Unity/loader_ref/VERSION is stamped by build.sh from the binary itself.
+# Fetched via the SAME commit SHA we download the zip from, so script/zip can
+# never disagree because of CDN caching of this script.
+GDS_EXPECT_VER="$GDS_EXPECT_VER_BAKED"
+if [ -n "$GDS_EXPECT_VER_ENV" ]; then
+  GDS_EXPECT_VER="$GDS_EXPECT_VER_ENV"
+  echo "  expected loader version: $GDS_EXPECT_VER (forced via env)"
+elif [ -n "$DOWNLOAD_SHA" ]; then
+  FETCHED_VER=$(curl -sL --max-time 15 "https://github.com/jackomix/asdf/raw/$DOWNLOAD_SHA/GDS_Unity/loader_ref/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+  if [ -n "$FETCHED_VER" ] && printf '%s' "$FETCHED_VER" | grep -qE "^0\.[0-9]+\.[0-9]+(-[a-z0-9]+)?$"; then
+    GDS_EXPECT_VER="$FETCHED_VER"
+    echo "  expected loader version: $GDS_EXPECT_VER (from repo @ ${DOWNLOAD_SHA:0:8})"
+  else
+    echo "  expected loader version: $GDS_EXPECT_VER (baked fallback; VERSION file not fetched)"
+  fi
+else
+  echo "  expected loader version: $GDS_EXPECT_VER (baked fallback; commit SHA unknown)"
+fi
+
 ZIP_URL=""
 if [ -n "$DOWNLOAD_SHA" ]; then
   ZIP_URL="https://github.com/jackomix/asdf/raw/$DOWNLOAD_SHA/GDS_Unity/gamedevstory.zip"
@@ -107,9 +134,9 @@ if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
   echo "  retry: zip loader2 build ${GZVER:-unknown}"
   if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
     echo "!! Still got '${GZVER:-none}' (expected $GDS_EXPECT_VER). Aborting."
-    echo "   The repo may not have the latest zip pushed yet, or GitHub is caching hard."
-    echo "   If THIS script itself is stale (its EXPECT_VER is old), re-fetch it with a cache-buster:"
-    echo "     curl -sL \"https://github.com/jackomix/asdf/raw/$BRANCH/GDS_Unity/tools/gds_deploy.sh?ts=\$(date +%s)\" -o gds_deploy.sh && chmod +x gds_deploy.sh"
+    echo "   The expected version was read from the repo itself (loader_ref/VERSION),"
+    echo "   so this means the zip at that commit is genuinely wrong or not pushed yet."
+    echo "   Check that build.sh ran (it stamps VERSION) and the zip was committed together."
     exit 1
   fi
 fi
