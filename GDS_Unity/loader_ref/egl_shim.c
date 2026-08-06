@@ -226,10 +226,20 @@ static void *(*r_eglGetCurrentSurface)(int);
 static void *(*r_eglCreatePbufferSurface)(void *, void *, const int *);
 static unsigned (*r_eglMakeCurrent)(void *, void *, void *, void *);
 static void *(*r_eglCreateContext)(void *, void *, void *, const int *);
+static unsigned (*r_eglSwapBuffers)(void *, void *);
+static unsigned (*r_eglDestroyContext)(void *, void *);
+static unsigned (*r_eglDestroySurface)(void *, void *);
+static int (*r_eglGetError)(void);
+static unsigned (*r_eglQuerySurface)(void *, void *, int, int *);
+static const char *(*r_eglQueryString)(void *, int);
+static unsigned (*r_eglSwapInterval)(void *, int);
 static void *g_real_dpy = NULL;    /* SDL's real EGLDisplay */
 static void *g_real_cfg = NULL;    /* real EGLConfig meeting Unity's RGBA8888 contract */
 static void *g_win_surf = NULL;    /* real EGLSurface of SDL's window */
 static void *g_pbuf = NULL;        /* real 16x16 pbuffer for Unity worker contexts */
+static int g_best_es_major = 0;    /* highest ES version the RAW driver actually hands out */
+static int g_raw_egl_active = 0;   /* a RAW context was handed to Unity */
+static void *g_raw_glGetString = 0;
 static void *g_real_egl_hdl = NULL;
 static int g_nullgl;   /* tentative; the NullGL section below owns the init */
 
@@ -256,6 +266,13 @@ static void gds_capture_real_egl(void) {
   CAP(r_eglCreatePbufferSurface, "eglCreatePbufferSurface");
   CAP(r_eglMakeCurrent, "eglMakeCurrent");
   CAP(r_eglCreateContext, "eglCreateContext");
+  CAP(r_eglSwapBuffers, "eglSwapBuffers");
+  CAP(r_eglDestroyContext, "eglDestroyContext");
+  CAP(r_eglDestroySurface, "eglDestroySurface");
+  CAP(r_eglGetError, "eglGetError");
+  CAP(r_eglQuerySurface, "eglQuerySurface");
+  CAP(r_eglQueryString, "eglQueryString");
+  CAP(r_eglSwapInterval, "eglSwapInterval");
 #undef CAP
   if (r_eglGetCurrentDisplay) g_real_dpy = r_eglGetCurrentDisplay();
   if (r_eglGetCurrentSurface) g_win_surf = r_eglGetCurrentSurface(0x3059 /*EGL_DRAW*/);
@@ -332,6 +349,53 @@ static void gds_capture_real_egl(void) {
     g_pbuf = r_eglCreatePbufferSurface(g_real_dpy, g_real_cfg, pb);
     fprintf(stderr, "[egl] real worker pbuffer = %p\n", g_pbuf);
   }
+
+  /* 0.70 RAW context-version probe.  Device evidence: every SDL-created
+   * context on this Mali blob reports GL_VERSION "OpenGL ES-CM 1.1" even
+   * when SDL asked for ES3/ES2 (EGL defaults EGL_CONTEXT_CLIENT_VERSION to
+   * 1 when the attrib doesn't land).  Unity 2022 on a 1.1 context: broken
+   * texture-unit state -> "Invalid texture unit!" -> wild-index SIGSEGV.
+   * Create contexts through the REAL driver entry points with the attrib
+   * verbatim and see what we really get. */
+  if (r_eglCreateContext && r_eglMakeCurrent && g_pbuf) {
+    const unsigned char *(*ggs)(unsigned) = NULL;
+    const char *gld = getenv("SDL_VIDEO_GL_DRIVER");
+    const char *glnames[] = { (gld && *gld) ? gld : "libGLESv2.so",
+                              "libGLESv2.so.2", "libGLESv2.so", 0 };
+    void *glh = NULL;
+    for (int i = 0; glnames[i] && !glh; i++) {
+      glh = dlopen(glnames[i], RTLD_NOW | RTLD_NOLOAD);
+      if (!glh) glh = dlopen(glnames[i], RTLD_NOW | RTLD_LOCAL);
+    }
+    if (glh) ggs = (const unsigned char *(*)(unsigned))dlsym(glh, "glGetString");
+    g_raw_glGetString = (void *)ggs;
+    fprintf(stderr, "[egl] raw glGetString=%p (GL lib=%s)\n",
+            (void *)ggs, gld ? gld : "(default)");
+    for (int want = 3; want >= 1 && !g_best_es_major; want--) {
+      int ca[] = { 0x3098 /*EGL_CONTEXT_CLIENT_VERSION*/, want, 0x3038 };
+      void *pc = r_eglCreateContext(g_real_dpy, g_real_cfg, 0, ca);
+      int err = r_eglGetError ? r_eglGetError() : 0;
+      fprintf(stderr, "[egl] RAW probe ctx es%d -> %p (err=0x%x)\n", want, pc, err);
+      if (!pc) continue;
+      if (r_eglMakeCurrent(g_real_dpy, g_pbuf, g_pbuf, pc)) {
+        const char *v = ggs ? (const char *)ggs(0x1F02) : NULL;
+        fprintf(stderr, "[egl] RAW probe GL_VERSION='%s'\n", v ? v : "(no glGetString)");
+        if (v && strstr(v, "ES 3")) g_best_es_major = 3;
+        else if (v && strstr(v, "ES 2")) g_best_es_major = 2;
+        else if (v && strstr(v, "ES-CM")) g_best_es_major = 0; /* 1.1: keep probing */
+        else if (v) g_best_es_major = want;
+        r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
+      }
+      if (r_eglDestroyContext) r_eglDestroyContext(g_real_dpy, pc);
+    }
+    if (!g_best_es_major)
+      fprintf(stderr, "[egl] WARNING: raw driver only hands out ES1.1 contexts\n");
+    else
+      fprintf(stderr, "[egl] raw driver max: ES%d\n", g_best_es_major);
+    /* restore what SDL believes it owns: share root current on its window */
+    if (egl_window && egl_share_root && S.GL_MakeCurrent)
+      S.GL_MakeCurrent(egl_window, egl_share_root);
+  }
 }
 
 /* 0.61: always-on call trace (stderr; swap/getproc are hot -> capped). */
@@ -358,6 +422,8 @@ static void egl_show_counts(const char *why) {
 
 typedef struct {
   SDL_GLContext sdl_context;
+  void *real_ctx;            /* RAW Mali EGLContext (0.70 real-object model) */
+  int is_real;               /* context lives on the real driver, not SDL */
   EGLSurface current_draw;   /* exact handles handed to eglMakeCurrent */
   EGLSurface current_read;
   int is_pbuffer;
@@ -767,9 +833,21 @@ int egl_shim_ensure_current(void) {
   if (!egl_window || !egl_share_root) return 0;
   if (has_real_gl) return 1;
   _egl_context *ctx = current_context ? current_context : last_context;
+  if (ctx && ctx->is_real && r_eglMakeCurrent) {
+    void *rs = (ctx->current_draw && ((char *)ctx->current_draw)[0] == 'w')
+                   ? g_win_surf : g_pbuf;
+    if (r_eglMakeCurrent(g_real_dpy, rs, rs, ctx->real_ctx)) {
+      has_real_gl = 1; current_context = ctx; return 1;
+    }
+  }
   if (ctx && ctx->sdl_context && S.GL_MakeCurrent(egl_window, ctx->sdl_context) == 0) {
     has_real_gl = 1; current_context = ctx; return 1;
   }
+  /* 0.70: with raw EGL captured, DON'T pre-bind the SDL share root to the
+   * window surface -- Unity's raw contexts own g_win_surf now, possibly from
+   * a render thread; an SDL binding here would make the first raw
+   * eglMakeCurrent fail EGL_BAD_ACCESS (surfaces are thread-affined). */
+  if (g_real_dpy && r_eglMakeCurrent) return 1;
   if (S.GL_MakeCurrent(egl_window, egl_share_root) == 0) { has_real_gl = 1; return 1; }
   return 0;
 }
@@ -855,6 +933,41 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
   (void)dpy; (void)config; (void)share_context; (void)attrib_list;
   _egl_context *c = (_egl_context *)calloc(1, sizeof(_egl_context));
   if (!c) return EGL_NO_CONTEXT;
+  /* 0.70 real-object model (Horizon): Unity faces REAL EGL objects.  SDL
+   * context creation on this Mali blob drops EGL_CONTEXT_CLIENT_VERSION and
+   * hands back ES1.1 ("OpenGL ES-CM 1.1") no matter what was requested;
+   * RAW r_eglCreateContext honors the attrib (proven by the capture probe).
+   * Unity on ES1.1 => broken texture-unit state => wild-index SIGSEGV. */
+  if (r_eglCreateContext && r_eglMakeCurrent && g_real_dpy && g_real_cfg) {
+    int want = -1;
+    if (attrib_list)
+      for (int i = 0; attrib_list[i] != 0x3038 && i < 32; i += 2)
+        if (attrib_list[i] == 0x3098) want = attrib_list[i + 1];
+    if (want < 1) want = g_best_es_major >= 2 ? g_best_es_major : 2;
+    if (g_best_es_major >= 2 && want > g_best_es_major) want = g_best_es_major;
+    void *shr = 0;
+    if (share_context && ((_egl_context *)share_context)->real_ctx)
+      shr = ((_egl_context *)share_context)->real_ctx;
+    int tries[3] = { want, 2, g_best_es_major >= 2 ? g_best_es_major : 2 };
+    void *rc = 0;
+    for (int a = 0; a < 3 && !rc; a++) {
+      if (a > 0 && tries[a] == tries[a - 1]) continue;
+      if (a > 0 && tries[a] < 2) break;
+      int ca[] = { 0x3098, tries[a], 0x3038 };
+      rc = r_eglCreateContext(g_real_dpy, g_real_cfg, shr, ca);
+      int err = r_eglGetError ? r_eglGetError() : 0;
+      printf("[egl] r_eglCreateContext es%d share=%p -> %p (err=0x%x tid=%lx)\n",
+             tries[a], shr, rc, err, (unsigned long)pthread_self());
+    }
+    if (rc) {
+      c->real_ctx = rc; c->is_real = 1; c->id = next_context_id++;
+      g_raw_egl_active = 1;
+      g_n_eglCreateContext++;
+      printf("[egl] eglCreateContext -> %p [ctx_id=%d, raw]\n", (void *)c, c->id);
+      return (EGLContext)c;
+    }
+    printf("[egl] raw context creation failed, falling back to SDL path\n");
+  }
   if (!egl_window || !S.GL_CreateContext) {
     if (g_nullgl) {
       c->sdl_context = NULL;
@@ -925,7 +1038,10 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
     /* Horizon UNBIND: clears current only; last_context survives so
      * egl_shim_ensure_current can rebind the same context. */
     current_context = NULL; has_real_gl = 0;
-    if (egl_window && S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, NULL);
+    if (g_raw_egl_active && r_eglMakeCurrent)
+      r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
+    else if (egl_window && S.GL_MakeCurrent)
+      S.GL_MakeCurrent(egl_window, NULL);
     return EGL_TRUE;
   }
   /* 0.68 (Horizon surface identity): Android EGL returns the exact surface
@@ -938,6 +1054,30 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
   current_context = context;
   last_context = context;
   if (g_nullgl) return EGL_TRUE;
+  /* 0.70 real-object bind: map our window/pbuffer tokens to the REAL
+   * surfaces captured from SDL's EGL (Horizon surface identity). */
+  if (context->is_real) {
+    void *rsurf = ((char *)draw)[0] == 'w' ? g_win_surf : g_pbuf;
+    if (r_eglMakeCurrent(g_real_dpy, rsurf, rsurf, context->real_ctx)) {
+      has_real_gl = 1;
+      static int rvn = 0;
+      const unsigned char *(*g)(unsigned) =
+          (const unsigned char *(*)(unsigned))g_raw_glGetString;
+      if (rvn < 6 && g) {
+        const unsigned char *s = g(0x1F02);
+        printf("[egl] raw ctx id=%d bound, GL_VERSION='%s'\n",
+               context->id, s ? (const char *)s : "(null)");
+        rvn++;
+      }
+    } else {
+      int err = r_eglGetError ? r_eglGetError() : 0;
+      has_real_gl = 0;
+      printf("[egl] r_eglMakeCurrent FAILED err=0x%x draw=%p tid=%lx\n",
+             err, (void *)draw, (unsigned long)pthread_self());
+    }
+    if (g_n_eglMakeCurrent <= 4) egl_show_counts("MakeCurrent");
+    return EGL_TRUE;
+  }
   if (!egl_window || !S.GL_MakeCurrent) return EGL_TRUE;
   if (S.GL_MakeCurrent(egl_window, context->sdl_context) == 0) {
     has_real_gl = 1;
@@ -966,6 +1106,20 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
   g_n_eglSwapBuffers++;
   static int swn = 0;
+  /* 0.70: real context presents through the REAL swap on SDL's window
+   * surface (the actual KMSDRM front-buffer owner). */
+  if (current_context && current_context->is_real && r_eglSwapBuffers) {
+    if (!current_context->is_pbuffer && g_win_surf) {
+      unsigned ok = r_eglSwapBuffers(g_real_dpy, g_win_surf);
+      if (g_n_eglSwapBuffers <= 3)
+        printf("[egl] SwapBuffers(real, raw) ok=%u\n", ok);
+      else if (!ok && ++swn <= 8) {
+        int e = r_eglGetError ? r_eglGetError() : 0;
+        printf("[egl] raw swap err=0x%x\n", e);
+      }
+    }
+    return EGL_TRUE;
+  }
   /* Horizon: only the window-bound context presents; worker (pbuffer) swaps
    * are silent no-ops so uploads don't fight the front buffer. */
   if (has_real_gl && egl_window && S.GL_SwapWindow &&
@@ -997,14 +1151,27 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
 EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
   (void)dpy;
   _egl_context *context = (_egl_context *)ctx;
-  if (context) { if (context->sdl_context && S.GL_DeleteContext) S.GL_DeleteContext(context->sdl_context); free(context); }
+  if (context) {
+    if (context->is_real && r_eglDestroyContext)
+      r_eglDestroyContext(g_real_dpy, context->real_ctx);
+    else if (context->sdl_context && S.GL_DeleteContext)
+      S.GL_DeleteContext(context->sdl_context);
+    free(context);
+  }
   return EGL_TRUE;
 }
 
 EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint *value) {
   { char b[96]; snprintf(b,sizeof b,"eglQuerySurface attr=0x%x",(int)attribute); TR(b); }
-  (void)dpy; (void)surface;
+  (void)dpy;
   if (!value) return EGL_TRUE;
+  /* 0.70: ask the real driver about the real surfaces behind our tokens. */
+  if (r_eglQuerySurface && g_real_dpy && surface) {
+    void *rs = ((char *)surface)[0] == 'w' ? g_win_surf : g_pbuf;
+    if (rs && r_eglQuerySurface(g_real_dpy, rs, attribute, value))
+      return EGL_TRUE;
+  }
+  (void)surface;
   if (attribute == 0x3057) *value = g_screen_w;      /* EGL_WIDTH */
   else if (attribute == 0x3056) *value = g_screen_h; /* EGL_HEIGHT */
   else *value = 0;
@@ -1057,7 +1224,10 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
   return EGL_TRUE;
 }
 
-EGLint eglGetError(void) { return EGL_SUCCESS; }
+EGLint eglGetError(void) {
+  if (r_eglGetError && g_real_dpy) return r_eglGetError();
+  return EGL_SUCCESS;
+}
 
 void *eglGetProcAddress(const char *procname) {
   void *ptr = S.GL_GetProcAddress ? S.GL_GetProcAddress(procname) : NULL;
@@ -1080,6 +1250,13 @@ EGLBoolean eglBindAPI(unsigned api) { { char b[64]; snprintf(b,sizeof b,"eglBind
 const char *eglQueryString(EGLDisplay dpy, EGLint name) {
   { char b[96]; snprintf(b,sizeof b,"eglQueryString(0x%x)",(int)name); TR(b); }
   (void)dpy;
+  /* 0.70: real display extension list -- Unity reads this to decide on
+   * Swappy (EGL_ANDROID_get_frame_timestamps); a fake empty list can send
+   * it down a broken present path. */
+  if (r_eglQueryString && g_real_dpy) {
+    const char *s = r_eglQueryString(g_real_dpy, name);
+    if (s) return s;
+  }
   switch (name) {
   case 0x3053: return "GDS";             /* EGL_VENDOR */
   case 0x3054: return "1.4 GDS";         /* EGL_VERSION */
@@ -1091,7 +1268,11 @@ const char *eglQueryString(EGLDisplay dpy, EGLint name) {
 
 EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
   { char b[64]; snprintf(b,sizeof b,"eglSwapInterval(%d)",(int)interval); TR(b); }
-  (void)dpy; if (S.GL_SetSwapInterval) S.GL_SetSwapInterval(interval); return EGL_TRUE;
+  (void)dpy;
+  if (g_raw_egl_active && r_eglSwapInterval)
+    return r_eglSwapInterval(g_real_dpy, interval) ? EGL_TRUE : EGL_FALSE;
+  if (S.GL_SetSwapInterval) S.GL_SetSwapInterval(interval);
+  return EGL_TRUE;
 }
 
 EGLContext eglGetCurrentContext(void) { return (EGLContext)current_context; }
