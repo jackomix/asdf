@@ -65,6 +65,17 @@ export TER_GAMEDIR="$GAMEDIR"
 export SDL_VIDEO_EGL_DRIVER="${SDL_VIDEO_EGL_DRIVER:-libEGL.so}"
 export SDL_VIDEO_GL_DRIVER="${SDL_VIDEO_GL_DRIVER:-libGLESv2.so}"
 
+# --- Experiment cycler (debug): runs 4 display theories back-to-back with
+# --- color tags when $GAMEDIR/gds_cycle.enable exists. ---
+if [ -f "$GAMEDIR/gds_cycle.enable" ] && [ -f "$GAMEDIR/gds_cycle.sh" ]; then
+  chmod +x "$GAMEDIR/gds_cycle.sh" 2>/dev/null
+  echo "=== experiment cycler ENABLED (gds_cycle.enable present) ===" >> "$LOG"
+  cd "$GAMEDIR" && bash ./gds_cycle.sh >> "$LOG" 2>&1
+  echo "=== cycler finished ===" >> "$LOG"
+  printf "\033c" >> /dev/tty1 2>/dev/null
+  exit 0
+fi
+
 # --- Run the game.  loader2 self-logs to loader.log next to itself. ---
 cd "$GAMEDIR" || { echo "cannot cd $GAMEDIR" >> "$LOG"; exit 1; }
 

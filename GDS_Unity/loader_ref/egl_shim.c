@@ -302,6 +302,66 @@ static int rtflash_on(void) {
   return f;
 }
 
+/* 0.76: one solid-color TAG flash at boot, named by GDS_TAGCOLOR.  The
+ * experiment cycler uses this as the per-experiment screen identifier:
+ * uses ONLY the proven-visible path (share-root ctx + SDL_GL_SwapWindow).
+ * Includes a black warm-up swap (0.72's missing-cyan lesson) and, because
+ * share-root window swaps are exactly what invalidated our captured surface
+ * in 0.72, RE-CAPTURES the window surface afterwards so Unity's first raw
+ * bind can't hit the stale handle (belt to the 0.73 heal's suspenders). */
+static void maybe_tag_flash(void) {
+  const char *name = getenv("GDS_TAGCOLOR");
+  if (!name || !*name || g_nullgl) return;
+  if (!egl_window || !egl_share_root || !S.GL_MakeCurrent || !S.GL_SwapWindow ||
+      !g_raw_glClearColor || !g_raw_glClear) return;
+  float r = 1.0f, g = 1.0f, b = 1.0f;
+  char nm[16];
+  int i;
+  for (i = 0; i < 15 && name[i]; i++) {
+    nm[i] = name[i];
+    if (nm[i] >= 'a' && nm[i] <= 'z') nm[i] = (char)(nm[i] - 32);
+  }
+  nm[i] = 0;
+  if      (!strcmp(nm, "RED"))     { r=1.0f; g=0.0f; b=0.0f; }
+  else if (!strcmp(nm, "GREEN"))   { r=0.0f; g=1.0f; b=0.0f; }
+  else if (!strcmp(nm, "BLUE"))    { r=0.0f; g=0.0f; b=1.0f; }
+  else if (!strcmp(nm, "YELLOW"))  { r=1.0f; g=1.0f; b=0.0f; }
+  else if (!strcmp(nm, "CYAN"))    { r=0.0f; g=1.0f; b=1.0f; }
+  else if (!strcmp(nm, "MAGENTA")) { r=1.0f; g=0.0f; b=1.0f; }
+  else if (!strcmp(nm, "BLACK"))   { r=0.0f; g=0.0f; b=0.0f; }
+  printf("[egl] TAG FLASH %s (%.0f %.0f %.0f)\n", nm, r * 255, g * 255, b * 255);
+  S.GL_MakeCurrent(egl_window, NULL);
+  if (S.GL_MakeCurrent(egl_window, egl_share_root) != 0) {
+    printf("[egl] TAG FLASH: share-root bind failed: %s\n",
+           S.GetError ? S.GetError() : "?");
+    return;
+  }
+  struct timespec ts;
+  g_raw_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+  g_raw_glClear(0x4000 /*GL_COLOR_BUFFER_BIT*/);
+  S.GL_SwapWindow(egl_window);
+  ts.tv_sec = 0; ts.tv_nsec = 120000000; nanosleep(&ts, NULL);
+  g_raw_glClearColor(r, g, b, 1.0f);
+  g_raw_glClear(0x4000);
+  S.GL_SwapWindow(egl_window);
+  ts.tv_sec = 0; ts.tv_nsec = 700000000; nanosleep(&ts, NULL);
+  S.GL_SwapWindow(egl_window);
+  ts.tv_sec = 0; ts.tv_nsec = 400000000; nanosleep(&ts, NULL);
+  /* capture SDL's window surface afresh: if the swaps rotated/invalidated
+   * the handle, Unity must never see the stale one (0.72's crash). */
+  if (r_eglGetCurrentSurface) {
+    void *fresh = r_eglGetCurrentSurface(0x3059 /*EGL_DRAW*/);
+    if (fresh && fresh != g_win_surf) {
+      printf("[egl] window surface re-captured after tag flash: %p -> %p\n",
+             g_win_surf, fresh);
+      g_win_surf = fresh;
+    } else {
+      printf("[egl] window surface still %p after tag flash\n", g_win_surf);
+    }
+  }
+  S.GL_MakeCurrent(egl_window, NULL);
+}
+
 static void gds_capture_real_egl(void) {
   if (g_nullgl) return;
   const char *drv = getenv("SDL_VIDEO_EGL_DRIVER");
@@ -1027,6 +1087,7 @@ void egl_shim_create_window(void) {
   printf("[egl] theories: ctxmodel=%s present=%s rtflash=%d (via gds_env.cfg)\n",
          ctx_model_sdl() ? "SDL(Horizon-KMS)" : "raw",
          present_raw() ? "raw" : "sdl", rtflash_on());
+  maybe_tag_flash();
   printf("[egl] window %dx%d context ready (ES%d)\n", g_screen_w, g_screen_h, g_es_major);
 
   /* release from the bootstrap thread; the game binds when it makes current */
