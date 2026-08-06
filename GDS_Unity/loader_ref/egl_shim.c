@@ -283,21 +283,71 @@ static int ctx_model_sdl(void) {
   }
   return m;
 }
-static int present_raw(void) {
+static int present_mode(void) {
   static int p = -1;
   if (p < 0) {
     const char *e = getenv("GDS_PRESENT");
-    p = (e && strcmp(e, "raw") == 0) ? 1 : 0;
+    p = e && strcmp(e, "raw") == 0 ? 1 : e && strcmp(e, "shrswap") == 0 ? 2 : 0;
   }
   return p;
 }
+static const char *present_mode_name(void) {
+  switch (present_mode()) { case 1: return "raw"; case 2: return "shrswap"; }
+  return "sdl";
+}
+static int clampgl_on(void) {
+  static int c = -1;
+  if (c < 0) {
+    const char *e = getenv("GDS_CLAMPGL");
+    c = (e && atoi(e) > 0) ? 1 : 0;
+  }
+  return c;
+}
+
+/* 0.77 GDS_CLAMPGL=1: floor texture-unit/size limits for the ES-CM 1.1 SDL
+ * contexts (Horizon model experiment).  0.69 + 0.76 device evidence: Unity
+ * 2022.3.62f2 sizes its per-texture-unit state from driver answers, then
+ * wild-indexes it on a 1.1 context ("Invalid texture unit!" + SIGSEGV).
+ * Horizon's own gl router compensates the same way; floor-only clamps here:
+ * the driver's answer wins whenever it's larger. */
+static void (*g_real_glGetIntegerv)(unsigned, int *);
+static void gds_clamp_glGetIntegerv(unsigned pname, int *p) {
+  if (g_real_glGetIntegerv) g_real_glGetIntegerv(pname, p);
+  if (!p) return;
+  static const struct { unsigned p; int floor; } floors[] = {
+    { 0x8872, 16 },  /* GL_MAX_TEXTURE_IMAGE_UNITS */
+    { 0x8B4D, 16 },  /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */
+    { 0x8B4C, 16 },  /* GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS */
+    { 0x8DFB, 16 },  /* GL_MAX_FRAGMENT_* general cap? conservative */
+    { 0x0D33, 8192 },/* GL_MAX_TEXTURE_SIZE */
+    { 0x851C, 8192 },/* GL_MAX_CUBE_MAP_TEXTURE_SIZE */
+    { 0x84E8, 8192 },/* GL_MAX_RENDERBUFFER_SIZE */
+    { 0x84FF, 16 },  /* GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT */
+  };
+  for (size_t i = 0; i < sizeof floors / sizeof floors[0]; i++) {
+    if (floors[i].p == pname && p[0] < floors[i].floor) {
+      static int logged = 0;
+      if (logged < 12) {
+        logged++;
+        printf("[egl] CLAMPGL: pname 0x%x %d -> %d\n",
+               pname, p[0], floors[i].floor);
+      }
+      p[0] = floors[i].floor;
+      return;
+    }
+  }
+}
+
 static int rtflash_on(void) {
   static int f = -1;
   if (f < 0) {
     const char *e = getenv("GDS_RTFLASH");
     f = (e && atoi(e) > 0) ? 1 : 0;
     if (f)
-      fprintf(stderr, "[egl] GDS_RTFLASH=1: mid-game flash probes at frames 60/120/180\n");
+      fprintf(stderr,
+              "[egl] GDS_RTFLASH=1: probes f60=magenta(raw+route) "
+              "f120=ORANGE(raw-draw, share-root swap only) "
+              "f180=CYAN(raw ctx bound via SDL, draw+swap)\n");
   }
   return f;
 }
@@ -1084,9 +1134,9 @@ void egl_shim_create_window(void) {
    * returning empty strings (SDL believed its share root was still bound). */
   gds_capture_real_egl();
 
-  printf("[egl] theories: ctxmodel=%s present=%s rtflash=%d (via gds_env.cfg)\n",
+  printf("[egl] theories: ctxmodel=%s present=%s rtflash=%d clampgl=%d (via gds_env.cfg)\n",
          ctx_model_sdl() ? "SDL(Horizon-KMS)" : "raw",
-         present_raw() ? "raw" : "sdl", rtflash_on());
+         present_mode_name(), rtflash_on(), clampgl_on());
   maybe_tag_flash();
   printf("[egl] window %dx%d context ready (ES%d)\n", g_screen_w, g_screen_h, g_es_major);
 
@@ -1421,40 +1471,50 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   if (current_context && current_context->is_real) {
     if (!current_context->is_pbuffer && g_win_surf) {
 
-      /* 0.75 mid-game probes (GDS_RTFLASH=1).  Frame 60: magenta through
-       * UNITY'S OWN raw context + SDL present.  Frames 120/180: yellow/cyan
-       * through the SDL share root + pixel-alias compare (same address,
-       * both contexts).  Interpreting what hits the panel tells us whether
-       * raw-ctx content ever reaches the GBM bo SDL flips. */
+      /* 0.77 mid-game probes (GDS_RTFLASH=1).  f60 MAGENTA control (raw ctx
+       * draw + route swap; 0.76 proved invisible).  f120 ORANGE compose:
+       * raw-ctx draws orange, share root swaps WITHOUT drawing -- orange
+       * visible => raw bytes are in the flipped bo and only the swap's
+       * current-ctx matters => shrswap steady fix.  f180 CYAN SDL-bind:
+       * raw ctx bound THROUGH SDL's tracked MakeCurrent, cyan draw, SDL
+       * swap -- cyan visible => SDL's bookkeeping entry is the magic. */
       static int g_frame_no = 0;
       g_frame_no++;
       if (rtflash_on() && egl_window && egl_share_root && S.GL_MakeCurrent &&
           S.GL_SwapWindow && g_raw_glReadPixels && g_raw_glClearColor &&
           g_raw_glClear && current_context->real_ctx) {
         if (g_frame_no == 60) {
-          printf("[rtf] frame 60: MAGENTA via Unity raw ctx + SDL swap\n");
+          printf("[rtf] frame 60: MAGENTA control (raw ctx + route swap)\n");
           g_raw_glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
           g_raw_glClear(0x4000);
         } else if (g_frame_no == 120 || g_frame_no == 180) {
-          int yel = g_frame_no == 120;
-          unsigned char pa[4] = { 0, 0, 0, 0 }, pb[4] = { 0, 0, 0, 0 };
-          g_raw_glReadPixels(320, 240, 1, 1, 0x1908, 0x1401, pa);
+          int compose = g_frame_no == 120;
+          unsigned char pa[4] = { 0 }, pb[4] = { 0 };
+          if (compose) {
+            g_raw_glClearColor(1.0f, 0.5f, 0.0f, 1.0f);   /* ORANGE */
+          } else {
+            g_raw_glClearColor(0.0f, 1.0f, 1.0f, 1.0f);   /* CYAN */
+          }
+          g_raw_glClear(0x4000);
+          if (compose) g_raw_glReadPixels(320, 240, 1, 1, 0x1908, 0x1401, pa);
           r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
-          int dto = 0;
-          if (S.GL_MakeCurrent(egl_window, egl_share_root) == 0) {
-            g_raw_glReadPixels(320, 240, 1, 1, 0x1908, 0x1401, pb);
-            g_raw_glClearColor(yel ? 1.0f : 0.0f, yel ? 1.0f : 0.0f,
-                               1.0f, 1.0f);
-            g_raw_glClear(0x4000);
+          int sw = 0;
+          void *bind_ctx = compose ? (void *)egl_share_root
+                                   : (void *)current_context->real_ctx;
+          if (S.GL_MakeCurrent(egl_window, bind_ctx) == 0) {
+            if (compose)
+              g_raw_glReadPixels(320, 240, 1, 1, 0x1908, 0x1401, pb);
             S.GL_SwapWindow(egl_window);
             S.GL_MakeCurrent(egl_window, NULL);
-            dto = 1;
+            sw = 1;
           }
-          printf("[rtf] frame %d %s: raw-ctx px=%02x%02x%02x%02x "
-                 "share-root px=%02x%02x%02x%02x (same:%s sdlswap:%d)\n",
-                 g_frame_no, yel ? "YELLOW" : "CYAN",
-                 pa[0], pa[1], pa[2], pa[3], pb[0], pb[1], pb[2], pb[3],
-                 memcmp(pa, pb, 4) == 0 ? "YES" : "NO", dto);
+          if (compose)
+            printf("[rtf] f120 COMPOSE ORANGE: rawread=%02x%02x%02x%02x "
+                   "shrread=%02x%02x%02x%02x same:%s swap:%d\n",
+                   pa[0], pa[1], pa[2], pa[3], pb[0], pb[1], pb[2], pb[3],
+                   memcmp(pa, pb, 4) == 0 ? "YES" : "NO", sw);
+          else
+            printf("[rtf] f180 SDL-BIND CYAN: sdlbind+swap:%d\n", sw);
           unsigned rb = r_eglMakeCurrent(g_real_dpy, g_win_surf, g_win_surf,
                                          current_context->real_ctx);
           if (!rb)
@@ -1477,10 +1537,30 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                preswap_n, px[0], px[1], px[2], px[3], ge0, ge1);
       }
       preswap_n++;
-      if (!present_raw() && egl_window && S.GL_SwapWindow) {
+      if (present_mode() == 0 && egl_window && S.GL_SwapWindow) {
         S.GL_SwapWindow(egl_window);
         if (g_n_eglSwapBuffers <= 3)
           printf("[egl] SwapBuffers(real, SDL window)\n");
+      } else if (present_mode() == 2 && egl_window && egl_share_root &&
+                 S.GL_MakeCurrent && S.GL_SwapWindow) {
+        /* 0.77 shrswap: Unity's raw-ctx frame is complete; swap the window
+         * with the SDL share root current (0.76 compose-era hypothesis:
+         * only the swap's current-ctx identity decides what the KMS flip
+         * shows).  Then re-bind Unity's ctx so the game never notices. */
+        static int shrlog = 0;
+        r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
+        if (S.GL_MakeCurrent(egl_window, egl_share_root) == 0) {
+          S.GL_SwapWindow(egl_window);
+          S.GL_MakeCurrent(egl_window, NULL);
+        }
+        if (current_context->real_ctx &&
+            !r_eglMakeCurrent(g_real_dpy, g_win_surf, g_win_surf,
+                              current_context->real_ctx) &&
+            shrlog++ < 5)
+          printf("[egl] shrswap raw rebind failed err=0x%x\n",
+                 r_eglGetError ? r_eglGetError() : 0);
+        if (g_n_eglSwapBuffers <= 3)
+          printf("[egl] SwapBuffers(real, shrswap)\n");
       } else if (r_eglSwapBuffers) {
         unsigned ok = r_eglSwapBuffers(g_real_dpy, g_win_surf);
         if (g_n_eglSwapBuffers <= 3)
@@ -1603,6 +1683,12 @@ EGLint eglGetError(void) {
 }
 
 void *eglGetProcAddress(const char *procname) {
+  if (clampgl_on() && procname && strcmp(procname, "glGetIntegerv") == 0) {
+    if (!g_real_glGetIntegerv && S.GL_GetProcAddress)
+      g_real_glGetIntegerv =
+          (void (*)(unsigned, int *))S.GL_GetProcAddress("glGetIntegerv");
+    if (g_real_glGetIntegerv) return (void *)gds_clamp_glGetIntegerv;
+  }
   void *ptr = S.GL_GetProcAddress ? S.GL_GetProcAddress(procname) : NULL;
   if (ptr) return ptr;
   /* GLES may suffix extension names with OES; try the stripped name. */
