@@ -2885,11 +2885,33 @@ extern int egl_shim_screen_w(void);
 extern int egl_shim_screen_h(void);
 
 /* Defaults match the R36S panel (640x480, ~230dpi) and remain sane even if a
- * field is read before getMetrics ran. */
+ * field is read before getMetrics ran.  GDS_DPI overrides every density
+ * value at once (DisplayMetrics densityDpi + density + x/ydpi, and Unity's
+ * Screen.dpi in input.c reads the same knob) for the tab-size experiment:
+ * the game's fixed little bottom tabs on a 640x480 panel look like a
+ * density decision, and Screen.dpi=160 vs densityDpi=240 didn't agree. */
 static struct {
     int w, h, dpi;
     float density, scaled, xdpi, ydpi;
 } g_metrics = { 640, 480, 240, 1.5f, 1.5f, 240.0f, 240.0f };
+
+int gds_dpi_override(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GDS_DPI");
+        v = e ? atoi(e) : 0;
+        if (v > 0) {
+            g_metrics.dpi = v;
+            g_metrics.density = g_metrics.scaled = v / 160.0f;
+            g_metrics.xdpi = g_metrics.ydpi = (float)v;
+            fprintf(stderr, "[jni] GDS_DPI=%d -> density=%.2f (tabs/UI scale test)\n",
+                    v, g_metrics.density);
+            fflush(stderr);
+        }
+    }
+    return v;
+}
 
 static int64_t j_Unity_getWindowManager(jctx *c)
 {
@@ -2913,6 +2935,7 @@ static int64_t j_Display_getMetrics(jctx *c)
     int w = egl_shim_screen_w(), h = egl_shim_screen_h();
     if (w > 0) g_metrics.w = w;
     if (h > 0) g_metrics.h = h;
+    (void)gds_dpi_override();
     JT("Display.getMetrics -> %dx%d dpi=%d", g_metrics.w, g_metrics.h,
        g_metrics.dpi);
     return 0;

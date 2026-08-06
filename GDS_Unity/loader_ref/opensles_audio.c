@@ -1054,9 +1054,70 @@ void *gds_opensles_sym(const char *name) {
  * the RegisterNatives'd fmodProcess into a synthetic mix player slot, so
  * the existing SDL callback mixes FMOD's PCM like any OpenSL player. */
 #include "gds.h"
+#include "nx_elf.h"
+
+/* FMOD output-object internals (file VAs in libunity.so v2.6.9, all
+ * disasm-verified this session):
+ *   [unity_base + 0x102b2b0]  OutputAudioTrack object (set by its init
+ *                             @0xbe8248; NULL => fmodProcess returns -1)
+ *   out[+0x60]                FMOD System object
+ *   sys[+0x7c4]               output format id (jump table in readData)
+ *   sys[+0x7c8]               output sample rate
+ *   sys[+0x7d4]               output channels
+ *   sys[+0x97e0]              output mode (forces 2ch for modes {2,3,5,7,8,9}
+ *                             and 1000)
+ *   sys[+0x9788]              readFromMixer callback -- NULL means the FMOD
+ *                             core never attached a producer to this output
+ *                             (readData then writes NOTHING: the all-zeros
+ *                             stream of the 0.86.0 log)
+ *   [unity_base + 0x102b218]  byte set when the output returned 0x2b from
+ *                             its pre-read op
+ *   out[+0x260]               started flag (set by OutputAudioTrack::start
+ *                             @0xbe86c0, before it calls Java start())
+ *   out[+0x84]                pre-read op gate checked by readData
+ * We read these straight out of the C++ object: the rate/channel label on
+ * our mix player comes from FMOD's own config, not from guesses. */
+#define FMOD_OUT_GLOBAL  0x102b2b0
+#define FMOD_OUT_FLAG218 0x102b218
+
+static int g_fmod_rate, g_fmod_channels, g_fmod_blockframes;
+static unsigned long g_fmod_base;
+
+static void fmod_dump_state(const char *why)
+{
+    if (!g_fmod_base) {
+        nx_mod *m = nx_find_mod("libunity.so");
+        if (!m) return;
+        g_fmod_base = (unsigned long)m->base;
+    }
+    void *out = *(void **)(g_fmod_base + FMOD_OUT_GLOBAL);
+    unsigned char flag218 = *(unsigned char *)(g_fmod_base + FMOD_OUT_FLAG218);
+    if (!out) {
+        fprintf(stderr, "[audio] fmod state (%s): output object NULL (flag218=%u)\n",
+                why, flag218);
+        fflush(stderr);
+        return;
+    }
+    void *sys = *(void **)((char *)out + 0x60);
+    unsigned gate84 = *(unsigned *)((char *)out + 0x84);
+    unsigned started = *((unsigned char *)out + 0x260);
+    if (!sys) {
+        fprintf(stderr, "[audio] fmod state (%s): out=%p sys=NULL gate84=%u started=%u flag218=%u\n",
+                why, out, gate84, started, flag218);
+        fflush(stderr);
+        return;
+    }
+    unsigned fmt  = *(unsigned *)((char *)sys + 0x7c4);
+    unsigned rate = *(unsigned *)((char *)sys + 0x7c8);
+    unsigned ch   = *(unsigned *)((char *)sys + 0x7d4);
+    unsigned mode = *(unsigned *)((char *)sys + 0x97e0);
+    void *mixcb   = *(void **)((char *)sys + 0x9788);
+    fprintf(stderr, "[audio] fmod state (%s): out=%p sys=%p rate=%u ch=%u fmt=%u mode=%u mixcb=%p gate84=%u started=%u flag218=%u\n",
+            why, out, sys, rate, ch, fmt, mode, mixcb, gate84, started, flag218);
+    fflush(stderr);
+}
 
 static AudioPlayer *g_fmod_player;
-static int g_fmod_rate, g_fmod_channels, g_fmod_blockframes;
 
 void gds_audio_fmod_config(int rate, int channels, int blockframes)
 {
@@ -1106,18 +1167,51 @@ static void *fmod_java_thread(void *arg)
         }
         if (!g_fmod_player) {
             g_fmod_player = alloc_player();
-            /* experiment knobs for the pitch/stutter report (0.86): force
-             * the rate/channel label used when mixing FMOD's stream.
-             * GDS_FMOD_RATE=22050 / GDS_FMOD_CH=1 A/B-test the two classic
-             * octave-up causes without a redeploy. */
+            /* 0.87: read FMOD's OWN output config straight from the C++
+             * output object (disasm-verified offsets) -- this answers the
+             * 'high-pitched' report with data instead of trial knobs:
+             * rate/channels the C++ actually configured, the readFromMixer
+             * callback's presence (NULL = core never attached = the
+             * all-zero stream of 0.86.0), and the output mode. */
+            fmod_dump_state("first pump");
+            /* ALSO replicate the real Java run(): it calls fmodGetInfo
+             * (rate/channels/blockFrames/bufferFrames) before starting its
+             * track.  Values logged as evidence; the C++ mixes regardless. */
+            {
+                typedef int (*fmod_getinfo_fn)(void *env, void *self, int id);
+                fmod_getinfo_fn gi = (fmod_getinfo_fn)gds_jni_native(
+                    "org/fmod/FMODAudioDevice", "fmodGetInfo");
+                if (gi) {
+                    int v[5] = { -1, -1, -1, -1, -1 };
+                    for (int id = 0; id < 5; id++)
+                        v[id] = gi(gds_jni_env(), gds_jni_fmod_device(), id);
+                    fprintf(stderr, "[audio] fmodGetInfo: rate=%d ch=%d f2=%d f3=%d f4=%d\n",
+                            v[0], v[1], v[2], v[3], v[4]);
+                    fflush(stderr);
+                }
+            }
             unsigned knob_rate = 0, knob_ch = 0;
             const char *er = getenv("GDS_FMOD_RATE"), *ec = getenv("GDS_FMOD_CH");
             if (er) knob_rate = (unsigned)atoi(er);
             if (ec) knob_ch   = (unsigned)atoi(ec);
-            unsigned eff_rate = knob_rate ? knob_rate
-                : (g_fmod_rate > 0 ? (unsigned)g_fmod_rate : 44100);
-            unsigned eff_ch = knob_ch ? knob_ch
-                : (g_fmod_channels > 0 ? (unsigned)g_fmod_channels : 2);
+            unsigned eff_rate, eff_ch;
+            /* authoritative source order: GDS_FMOD_* knobs > FMOD object's
+             * own rate/channels > startAudioDevice args > 44100/2 */
+            unsigned obj_rate = 0, obj_ch = 0;
+            if (g_fmod_base) {
+                void *out = *(void **)(g_fmod_base + FMOD_OUT_GLOBAL);
+                void *sys = out ? *(void **)((char *)out + 0x60) : NULL;
+                if (sys) {
+                    obj_rate = *(unsigned *)((char *)sys + 0x7c8);
+                    obj_ch   = *(unsigned *)((char *)sys + 0x7d4);
+                }
+            }
+            eff_rate = knob_rate ? knob_rate
+                : (obj_rate ? obj_rate
+                : (g_fmod_rate > 0 ? (unsigned)g_fmod_rate : 44100));
+            eff_ch = knob_ch ? knob_ch
+                : (obj_ch ? obj_ch
+                : (g_fmod_channels > 0 ? (unsigned)g_fmod_channels : 2));
             if (g_fmod_player) {
                 g_fmod_player->sample_rate     = (SLuint32)eff_rate;
                 g_fmod_player->num_channels    = (SLuint32)eff_ch;
@@ -1136,8 +1230,6 @@ static void *fmod_java_thread(void *arg)
          * loop which writes `capacity` bytes regardless) and -1 only while
          * the C++ output object ([0x102b2b0]) doesn't exist yet.  0.85.0
          * treated 0 as "no data" and never wrote a byte. */
-        unsigned rate = g_fmod_rate > 0 ? (unsigned)g_fmod_rate : 44100;
-        unsigned ch = g_fmod_channels > 0 ? (unsigned)g_fmod_channels : 2;
         unsigned bufsz = (unsigned)gds_jni_fmod_buffer_size();
         if (!bufsz) bufsz = 8192;
         /* pace like AudioTrack.write(): it blocks while the track is full.
@@ -1172,13 +1264,17 @@ static void *fmod_java_thread(void *arg)
             if (g_fmod_player)
                 ring_write(g_fmod_player, pcm, bufsz);
             blocks++;
-            if (blocks <= 60 || blocks % 600 == 0) {
+            if (blocks <= 20 || blocks % 60 == 0) {
                 fprintf(stderr, "[audio] fmod block #%lu (rc=%d %uB, fill=%u, zeros=%u%%, peak=%d)\n",
                         blocks, rc, bufsz,
                         g_fmod_player ? ring_readable(g_fmod_player) : 0,
                         zpct, peak);
                 fflush(stderr);
             }
+            /* watch the mixer attach: readFromMixer callback appearing
+             * (NULL->ptr) marks when the FMOD core joined this output */
+            if (blocks == 1 || blocks % 300 == 0)
+                fmod_dump_state("pump");
             err_n = 0;
         } else {
             if (err_n < 6) {

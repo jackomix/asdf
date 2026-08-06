@@ -516,6 +516,7 @@ static void arm_traps(uintptr_t il2b)
         {0x186a8d0, "Setup.postOpen",          3},
         {0x186a8e4, "RecordStore.Setup.store", 21},
         {0xcb0ddc, "raiseAORE.stub",          19},
+        {0xcb1180, "raiseInvalidCast.stub",   19},
         /* Storage::GetFolder folder in {1,4}, Android branch: the path is
          * cut out of the base path via LastIndexOf(strA)+5..LastIndexOf(strB)
          * then Substring(start,len) -- AORE if either index is -1. */
@@ -1377,7 +1378,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.86.0-diag)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.87.0-fmodstate)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();

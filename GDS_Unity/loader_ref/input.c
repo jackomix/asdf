@@ -781,7 +781,9 @@ static int inp_Screen_get_orientation(void) {
 }
 static float inp_Screen_get_dpi(void) {
     HITF(14, "Screen.get_dpi");
-    return 160.0f;
+    extern int gds_dpi_override(void);
+    int ov = gds_dpi_override();
+    return ov > 0 ? (float)ov : 160.0f;
 }
 static int inp_Screen_get_autorotateToPortrait(void) { return 0; }
 static int inp_Screen_get_fullScreen(void) { return 1; }
