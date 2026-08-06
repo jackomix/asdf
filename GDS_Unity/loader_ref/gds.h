@@ -49,7 +49,7 @@ void *gds_native_window(void);
 
 /* Unity's Android FMOD backend normally feeds an AudioTrack from
  * FMODAudioDevice.run().  The JNI shim keeps the original fmodGetInfo /
- * fmodProcess contract and audio.c supplies the missing Java thread through
+ * fmodProcess contract and opensles_audio.c supplies the missing Java thread through
  * SDL's native NextOS output. */
 void *gds_jni_fmod_device(void);
 void *gds_jni_fmod_bytebuffer(void);

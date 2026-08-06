@@ -1974,3 +1974,43 @@ the next surface (input is minimal; GDS is touch).
   screen, live on the panel.  Remaining chapters: INPUT (R36S has no
   touchscreen; dpad/analog -> virtual cursor + tap buttons; leads in kairovm
   SurfaceBase/MotionEventRecord + Horizon jni input) then AUDIO.
+
+## 2026-08-06 -- 0.79.0-input: landscape unlock + gamepad pointer + OpenSL audio
+
+Three chapters of the port land together (OSK is the next ship):
+
+- LANDSCAPE (root cause, disassembly-proven): the game's orientation toggle in
+  System->Options is gated on JNI `kairo/android/plugin/Utility.isTablet()`
+  (KairoPlugin::_isTablet @0x17f8084; IApplication caches IsTablet()&1 at the
+  GetRotateCheck site @0x175b628; literal #8017).  Unbound, our bridge returned
+  0 -> the 640x480 landscape panel got the portrait layout.  jni.c now binds
+  isTablet ()Z/(Context)Z -> 1 and getSystemBarHeight ()I -> 0 (was unhandled).
+  ALSO pinned Unity's managed-side screen facts the kairo engine reads
+  (kairovm unity.py contract): Screen.get_orientation -> LandscapeLeft (w>=h),
+  Screen.get_dpi -> 160.0f (Java-less Unity defaults dpi to 96, warping
+  Kairosoft's dp-based layout), get_autorotateToPortrait -> 0.
+- INPUT (native_pad technique from the reference ports): input.c rewritten to
+  patch UnityEngine.Input icall bodies in place (MethodInfo.methodPointer @ +0,
+  ldr x16/br x16 trampoline via il2cpp_runtime_class_init-free name lookup),
+  answering from an SDL_GameController driving a virtual pointer: stick/dpad
+  move (deadzone 0.18, accel curve), A = mouse0 + synthetic single touch
+  (Began/Moved/Stationary/Ended phase machine), B = mouse1, SELECT+START = exit.
+  Axis contract: GetAxis Horizontal/Vertical from dpad+stick (only with
+  GDS_ARROWS=1 as keys; axes always on).  gds_env.cfg switches: GDS_CURSOR
+  (default 1), GDS_ARROWS (0), GDS_JOYNAME (0).
+- CURSOR OVERLAY: egl_shim.c draws a white/black arrow into Unity's back
+  buffer with raw GLES2 (own program/VBO/VAO) right before the present, while
+  Unity's raw ctx is current; ALL touched GL state (program, VBO, VAO,
+  viewport, depth/blend/cull/scissor) is saved then restored so the engine
+  can't notice.  Arrow doubles as the active-press indicator (turns orange).
+- AUDIO (OpenSLES -> SDL2, ported from the reference ports' opensles_shim):
+  Unity 2022 ships FMOD inside libunity which dlopens "libOpenSLES.so" and
+  dlsyms slCreateEngine + SL_IID_* data objects.  ours -> opensles_audio.c:
+  full vtable object model (engine/outputmix/player + PLAY/VOLUME/
+  BUFFERQUEUE interfaces), 16 players x 4MB SPSC rings, 64-deep queued-size
+  FIFO, 4ms pump THREAD (mandatory: FMOD's System::init blocks inside
+  nativeRender waiting for the first buffer-queue callback), SDL audio 44100
+  S16 stereo 2048 samples via dlsym (no SDL headers), per-player resample +
+  volume + fade-in/underrun fade-out + soft-clip.  GDS_AUDIO=0 disables
+  (back to 0.78 silence).  Watch device log for: "[SL] slCreateEngine",
+  "[SL] CreateAudioPlayer", "[SL] SDL audio open:", "[SL] bq_Enqueue".

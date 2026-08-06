@@ -1469,6 +1469,222 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
   return EGL_TRUE;
 }
 
+/* ------------------------------------------------------------------ *
+ * 0.79 gamepad cursor overlay.  input.c drives a virtual pointer from
+ * the R36S gamepad (stick/dpad); here we draw that pointer into Unity's
+ * back buffer right before the present, with raw GLES2 calls while
+ * Unity's raw context is still current.  All Unity-touched GL state is
+ * saved and restored (program, VBO binding, VAO, viewport, enable
+ * bits) so the engine can't tell we were here.  ES3.2 VAOs keep the
+ * vertex-attrib state ours; if VAOs are somehow missing we draw
+ * nothing (logged once) rather than risk clobbering Unity's attribs.
+ * ------------------------------------------------------------------ */
+extern int gds_input_cursor(float *x, float *y);
+extern int gds_input_cursor_pressed(void);
+
+static struct {
+  int tried, ok, broken;
+  unsigned prog;      /* GL program */
+  unsigned vbo, vao;
+  int a_pos, u_color; /* attrib/uniform locations */
+  /* raw GL entry points (libGLESv2, RTLD_NOLOAD -- already loaded) */
+  void (*glGetIntegerv)(unsigned, int *);
+  int (*glIsEnabled)(unsigned);
+  void (*glEnable)(unsigned);
+  void (*glDisable)(unsigned);
+  unsigned (*glCreateShader)(unsigned);
+  void (*glShaderSource)(unsigned, int, const char *const *, const int *);
+  void (*glCompileShader)(unsigned);
+  void (*glGetShaderiv)(unsigned, unsigned, int *);
+  unsigned (*glCreateProgram)(void);
+  void (*glAttachShader)(unsigned, unsigned);
+  void (*glLinkProgram)(unsigned);
+  void (*glGetProgramiv)(unsigned, unsigned, int *);
+  void (*glUseProgram)(unsigned);
+  void (*glDeleteShader)(unsigned);
+  int (*glGetAttribLocation)(unsigned, const char *);
+  int (*glGetUniformLocation)(unsigned, const char *);
+  void (*glUniform4f)(int, float, float, float, float);
+  void (*glGenBuffers)(int, unsigned *);
+  void (*glBindBuffer)(unsigned, unsigned);
+  void (*glBufferData)(unsigned, long, const void *, unsigned);
+  void (*glDeleteBuffers)(int, const unsigned *);
+  void (*glVertexAttribPointer)(unsigned, int, unsigned, unsigned char, int, const void *);
+  void (*glEnableVertexAttribArray)(unsigned);
+  void (*glDrawArrays)(unsigned, int, int);
+  void (*glViewport)(int, int, int, int);
+  void (*glGenVertexArrays)(int, unsigned *);
+  void (*glBindVertexArray)(unsigned);
+  void (*glDeleteVertexArrays)(int, const unsigned *);
+} g_cur_gl;
+
+#define CUR_GL_DEPTH_TEST   0x0B71u
+#define CUR_GL_BLEND        0x0BE2u
+#define CUR_GL_CULL_FACE    0x0B44u
+#define CUR_GL_SCISSOR_TEST 0x0C11u
+#define CUR_GL_CURRENT_PROGRAM   0x8B8Du
+#define CUR_GL_ARRAY_BUFFER 0x8892u
+#define CUR_GL_ARRAY_BUFFER_BINDING 0x8894u
+#define CUR_GL_STREAM_DRAW  0x88E0u
+#define CUR_GL_FLOAT        0x1406u
+#define CUR_GL_TRIANGLES    0x0004u
+#define CUR_GL_VIEWPORT     0x0BA2u
+#define CUR_GL_VERTEX_SHADER   0x8B31u
+#define CUR_GL_FRAGMENT_SHADER 0x8B30u
+#define CUR_GL_LINK_STATUS  0x8B82u
+#define CUR_GL_COMPILE_STATUS 0x8B81u
+#define CUR_GL_VERTEX_ARRAY_BINDING 0x85B5u
+
+static int cursor_gl_load(void) {
+  if (g_cur_gl.tried) return g_cur_gl.ok;
+  g_cur_gl.tried = 1;
+  const char *gld = getenv("SDL_VIDEO_GL_DRIVER");
+  const char *names[] = { (gld && *gld) ? gld : "libGLESv2.so",
+                          "libGLESv2.so.2", "libGLESv2.so", 0 };
+  void *h = NULL;
+  for (int i = 0; names[i] && !h; i++) {
+    h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+  }
+  if (!h) { printf("[cursor] no libGLESv2 handle\n"); return 0; }
+#define R(f) g_cur_gl.f = (void *)dlsym(h, #f)
+  R(glGetIntegerv); R(glIsEnabled); R(glEnable); R(glDisable);
+  R(glCreateShader); R(glShaderSource); R(glCompileShader); R(glGetShaderiv);
+  R(glCreateProgram); R(glAttachShader); R(glLinkProgram); R(glGetProgramiv);
+  R(glUseProgram); R(glDeleteShader);
+  R(glGetAttribLocation); R(glGetUniformLocation); R(glUniform4f);
+  R(glGenBuffers); R(glBindBuffer); R(glBufferData); R(glDeleteBuffers);
+  R(glVertexAttribPointer); R(glEnableVertexAttribArray); R(glDrawArrays);
+  R(glViewport); R(glGenVertexArrays); R(glBindVertexArray);
+  R(glDeleteVertexArrays);
+#undef R
+  if (!g_cur_gl.glGetIntegerv || !g_cur_gl.glCreateShader ||
+      !g_cur_gl.glUseProgram || !g_cur_gl.glGenBuffers ||
+      !g_cur_gl.glVertexAttribPointer || !g_cur_gl.glDrawArrays ||
+      !g_cur_gl.glViewport) {
+    printf("[cursor] GLES2 entry points missing -- overlay off\n");
+    return 0;
+  }
+  if (!g_cur_gl.glGenVertexArrays || !g_cur_gl.glBindVertexArray) {
+    printf("[cursor] no VAOs -- overlay off (can't isolate attribs)\n");
+    return 0;
+  }
+  static const char *vs_src =
+      "attribute vec2 aPos;\n"
+      "void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+  static const char *fs_src =
+      "precision mediump float;\n"
+      "uniform vec4 uColor;\n"
+      "void main(){ gl_FragColor = uColor; }\n";
+  unsigned vs = g_cur_gl.glCreateShader(CUR_GL_VERTEX_SHADER);
+  g_cur_gl.glShaderSource(vs, 1, &vs_src, 0);
+  g_cur_gl.glCompileShader(vs);
+  int okc = 0; g_cur_gl.glGetShaderiv(vs, CUR_GL_COMPILE_STATUS, &okc);
+  unsigned fs = g_cur_gl.glCreateShader(CUR_GL_FRAGMENT_SHADER);
+  g_cur_gl.glShaderSource(fs, 1, &fs_src, 0);
+  g_cur_gl.glCompileShader(fs);
+  int okf = 0; g_cur_gl.glGetShaderiv(fs, CUR_GL_COMPILE_STATUS, &okf);
+  g_cur_gl.prog = g_cur_gl.glCreateProgram();
+  g_cur_gl.glAttachShader(g_cur_gl.prog, vs);
+  g_cur_gl.glAttachShader(g_cur_gl.prog, fs);
+  g_cur_gl.glLinkProgram(g_cur_gl.prog);
+  int okl = 0; g_cur_gl.glGetProgramiv(g_cur_gl.prog, CUR_GL_LINK_STATUS, &okl);
+  g_cur_gl.glDeleteShader(vs); g_cur_gl.glDeleteShader(fs);
+  if (!okc || !okf || !okl) {
+    printf("[cursor] shader build failed c=%d f=%d l=%d\n", okc, okf, okl);
+    return 0;
+  }
+  g_cur_gl.a_pos = g_cur_gl.glGetAttribLocation(g_cur_gl.prog, "aPos");
+  g_cur_gl.u_color = g_cur_gl.glGetUniformLocation(g_cur_gl.prog, "uColor");
+  if (g_cur_gl.a_pos < 0) { printf("[cursor] no aPos attrib\n"); return 0; }
+  g_cur_gl.glGenBuffers(1, &g_cur_gl.vbo);
+  g_cur_gl.glGenVertexArrays(1, &g_cur_gl.vao);
+  g_cur_gl.ok = 1;
+  printf("[cursor] overlay GL ready (prog=%u vbo=%u vao=%u aPos=%d)\n",
+         g_cur_gl.prog, g_cur_gl.vbo, g_cur_gl.vao, g_cur_gl.a_pos);
+  return 1;
+}
+
+/* Draw the arrow once (single color). verts: 15 x vec2 pixel offsets. */
+static void cursor_draw_shape(float cx_px, float cy_px, float w, float h,
+                              float scale, float r, float g, float b) {
+  /* classic pointer arrow, tip at (0,0), y-down pixel space. */
+  static const float A[2]  = { 0.0f, 0.0f };
+  static const float B[2]  = { 13.6f, 10.2f };
+  static const float C[2]  = { 8.2f, 10.8f };
+  static const float D[2]  = { 11.2f, 17.5f };
+  static const float E[2]  = { 7.9f, 18.6f };
+  static const float F[2]  = { 4.9f, 11.9f };
+  static const float G[2]  = { 0.0f, 16.2f };
+  static const float *tri[15] =
+      { A, B, C,  A, C, F,  A, F, G,  C, D, E,  C, E, F };
+  float ndc[30];
+  for (int i = 0; i < 15; i++) {
+    float px = cx_px + tri[i][0] * scale;
+    float py = cy_px + tri[i][1] * scale;
+    ndc[i * 2]     = px * 2.0f / w - 1.0f;
+    ndc[i * 2 + 1] = 1.0f - py * 2.0f / h;
+  }
+  g_cur_gl.glUniform4f(g_cur_gl.u_color, r, g, b, 1.0f);
+  g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, g_cur_gl.vbo);
+  g_cur_gl.glBufferData(CUR_GL_ARRAY_BUFFER, sizeof ndc, ndc, CUR_GL_STREAM_DRAW);
+  g_cur_gl.glVertexAttribPointer((unsigned)g_cur_gl.a_pos, 2, CUR_GL_FLOAT, 0, 0, 0);
+  g_cur_gl.glEnableVertexAttribArray((unsigned)g_cur_gl.a_pos);
+  g_cur_gl.glDrawArrays(CUR_GL_TRIANGLES, 0, 15);
+}
+
+static void draw_cursor_overlay(void) {
+  float cx, cy;
+  if (!gds_input_cursor(&cx, &cy)) return;
+  if (!cursor_gl_load()) return;
+  if (g_cur_gl.broken) return;
+
+  int w = egl_shim_screen_w() > 0 ? egl_shim_screen_w() : 640;
+  int h = egl_shim_screen_h() > 0 ? egl_shim_screen_h() : 480;
+
+  /* --- save Unity's state --- */
+  int prev_prog = 0, prev_vbo = 0, prev_vao = 0;
+  int prev_vp[4] = { 0, 0, 0, 0 };
+  g_cur_gl.glGetIntegerv(CUR_GL_CURRENT_PROGRAM, &prev_prog);
+  g_cur_gl.glGetIntegerv(CUR_GL_ARRAY_BUFFER_BINDING, &prev_vbo);
+  g_cur_gl.glGetIntegerv(CUR_GL_VERTEX_ARRAY_BINDING, &prev_vao);
+  g_cur_gl.glGetIntegerv(CUR_GL_VIEWPORT, prev_vp);
+  int en_depth = g_cur_gl.glIsEnabled(CUR_GL_DEPTH_TEST);
+  int en_blend = g_cur_gl.glIsEnabled(CUR_GL_BLEND);
+  int en_cull  = g_cur_gl.glIsEnabled(CUR_GL_CULL_FACE);
+  int en_scis  = g_cur_gl.glIsEnabled(CUR_GL_SCISSOR_TEST);
+
+  /* --- draw --- */
+  g_cur_gl.glUseProgram(g_cur_gl.prog);
+  g_cur_gl.glBindVertexArray(g_cur_gl.vao);
+  g_cur_gl.glViewport(0, 0, w, h);
+  if (en_depth) g_cur_gl.glDisable(CUR_GL_DEPTH_TEST);
+  if (en_blend) g_cur_gl.glDisable(CUR_GL_BLEND);
+  if (en_cull)  g_cur_gl.glDisable(CUR_GL_CULL_FACE);
+  if (en_scis)  g_cur_gl.glDisable(CUR_GL_SCISSOR_TEST);
+
+  cursor_draw_shape(cx, cy, (float)w, (float)h, 1.9f, 0.10f, 0.10f, 0.14f);
+  if (gds_input_cursor_pressed())
+    cursor_draw_shape(cx, cy, (float)w, (float)h, 1.35f, 0.95f, 0.55f, 0.20f);
+  else
+    cursor_draw_shape(cx, cy, (float)w, (float)h, 1.35f, 0.96f, 0.96f, 0.97f);
+
+  /* --- restore Unity's state --- */
+  if (en_depth) g_cur_gl.glEnable(CUR_GL_DEPTH_TEST);
+  if (en_blend) g_cur_gl.glEnable(CUR_GL_BLEND);
+  if (en_cull)  g_cur_gl.glEnable(CUR_GL_CULL_FACE);
+  if (en_scis)  g_cur_gl.glEnable(CUR_GL_SCISSOR_TEST);
+  g_cur_gl.glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+  g_cur_gl.glBindVertexArray((unsigned)prev_vao);
+  g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, (unsigned)prev_vbo);
+  g_cur_gl.glUseProgram((unsigned)prev_prog);
+
+  if (g_raw_glGetError) {
+    /* leave the error queue the way we found it (empty) */
+    for (int i = 0; i < 8; i++) { if (!g_raw_glGetError()) break; }
+  }
+}
+
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
   g_n_eglSwapBuffers++;
@@ -1549,6 +1765,9 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                preswap_n, px[0], px[1], px[2], px[3], ge0, ge1);
       }
       preswap_n++;
+      /* 0.79: burn the gamepad cursor into the back buffer while Unity's
+       * raw context is still current (all state saved/restored inside). */
+      draw_cursor_overlay();
       if (present_mode() == 0 && egl_window && S.GL_SwapWindow) {
         S.GL_SwapWindow(egl_window);
         if (g_n_eglSwapBuffers <= 3)

@@ -1537,6 +1537,31 @@ static int64_t j_Utility_getAppWidth(jctx *c)
     JT("Utility.getAppWidth() -> 640");
     return 640;
 }
+
+/* Utility.isTablet(): kairo.unity.ui.IApplication caches IsTablet()&1 into a
+ * static and only offers the System->Options orientation toggle (rotation /
+ * landscape layout) when it's 1 (libil2cpp: KairoPlugin::_isTablet @0x17f8084
+ * via literal #8017 'isTablet'; GetRotateCheck site @0x175b628).  Unbound,
+ * our bridge returned 0 -> the game locked itself into the portrait layout
+ * on the R36S's 640x480 4:3 panel.  The panel is landscape: report tablet=1
+ * so the game enables its landscape/rotation path like the Steam build. */
+static int64_t j_Utility_isTablet(jctx *c)
+{
+    (void)c;
+    JT("Utility.isTablet() -> 1");
+    return 1;
+}
+
+/* Utility.getSystemBarHeight(): queried by the dex getScaleRatio chain
+ * ("if (getSystemBarHeight() > 0) h -= bar").  Fullscreen port: no system
+ * bar, 0.  Previously unhandled (returned 0 anyway, but logged as unbound);
+ * bind it so the JNI log stays meaningful. */
+static int64_t j_Utility_getSystemBarHeight(jctx *c)
+{
+    (void)c;
+    JT("Utility.getSystemBarHeight() -> 0");
+    return 0;
+}
 static int64_t j_Utility_getAppHeight(jctx *c)
 {
     (void)c;
@@ -4686,6 +4711,12 @@ void gds_jni_init(void)
     /* App-size / package identity (KairoPlugin.Init chain, run14/23) */
     gds_jni_bind("kairo/android/plugin/Utility", "getPackageName",
                  "()Ljava/lang/String;", (void *)j_Utility_getPackageName);
+    gds_jni_bind("kairo/android/plugin/Utility", "isTablet",
+                 "()Z", (void *)j_Utility_isTablet);
+    gds_jni_bind("kairo/android/plugin/Utility", "isTablet",
+                 "(Landroid/content/Context;)Z", (void *)j_Utility_isTablet);
+    gds_jni_bind("kairo/android/plugin/Utility", "getSystemBarHeight",
+                 "()I", (void *)j_Utility_getSystemBarHeight);
     gds_jni_bind("kairo/android/plugin/Utility", "getAppWidth",
                  "()I", (void *)j_Utility_getAppWidth);
     gds_jni_bind("kairo/android/plugin/Utility", "getAppHeight",

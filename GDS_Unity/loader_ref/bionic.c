@@ -576,6 +576,7 @@ static int my_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data);
 extern void *gds_android_sym(const char *name);
 extern void *gds_egl_sym(const char *name);
 extern void *gds_jni_sym(const char *name);
+extern void *gds_opensles_sym(const char *name);
 
 static void *my_memalign(size_t a, size_t n)
 {
@@ -825,6 +826,9 @@ static void *my_dlsym(void *h, const char *sym)
     if (!a) a = gds_android_sym(sym);
     if (!a) a = gds_egl_sym(sym);
     if (!a) a = gds_jni_sym(sym);
+    /* FMOD (inside libunity) dlopens "libOpenSLES.so" and dlsyms
+     * slCreateEngine + the SL_IID_* data objects through here (0.79). */
+    if (!a) a = gds_opensles_sym(sym);
     if (!a) a = nx_lookup(sym);
     if (!a)
         nx_log("dlsym(%s) -> NULL", sym);
