@@ -1947,3 +1947,24 @@ and the log should show the reference boot sequence [gds] initJni... ->
 nativeRecreateGfxState -> nativeRender loop, now with System.loadLibrary binding
 so il2cpp actually loads.  If it reaches nativeRender, the game data/rendering is
 the next surface (input is minimal; GDS is touch).
+
+---
+## 2026-08-06 AM -- "didn't get past the subtitle screen" diagnosis (NO CODE CHANGE)
+
+- User report: shipped loader gets past the company logo but stalls at the
+  subtitle/title screen; past experiments (incl. SDL warm-up probes around
+  0.93) sometimes reached/her the actual title screen.
+- Investigation invoked the subtitle layout/Stella rule (Probe-pending set):
+  first suspect = low fps starving Progressor (sub 1/8/3/5/4 progression),
+  maybe mix framebuffer/presentation of splash->whole screen in subtitle.
+- Examined evidence: qemu runs (0.90-0.93 family) all show stable keep=1
+  frames with GPU busy (draw calls/swap present), rendering OK; device warm/
+  cold runs likewise button-verify.
+- Device-specific timing: SUBTITLE depends on a fixed number of frames
+  progressing within the deadline. Past "got to title" runs sit in warmed-up
+  caches (fast early frames); fresh APK-extract cold run (deploy always
+  re-extracts, so "fresh files" staging was a red herring / no-op) has slow
+  early frames (shader compile/texture upload IO) and subtitles expire.
+- CONCLUSION: timing difference, not a code regression. No code changes made.
+  Awaiting user A/B (repeat runs same binary) to confirm warm-vs-cold timing;
+  if it reproduces on warmed cache too, next probe is Progressor on device.
