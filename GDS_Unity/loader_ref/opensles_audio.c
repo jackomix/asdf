@@ -396,8 +396,22 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
         }
     }
 
-    /* soft limiter (smooth knee, no discontinuities) */
-    const float master_gain = 0.30f;
+    /* soft limiter (smooth knee, no discontinuities). 0.89: measured fmod
+     * peaks ~14k of 32767; the old 0.30 master put music at ~-21dBFS ('a
+     * bit quiet').  With per-player vol 0.64 and master 1.0 the WORST legal
+     * source (full-scale 32767) lands at 20971 -- still below the 28000
+     * knee, so the fmod-only path mathematically cannot clip; coincident
+     * multi-player peaks are absorbed by the knee, never hard-clipped.
+     * GDS_GAIN multiplies further if wanted (0.05..3.0). */
+    static float master_gain = -1.0f;
+    if (master_gain < 0.0f) {
+        master_gain = 1.0f;
+        const char *eg = getenv("GDS_GAIN");
+        if (eg) {
+            float g = (float)atof(eg);
+            if (g >= 0.05f && g <= 3.0f) master_gain = g;
+        }
+    }
     const float threshold = 28000.0f;
     const float knee = 4000.0f;
     for (int s = 0; s < out_samples; s++) {

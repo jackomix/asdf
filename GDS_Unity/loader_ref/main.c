@@ -515,8 +515,27 @@ static void arm_traps(uintptr_t il2b)
         {0x186d61c, "Storage.Open.entry",      24},
         {0x186a8d0, "Setup.postOpen",          3},
         {0x186a8e4, "RecordStore.Setup.store", 21},
-        {0xcb0ddc, "raiseAORE.stub",          19},
+        /* 0.89: stub labels corrected by disasm (0.88 "AORE" hit at 0xcb0ddc
+         * was the EH machine RETHROWING the caught exception -- misleading).
+         * 0xcb0ddc = raise(exception object) [rethrow helper]
+         * 0xcb0de4 = raise NullReference (no msg)
+         * 0xcb0dec = THE bounds-check-fail stub (IndexOutOfRange, canonical
+         *            'Index was outside the bounds of the array.')
+         * 0xcb0df4 = same but with explicit message string (String.get_Chars
+         *            sites etc.)
+         * 0xcb1180 = InvalidCast. */
+        {0xcb0ddc, "rethrow-exobj.stub",      19},
+        {0xcb0dec, "raiseAOREchk.stub",       19},
+        {0xcb0df4, "raiseAOREmsg.stub",       19},
         {0xcb1180, "raiseInvalidCast.stub",   19},
+        /* 0.89: the company-name AORE.  FepPanel::Update@0x17f4a40 = the
+         * instruction AFTER GetFepPanelResult returns (x0 = String[]):
+         * dump Length/elements + the branch-deciding statics.  0x17f4aac is
+         * FepPanel::Update's own bounds-fail site (element[1] load when
+         * Length<=1), disasm-pinned; if the exception comes from there this
+         * probe fires and names the delivered array. */
+        {0x17f4a40, "FepPanel.result",        31},
+        {0x17f4aac, "FepPanel.aoresite",      31},
         /* Storage::GetFolder folder in {1,4}, Android branch: the path is
          * cut out of the base path via LastIndexOf(strA)+5..LastIndexOf(strB)
          * then Substring(start,len) -- AORE if either index is -1. */
@@ -542,7 +561,7 @@ static void arm_traps(uintptr_t il2b)
         g_probes[g_nprobes].addr = a;
         g_probes[g_nprobes].orig = *(uint32_t *)a;
         g_probes[g_nprobes].hit = 0;
-        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : (T[i].kind == 24 ? 12 : ((T[i].kind >= 25 && T[i].kind <= 29) ? 6 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : 1)));
+        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : (T[i].kind == 24 ? 12 : ((T[i].kind >= 25 && T[i].kind <= 29) ? 6 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : (T[i].kind == 31 ? 4 : 1))));
         g_probes[g_nprobes].kind = T[i].kind;
         g_probes[g_nprobes].tag = T[i].tag;
         *(uint32_t *)a = 0xd4200000; /* brk #0 */
@@ -995,12 +1014,57 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                                 *(volatile unsigned char *)(st + 0x20));
                 }
             } else if (p->kind == 19) {
-                /* NRE-raise stub entry: x30 = codegen raise call site +4.
-                 * That is the instruction right after `bl raiseNRE`, so the
-                 * guarding null check sits a couple of insns earlier. */
+                /* raise-stub entry: x30 = codegen raise call site +4.
+                 * That is the instruction right after `bl <stub>`, so the
+                 * guarding check sits a couple of insns earlier. */
                 fprintf(stderr,
-                        "[trap]   NRE-raise site = il2cpp+%#lx\n",
+                        "[trap]   raise site = il2cpp+%#lx\n",
                         (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
+            } else if (p->kind == 31) {
+                /* 0.89: FepPanel result forensic dump.
+                 * At 0x17f4a40: x0 = String[] from GetFepPanelResult.
+                 * At 0x17f4aac: the bounds-fail site (same dump for proof). */
+                uintptr_t arr = (uintptr_t)u->uc_mcontext.regs[0];
+                char s1[300], s2[300];
+                fprintf(stderr, "[trap]   result x0=%#lx", (unsigned long)arr);
+                if (!trap_ptr_ok(arr) || !trap_mapped(arr)) {
+                    fprintf(stderr, " (NULL or bad)\n");
+                } else {
+                    int len = *(volatile int *)(arr + 0x18);
+                    uintptr_t e0 = *(uintptr_t *)(arr + 0x20);
+                    uintptr_t e1 = len > 1 ? *(uintptr_t *)(arr + 0x28) : 0;
+                    trap_il2str(e0, s1, sizeof s1);
+                    trap_il2str(e1, s2, sizeof s2);
+                    fprintf(stderr, " len=%d\n[trap]     [0]=(%#lx)'%s' [1]=(%#lx)'%s'\n",
+                            len, (unsigned long)e0, s1, (unsigned long)e1, s2);
+                }
+                /* branch deciders (disasm-pinned):
+                 *   flag: klassCell@0x1ebf338 -> klass -> statics(+0xb8) -> +0x199
+                 *   Main: klassCell@0x1ebf660 (KairoPlugin) -> statics -> [0]
+                 *         -> +0x208 int / +0x220 string */
+                uintptr_t kc = g_il2b + 0x1ebf338;
+                if (trap_mapped(kc)) {
+                    uintptr_t kla = *(uintptr_t *)kc;
+                    uintptr_t st = (trap_ptr_ok(kla) && trap_mapped(kla + 0xb8))
+                        ? *(uintptr_t *)(kla + 0xb8) : 0;
+                    if (st && trap_mapped(st + 0x199))
+                        fprintf(stderr, "[trap]   fepflag(statics+0x199)=%d\n",
+                                *(volatile unsigned char *)(st + 0x199));
+                }
+                uintptr_t kc2 = g_il2b + 0x1ebf660;
+                if (trap_mapped(kc2)) {
+                    uintptr_t kla = *(uintptr_t *)kc2;
+                    uintptr_t st = (trap_ptr_ok(kla) && trap_mapped(kla + 0xb8))
+                        ? *(uintptr_t *)(kla + 0xb8) : 0;
+                    uintptr_t maino = (st && trap_mapped(st)) ? *(uintptr_t *)st : 0;
+                    if (maino && trap_mapped(maino + 0x220)) {
+                        char s3[300];
+                        trap_il2str(*(uintptr_t *)(maino + 0x220), s3, sizeof s3);
+                        fprintf(stderr, "[trap]   Main._208=%d Main._220='%s' Main._1f8=%d\n",
+                                *(volatile int *)(maino + 0x208), s3,
+                                *(volatile int *)(maino + 0x1f8));
+                    }
+                }
             } else if (p->kind == 14) {
                 /* raise-helper entry: x30 = codegen out-of-range check site */
                 fprintf(stderr, "[trap]   ra=il2cpp+%#lx",
@@ -1378,7 +1442,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.88.0-fmodtrim)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.89.0-fepprobe)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */

@@ -24,7 +24,7 @@ BRANCH="${GDS_BRANCH:-arena/019fd2ed-asdf}"
 # a stale one).  That closes the old failure mode where a cached copy of THIS
 # script validated a stale zip against a stale baked version and everything
 # looked "fine".  Set GDS_EXPECT_VER env to force a value manually.
-GDS_EXPECT_VER_BAKED="0.88.0-fmodtrim"
+GDS_EXPECT_VER_BAKED="0.89.0-fepprobe"
 GDS_EXPECT_VER_ENV="${GDS_EXPECT_VER:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
@@ -174,14 +174,9 @@ echo "Installing and running..."
   rm -f gamedevstory.zip
   [ -f /tmp/gds_env.cfg.keep ] && cp /tmp/gds_env.cfg.keep '$PORTS_DIR/gamedevstory/gds_env.cfg' && rm -f /tmp/gds_env.cfg.keep || true
   chmod +x '$PORTS_DIR/Game Dev Story.sh' '$PORTS_DIR/gamedevstory/loader2'
-  echo '=== running launcher (background, '$RUN_SECONDS's) ==='
-  nohup bash '$PORTS_DIR/Game Dev Story.sh' >/dev/null 2>&1 &
-  for i in 1 2 3; do sleep $RUN_SECONDS; done
-  if kill -0 %1 2>/dev/null; then
-    echo 'launcher still running (game alive) after '$RUN_SECONDS's'
-  else
-    echo 'launcher already exited'
-  fi
+  # 0.89: no auto-launch (user request) -- install only; launch is done
+  # from the EmulationStation Ports menu.
+  echo '=== install complete; launch from the Ports menu ==='
 "
 
 # ---- 5. pull logs ----
