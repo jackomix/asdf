@@ -15,6 +15,7 @@
  */
 #include "egl_shim.h"
 #include "musl_compat.h"
+#include "gds.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1685,6 +1686,83 @@ static void draw_cursor_overlay(void) {
   }
 }
 
+/* ------------------------------------------------ OSK overlay (begin/rect/end)
+ * Same GL stack as the cursor overlay, factored so osk.c can draw arbitrary
+ * axis-aligned pixel quads.  Single-threaded render thread, so the saved
+ * state lives in statics between begin/end. */
+static struct {
+    int open;
+    int w, h;
+    int prog, vbo, vao;
+    int vp[4];
+    int en_depth, en_blend, en_cull, en_scis;
+} g_ov;
+
+int gds_egl_overlay_begin(int *sw, int *sh) {
+    if (!cursor_gl_load() || g_cur_gl.broken) return 0;
+    int w = egl_shim_screen_w() > 0 ? egl_shim_screen_w() : 640;
+    int h = egl_shim_screen_h() > 0 ? egl_shim_screen_h() : 480;
+    g_ov.w = w; g_ov.h = h;
+    g_ov.vp[0] = g_ov.vp[1] = g_ov.vp[2] = g_ov.vp[3] = 0;
+    g_cur_gl.glGetIntegerv(CUR_GL_CURRENT_PROGRAM, &g_ov.prog);
+    g_cur_gl.glGetIntegerv(CUR_GL_ARRAY_BUFFER_BINDING, &g_ov.vbo);
+    g_cur_gl.glGetIntegerv(CUR_GL_VERTEX_ARRAY_BINDING, &g_ov.vao);
+    g_cur_gl.glGetIntegerv(CUR_GL_VIEWPORT, g_ov.vp);
+    g_ov.en_depth = g_cur_gl.glIsEnabled(CUR_GL_DEPTH_TEST);
+    g_ov.en_blend = g_cur_gl.glIsEnabled(CUR_GL_BLEND);
+    g_ov.en_cull  = g_cur_gl.glIsEnabled(CUR_GL_CULL_FACE);
+    g_ov.en_scis  = g_cur_gl.glIsEnabled(CUR_GL_SCISSOR_TEST);
+    g_cur_gl.glUseProgram(g_cur_gl.prog);
+    g_cur_gl.glBindVertexArray(g_cur_gl.vao);
+    g_cur_gl.glViewport(0, 0, w, h);
+    if (g_ov.en_depth) g_cur_gl.glDisable(CUR_GL_DEPTH_TEST);
+    if (g_ov.en_blend) g_cur_gl.glDisable(CUR_GL_BLEND);
+    if (g_ov.en_cull)  g_cur_gl.glDisable(CUR_GL_CULL_FACE);
+    if (g_ov.en_scis)  g_cur_gl.glDisable(CUR_GL_SCISSOR_TEST);
+    g_ov.open = 1;
+    if (sw) *sw = w;
+    if (sh) *sh = h;
+    return 1;
+}
+
+void gds_egl_overlay_rect(float x, float y, float w, float h,
+                          float r, float g, float b) {
+    if (!g_ov.open) return;
+    float W = (float)g_ov.w, H = (float)g_ov.h;
+    /* two triangles, y-down pixel space -> NDC, stride identical to
+     * cursor_draw_shape's upload path. */
+    float ndc[12] = {
+        x,     y,      x + w, y,      x,     y + h,
+        x + w, y,      x + w, y + h,  x,     y + h,
+    };
+    for (int i = 0; i < 6; i++) {
+        ndc[i * 2]     = ndc[i * 2]     * 2.0f / W - 1.0f;
+        ndc[i * 2 + 1] = 1.0f - ndc[i * 2 + 1] * 2.0f / H;
+    }
+    g_cur_gl.glUniform4f(g_cur_gl.u_color, r, g, b, 1.0f);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, g_cur_gl.vbo);
+    g_cur_gl.glBufferData(CUR_GL_ARRAY_BUFFER, sizeof ndc, ndc, CUR_GL_STREAM_DRAW);
+    g_cur_gl.glVertexAttribPointer((unsigned)g_cur_gl.a_pos, 2, CUR_GL_FLOAT, 0, 0, 0);
+    g_cur_gl.glEnableVertexAttribArray((unsigned)g_cur_gl.a_pos);
+    g_cur_gl.glDrawArrays(CUR_GL_TRIANGLES, 0, 6);
+}
+
+void gds_egl_overlay_end(void) {
+    if (!g_ov.open) return;
+    g_ov.open = 0;
+    if (g_ov.en_depth) g_cur_gl.glEnable(CUR_GL_DEPTH_TEST);
+    if (g_ov.en_blend) g_cur_gl.glEnable(CUR_GL_BLEND);
+    if (g_ov.en_cull)  g_cur_gl.glEnable(CUR_GL_CULL_FACE);
+    if (g_ov.en_scis)  g_cur_gl.glEnable(CUR_GL_SCISSOR_TEST);
+    g_cur_gl.glViewport(g_ov.vp[0], g_ov.vp[1], g_ov.vp[2], g_ov.vp[3]);
+    g_cur_gl.glBindVertexArray((unsigned)g_ov.vao);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, (unsigned)g_ov.vbo);
+    g_cur_gl.glUseProgram((unsigned)g_ov.prog);
+    if (g_raw_glGetError) {
+        for (int i = 0; i < 8; i++) { if (!g_raw_glGetError()) break; }
+    }
+}
+
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
   g_n_eglSwapBuffers++;
@@ -1768,6 +1846,9 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
       /* 0.79: burn the gamepad cursor into the back buffer while Unity's
        * raw context is still current (all state saved/restored inside). */
       draw_cursor_overlay();
+      /* 0.84: the OSK draws through the same seam (no-op unless a kairo
+       * FEP panel / Unity soft-input is open). */
+      gds_osk_draw();
       if (present_mode() == 0 && egl_window && S.GL_SwapWindow) {
         S.GL_SwapWindow(egl_window);
         if (g_n_eglSwapBuffers <= 3)

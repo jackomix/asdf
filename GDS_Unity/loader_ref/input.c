@@ -128,8 +128,7 @@ static int sdl_input_load(void) {
 }
 
 /* ---------------------------------------------------------- pad state */
-enum { NPB_A, NPB_B, NPB_X, NPB_Y, NPB_LB, NPB_RB, NPB_BACK, NPB_START,
-       NPB_L3, NPB_R3, NPB_DU, NPB_DD, NPB_DL, NPB_DR, NPB_COUNT };
+/* NPB_* button indices live in gds.h (shared with osk.c). */
 enum { NPA_LX, NPA_LY, NPA_RX, NPA_RY, NPA_LT, NPA_RT, NPA_COUNT };
 
 static unsigned char g_npb[NPB_COUNT];
@@ -437,6 +436,9 @@ static int key_from_pad(int key) {
  *   0x1010/20->6/7 (L1/R1), 0x1040/80->8/9 (L2/R2), 0x1100/200->10/11
  *   (SELECT/START), 0x10000..0x80000->12-15, 0x2000 group -> 16-23. */
 static int kjoy_button(int id) {
+    /* 0.84 OSK gate (Terraria ter_vkbd_blocking equivalent): while the
+     * on-screen keyboard owns the pad the game must see NOTHING pressed. */
+    if (gds_osk_active()) return 0;
     switch (id & 0xff) {
     case 0:  return g_npb[NPB_A];
     case 1:  return g_npb[NPB_B];
@@ -456,6 +458,7 @@ static int kjoy_button(int id) {
     return 0;
 }
 static float kjoy_axis_value(int id) {
+    if (gds_osk_active()) return 0.0f;
     switch (id & 0xff) {
     case 8:  return g_npa[NPA_LT];
     case 9:  return g_npa[NPA_RT];
@@ -1017,11 +1020,28 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
     memcpy(g_key_prev, g_key_now, sizeof g_key_prev);
     pad_poll();
     frame_update();
-    for (size_t i = 0; i < sizeof g_snap_keys / sizeof *g_snap_keys; i++)
-        g_key_now[g_snap_keys[i]] = key_from_pad(g_snap_keys[i]);
-    memcpy(g_kjoy_prev, g_kjoy_now, sizeof g_kjoy_prev);
-    for (size_t i = 0; i < sizeof g_kjoy_now / sizeof *g_kjoy_now; i++)
-        g_kjoy_now[i] = (unsigned char)kjoy_button((int)i);
+    /* 0.84 OSK ownership of the pad (Terraria ter_vkbd_blocking gate):
+     * while the keyboard is open the game sees zero buttons/keys, and the
+     * 18-frame swallow after close keeps the confirming press from leaking
+     * back into the game as a phantom edge (Terraria g_vkbd_swallow). */
+    static int osk_was, osk_swallow;
+    int osk_active = gds_osk_active();
+    if (osk_was && !osk_active) osk_swallow = 18;
+    osk_was = osk_active;
+    if (osk_active)
+        gds_osk_pad_tick(g_npb, g_npb_prev);
+    if (osk_active || osk_swallow > 0) {
+        if (osk_swallow > 0) osk_swallow--;
+        memset(g_key_now, 0, sizeof g_key_now);
+        memcpy(g_kjoy_prev, g_kjoy_now, sizeof g_kjoy_prev);
+        memset(g_kjoy_now, 0, sizeof g_kjoy_now);
+    } else {
+        for (size_t i = 0; i < sizeof g_snap_keys / sizeof *g_snap_keys; i++)
+            g_key_now[g_snap_keys[i]] = key_from_pad(g_snap_keys[i]);
+        memcpy(g_kjoy_prev, g_kjoy_now, sizeof g_kjoy_prev);
+        for (size_t i = 0; i < sizeof g_kjoy_now / sizeof *g_kjoy_now; i++)
+            g_kjoy_now[i] = (unsigned char)kjoy_button((int)i);
+    }
     /* fallback only: normally installed by gds_input_install_now at load */
     if (!g_patched && (long)frame >= hook_delay()) {
         install_hooks();
@@ -1067,11 +1087,12 @@ void gds_input_set_screen_size(int width, int height) {
     (void)width; (void)height;
 }
 
-/* soft keyboard: no-op stubs (Terraria OSK lands in the next build) */
+/* soft keyboard: Unity's showSoftInput path and the kairo FEP panel share
+ * the same OSK (osk.c, Terraria controller-keyboard port). */
 void gds_input_keyboard_open(const char *initial, int character_limit) {
-    (void)initial; (void)character_limit; }
-void gds_input_keyboard_set(const char *text) { (void)text; }
-void gds_input_keyboard_hide(void) { }
+    gds_osk_open(NULL, initial, character_limit); }
+void gds_input_keyboard_set(const char *text) { gds_osk_set_text(text); }
+void gds_input_keyboard_hide(void) { gds_osk_hide(); }
 int gds_input_keyboard_snapshot(char *text, size_t text_size,
                                 int *uppercase, int *selected,
                                 const gds_keyboard_key **keys, size_t *key_count) {

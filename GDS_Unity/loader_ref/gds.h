@@ -107,6 +107,26 @@ void gds_jni_soft_input_selection(int start, int length);
 void gds_jni_soft_input_visible(int visible);
 void gds_jni_soft_input_closed(int canceled);
 
+/* ---------------- on-screen keyboard (Terraria-style, osk.c) -------------
+ * Gamepad-driven QWERTY overlay.  Two drivers open it:
+ *   - kairo native plugin: Utility.showInputPanel (FEP panel, the game's
+ *     own name/text entry) -> polled via isEndInputPanel/getResultInputPanel
+ *   - Unity generic: UnityPlayer.showSoftInput (kept working in parallel)
+ * While gds_osk_active() the whole pad feed to the game is blocked
+ * (input.c gates the kairo joystick + Unity key layers), so dpad+A drive
+ * the keyboard only -- same gate as Terraria's ter_vkbd_blocking(). */
+enum { NPB_A, NPB_B, NPB_X, NPB_Y, NPB_LB, NPB_RB, NPB_BACK, NPB_START,
+       NPB_L3, NPB_R3, NPB_DU, NPB_DD, NPB_DL, NPB_DR, NPB_COUNT };
+void gds_osk_open(const char *title, const char *initial, int maxlen);
+void gds_osk_set_text(const char *text);
+void gds_osk_hide(void);            /* external close => cancel */
+int  gds_osk_active(void);          /* overlay visible, owns the pad */
+int  gds_osk_done(void);            /* latched: entry finished (ok or cancel) */
+int  gds_osk_result_ok(void);       /* DONE=1 / CANCEL=0 (valid when done) */
+const char *gds_osk_text(void);
+void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev);
+void gds_osk_draw(void);            /* called pre-swap from egl_shim */
+
 /* The three arm64 objects, in load order. */
 int gds_load_modules(void);
 void gds_arm_frame_watchdog(void);

@@ -2690,6 +2690,110 @@ static int64_t j_Kairo_showDialog(jctx *c)
     return result;
 }
 
+/* ------------------------------------------------ kairo FEP input panel ----
+ * The game's own text-entry contract (name entry etc.), recovered from
+ * global-metadata string tables + libil2cpp disasm:
+ *   managed kairo.unity.native.KairoPlugin        dex kairo/android/plugin/Utility
+ *     ShowFepPanel   (fepTitle_,fepText_,fepMode_,fepPositive_,fepNegative_,fepMaxLength_)
+ *                    -> showInputPanel
+ *     StartFepPanel  -> startInputPanel
+ *     IsFepPanelFinish (polled each frame) -> isEndInputPanel
+ *     GetFepPanelResult                    -> getResultInputPanel
+ * kairo.unity.panel.FepPanel::Update @0x17f4974 (disasm-verified) consumes
+ * the result as a 2-element String array: Length must be >= 2 (else their
+ * bounds check throws), array[1] is stored to the TextBox display text, and
+ * array[0] selects the listener branch: non-NULL = positive (OK), NULL =
+ * negative (cancel).  We answer all four with the Terraria-style gamepad
+ * OSK in osk.c.  Routed by NAME so any dex signature works on first boot. */
+static int64_t j_kairo_InputPanel(jctx *c)
+{
+    const jmethod *m = c->m;
+    const char *sig = m && m->sig ? m->sig : "()V";
+    /* Walk the args by the signature's parameter types.  Unity's managed
+     * AndroidJavaObject.CallStatic always arrives as the *A variant, so
+     * c->args is a proper jvalue array we can index safely. */
+    jobj *objs[8];
+    long long nums[8];
+    int no = 0, ni = 0;
+    const char *p = strchr(sig, '(');
+    for (p = p ? p + 1 : sig; *p && *p != ')'; ) {
+        if (no >= 8 || ni >= 8) break;
+        if (*p == '[') {
+            p++;
+            continue;
+        } else if (*p == 'L') {
+            objs[no++] = jarg_obj(c);
+            while (*p && *p != ';') p++;
+            if (*p == ';') p++;
+        } else if (*p == 'F') {
+            nums[ni++] = (long long)jarg_float(c);
+            p++;
+        } else if (*p == 'J') {
+            nums[ni++] = jarg_long(c);
+            p++;
+        } else {
+            nums[ni++] = jarg_int(c);
+            p++;
+        }
+    }
+    const char *name = m ? m->name : "?";
+    if (strcmp(name, "showInputPanel") == 0) {
+        /* strings arrive in dex declaration order (title, text, positive,
+         * negative); the ints are mode + maxLength (small positives, the
+         * LAST one is maxLength). */
+        const char *title = (no >= 1 && objs[0] && objs[0]->str) ? objs[0]->str : "";
+        const char *text  = (no >= 2 && objs[1] && objs[1]->str) ? objs[1]->str : "";
+        int maxlen = 16;
+        for (int i = 0; i < ni; i++)
+            if (nums[i] > 0 && nums[i] <= 64)
+                maxlen = (int)nums[i];
+        fprintf(stderr, "[osk] Utility.showInputPanel%s title=\"%s\" text=\"%s\""
+                        " nstr=%d nnum=%d max=%d\n",
+                sig, title, text, no, ni, maxlen);
+        fflush(stderr);
+        gds_osk_open(title, text, maxlen);
+        return 1;
+    }
+    if (strcmp(name, "startInputPanel") == 0) {
+        fprintf(stderr, "[osk] Utility.startInputPanel%s (no-op, panel already open)\n",
+                sig);
+        fflush(stderr);
+        return 1;
+    }
+    if (strcmp(name, "isEndInputPanel") == 0) {
+        int done = gds_osk_done();
+        static unsigned seen_notdone = 8;
+        if (done || seen_notdone) {
+            if (!done) seen_notdone--;
+            fprintf(stderr, "[osk] Utility.isEndInputPanel%s -> %d\n", sig, done);
+            fflush(stderr);
+        }
+        return done;
+    }
+    if (strcmp(name, "getResultInputPanel") == 0) {
+        jobj *arr = j_NewObjectArray(NULL, 2, mk_class("java/lang/String"), NULL);
+        if (arr) {
+            arr->cls = "[Ljava/lang/String;";
+            if (gds_osk_result_ok()) {
+                /* non-NULL [0] = positive branch (FepPanel disasm: cbz on
+                 * [0x20] picks the negative listener; non-null keeps the
+                 * positive one) */
+                arr->elems[0] = mk_string("positive");
+            }
+            arr->elems[1] = mk_string(gds_osk_text());
+        }
+        fprintf(stderr, "[osk] Utility.getResultInputPanel%s -> { %s, \"%s\" }\n",
+                sig, gds_osk_result_ok() ? "\"positive\"" : "null",
+                gds_osk_text());
+        fflush(stderr);
+        return (int64_t)(uintptr_t)arr;
+    }
+    fprintf(stderr, "[osk] Utility.%s%s -> 0 (unhandled InputPanel member)\n",
+            name, sig);
+    fflush(stderr);
+    return 0;
+}
+
 /* ---- display metrics chain (Kairosoft kairo.unity.util.DisplayMetrics) ----
  * Boot evidence (qemu NullGL run6): the game called
  *   UnityPlayer.getWindowManager()Ljava/lang/Object;   -> unhandled -> NULL
@@ -4047,6 +4151,21 @@ static int64_t dispatch(void *e, jobj *self, void *mid, va_list *ap,
     if (self && self->boxed && is_unbox(m->name)) {
         JT("unboxed %s.%s -> %lld", self->cls, m->name, (long long)self->prim);
         return self->prim;
+    }
+    /* kairo FEP text-entry panel: routed by name regardless of the dex
+     * signature (showInputPanel / startInputPanel / isEndInputPanel /
+     * getResultInputPanel drive osk.c; see j_kairo_InputPanel). */
+    if (m->cls && strcmp(m->cls, "kairo/android/plugin/Utility") == 0 &&
+        strstr(m->name, "InputPanel")) {
+        jctx c = {
+            .env = e,
+            .self = self,
+            .ap = ap,
+            .args = args,
+            .arg_index = 0,
+            .m = m,
+        };
+        return j_kairo_InputPanel(&c);
     }
     if (m->handler) {
         jctx c = {
