@@ -2737,40 +2737,46 @@ static int64_t j_kairo_InputPanel(jctx *c)
         }
     }
     const char *name = m ? m->name : "?";
-    if (strcmp(name, "showInputPanel") == 0) {
+    /* Device-proven dex surface (0.84.0 run): the panel OPENS via
+     * startInputPanel(String title, String text, int mode,
+     *                 String positive, String negative, int maxLength)
+     * and POLLS via isInputPanelFinish()Z.  The metadata-guessed
+     * showInputPanel/isEndInputPanel names never fire; keep both handled
+     * (other kairo builds may use them). */
+    int is_show  = !strcmp(name, "startInputPanel") ||
+                   !strcmp(name, "showInputPanel");
+    int is_poll  = !strcmp(name, "isInputPanelFinish") ||
+                   !strcmp(name, "isEndInputPanel");
+    int is_fetch = !strcmp(name, "getResultInputPanel") ||
+                   !strcmp(name, "getInputPanelResult");
+    if (is_show) {
         /* strings arrive in dex declaration order (title, text, positive,
-         * negative); the ints are mode + maxLength (small positives, the
-         * LAST one is maxLength). */
+         * negative); the ints are mode + maxLength (the LAST small
+         * positive is maxLength). */
         const char *title = (no >= 1 && objs[0] && objs[0]->str) ? objs[0]->str : "";
         const char *text  = (no >= 2 && objs[1] && objs[1]->str) ? objs[1]->str : "";
         int maxlen = 16;
         for (int i = 0; i < ni; i++)
             if (nums[i] > 0 && nums[i] <= 64)
                 maxlen = (int)nums[i];
-        fprintf(stderr, "[osk] Utility.showInputPanel%s title=\"%s\" text=\"%s\""
+        fprintf(stderr, "[osk] Utility.%s%s title=\"%s\" text=\"%s\""
                         " nstr=%d nnum=%d max=%d\n",
-                sig, title, text, no, ni, maxlen);
+                name, sig, title, text, no, ni, maxlen);
         fflush(stderr);
         gds_osk_open(title, text, maxlen);
         return 1;
     }
-    if (strcmp(name, "startInputPanel") == 0) {
-        fprintf(stderr, "[osk] Utility.startInputPanel%s (no-op, panel already open)\n",
-                sig);
-        fflush(stderr);
-        return 1;
-    }
-    if (strcmp(name, "isEndInputPanel") == 0) {
+    if (is_poll) {
         int done = gds_osk_done();
-        static unsigned seen_notdone = 8;
+        static unsigned seen_notdone = 6;
         if (done || seen_notdone) {
             if (!done) seen_notdone--;
-            fprintf(stderr, "[osk] Utility.isEndInputPanel%s -> %d\n", sig, done);
+            fprintf(stderr, "[osk] Utility.%s%s -> %d\n", name, sig, done);
             fflush(stderr);
         }
         return done;
     }
-    if (strcmp(name, "getResultInputPanel") == 0) {
+    if (is_fetch) {
         jobj *arr = j_NewObjectArray(NULL, 2, mk_class("java/lang/String"), NULL);
         if (arr) {
             arr->cls = "[Ljava/lang/String;";
@@ -2782,15 +2788,28 @@ static int64_t j_kairo_InputPanel(jctx *c)
             }
             arr->elems[1] = mk_string(gds_osk_text());
         }
-        fprintf(stderr, "[osk] Utility.getResultInputPanel%s -> { %s, \"%s\" }\n",
-                sig, gds_osk_result_ok() ? "\"positive\"" : "null",
+        fprintf(stderr, "[osk] Utility.%s%s -> { %s, \"%s\" }\n",
+                name, sig, gds_osk_result_ok() ? "\"positive\"" : "null",
                 gds_osk_text());
         fflush(stderr);
         return (int64_t)(uintptr_t)arr;
     }
-    fprintf(stderr, "[osk] Utility.%s%s -> 0 (unhandled InputPanel member)\n",
-            name, sig);
-    fflush(stderr);
+    /* One log per unknown member name (the isInputPanelFinish-per-frame
+     * spam of 0.84.0 drowned the real evidence). */
+    static char seen_names[4][64];
+    static int seen_n;
+    int seen = 0;
+    for (int i = 0; i < seen_n; i++)
+        if (!strcmp(seen_names[i], name)) seen = 1;
+    if (!seen) {
+        if (seen_n < 4) {
+            snprintf(seen_names[seen_n], 64, "%s", name);
+            seen_n++;
+        }
+        fprintf(stderr, "[osk] Utility.%s%s -> 0 (unhandled InputPanel member)\n",
+                name, sig);
+        fflush(stderr);
+    }
     return 0;
 }
 

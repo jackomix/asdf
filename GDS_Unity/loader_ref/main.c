@@ -1344,7 +1344,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.84.0-osk)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.84.1-oskfix)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
