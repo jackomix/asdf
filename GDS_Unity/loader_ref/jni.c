@@ -1245,10 +1245,45 @@ static int64_t j_File_mkdirs(jctx *c)
     return 0;
 }
 
+static char gds_android_filesdir[1400];
+
+/* Real Android: context.getFilesDir()       -> /data/data/<pkg>/files
+ *               context.getExternalFilesDir -> /sdcard/Android/data/<pkg>/files
+ * Kairosoft's Storage::GetFolder cuts the package name out of that path with
+ * LastIndexOf("data/")+5 .. LastIndexOf("/files") and Substring().  When
+ * we answered with the bare <gamedir>/home both probes missed and Substring
+ * (start=4, len=-5) raised ArgumentOutOfRangeException, which unwound
+ * Storage::Open(4) -> RecordStore::Setup stored nothing -> later
+ * GetNumRecords NRE -> "An error has occurred." dialog at frame 3.
+ * Answer with an Android-shaped path rooted under gds_home instead and
+ * pre-create it (their File.mkdirs() only does a single mkdir). */
+static const char *gds_filesdir_path(void)
+{
+    if (!*gds_android_filesdir) {
+        snprintf(gds_android_filesdir, sizeof gds_android_filesdir,
+                 "%s/Android/data/net.kairosoft.android.gamedev3en/files",
+                 gds_home);
+        char tmp[1400];
+        snprintf(tmp, sizeof tmp, "%s", gds_android_filesdir);
+        for (char *p = tmp + 1; ; p++) {
+            if (*p == '/' || *p == 0) {
+                int end = *p == 0;
+                *p = 0;
+                if (mkdir(tmp, 0755) && errno != EEXIST)
+                    nx_log("filesdir: mkdir %s: %s", tmp, strerror(errno));
+                if (end)
+                    break;
+                *p = '/';
+            }
+        }
+    }
+    return gds_android_filesdir;
+}
+
 static int64_t j_Context_getFilesDir(jctx *c)
 {
     (void)c;
-    return (int64_t)(uintptr_t)mk_file(gds_home);
+    return (int64_t)(uintptr_t)mk_file(gds_filesdir_path());
 }
 
 static int64_t j_Context_getPackageCodePath(jctx *c)
@@ -2981,6 +3016,7 @@ enum pref_type {
     PREF_FLOAT,
     PREF_STRING,
     PREF_BOOL,
+    PREF_BYTES,             /* kairo Utility.putPreference byte[] payloads */
 };
 
 typedef struct {
@@ -2989,6 +3025,8 @@ typedef struct {
     int32_t integer;
     float real;
     char *string;
+    unsigned char *blob;
+    uint32_t blob_len;
 } pref_entry;
 
 #define MAX_PREFS 1024
@@ -3019,8 +3057,30 @@ static pref_entry *pref_set_locked(const char *key, enum pref_type type)
         free(entry->string);
         entry->string = NULL;
     }
+    if (entry->type == PREF_BYTES) {
+        free(entry->blob);
+        entry->blob = NULL;
+        entry->blob_len = 0;
+    }
     entry->type = type;
     return entry;
+}
+
+static int pref_remove_locked(const char *key)
+{
+    for (int i = 0; i < preferences_count; i++) {
+        if (strcmp(preferences[i].key, key) == 0) {
+            free(preferences[i].key);
+            if (preferences[i].type == PREF_STRING)
+                free(preferences[i].string);
+            if (preferences[i].type == PREF_BYTES)
+                free(preferences[i].blob);
+            preferences[i] = preferences[--preferences_count];
+            memset(&preferences[preferences_count], 0, sizeof(pref_entry));
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int pref_write(FILE *file, const void *data, size_t bytes)
@@ -3056,7 +3116,9 @@ static int preferences_save_locked(void)
         uint32_t value_length =
             entry->type == PREF_STRING
                 ? (uint32_t)strlen(entry->string ? entry->string : "")
-                : (uint32_t)sizeof(uint32_t);
+                : entry->type == PREF_BYTES
+                    ? entry->blob_len
+                    : (uint32_t)sizeof(uint32_t);
         ok = pref_write(file, &type, sizeof type) &&
              pref_write(file, &key_length, sizeof key_length) &&
              pref_write(file, &value_length, sizeof value_length) &&
@@ -3066,6 +3128,9 @@ static int preferences_save_locked(void)
         if (entry->type == PREF_STRING)
             ok = pref_write(file, entry->string ? entry->string : "",
                             value_length);
+        else if (entry->type == PREF_BYTES)
+            ok = value_length == 0 ||
+                 pref_write(file, entry->blob, value_length);
         else if (entry->type == PREF_FLOAT)
             ok = pref_write(file, &entry->real, sizeof entry->real);
         else
@@ -3116,7 +3181,7 @@ static void preferences_load_locked(void)
             !pref_read(file, &value_length, sizeof value_length) ||
             key_length == 0 || key_length > 4096 ||
             value_length > 1024 * 1024 ||
-            type < PREF_INT || type > PREF_BOOL)
+            type < PREF_INT || type > PREF_BYTES)
             break;
         char *key = calloc((size_t)key_length + 1, 1);
         char *value = calloc((size_t)value_length + 1, 1);
@@ -3131,6 +3196,10 @@ static void preferences_load_locked(void)
         if (entry) {
             if (type == PREF_STRING) {
                 entry->string = value;
+                value = NULL;
+            } else if (type == PREF_BYTES) {
+                entry->blob = (unsigned char *)value;
+                entry->blob_len = value_length;
                 value = NULL;
             } else if (value_length == sizeof(uint32_t)) {
                 if (type == PREF_FLOAT)
@@ -3150,6 +3219,212 @@ static int64_t j_getPreferences(jctx *c)
 {
     (void)c;
     return (int64_t)(uintptr_t)preferences_object;
+}
+
+/* ---- kairo.android.plugin.Utility preference family ----------------------
+ * kairo.unity.io.RecordStore keeps every save slot as a preference entry, so
+ * these five calls are the game's whole persistence layer.  None of them was
+ * bound: Utility.getPreferenceKeys() answered NULL through the generic path,
+ * the managed reader maps empty/null to a null String[] and
+ * KairoPlugin.GetPreferenceKeys(array) raises NRE at il2cpp+0x17fc300 ->
+ * AppData.LoadSystem rethrows at il2cpp+0xe78210 -> Main catch ->
+ * "An error has occurred." (trapD12).  Behaviours below are 1:1 with
+ * classes.dex (via the kairovm reference model):
+ *   putPreference(String,byte[])  store bytes under key
+ *   getPreference(String)         -> byte[] / null when absent
+ *   existPreference(String)       -> 1/0
+ *   removePreference(String)
+ *   getPreferenceKeys()           -> join(',', StringUtil.escape(key))
+ *      escape = '"' + key with \ before , & @ \ + '"'   (never null)
+ * Also real: setNotificationFilter/setNotificationBackground -- on a device
+ * THESE are the writes that keep the store non-empty at boot, which the
+ * shipped reader depends on (empty string -> null -> Enumerable NRE). */
+
+static void pref_put_blob_locked(const char *key, const void *data,
+                                 uint32_t len)
+{
+    pref_entry *entry = pref_set_locked(key, PREF_BYTES);
+    if (!entry)
+        return;
+    entry->blob = malloc(len ? len : 1);
+    entry->blob_len = len;
+    if (len)
+        memcpy(entry->blob, data, len);
+    preferences_save_locked();
+}
+
+static const unsigned char *pref_find_blob_locked(const char *key,
+                                                  uint32_t *len)
+{
+    pref_entry *entry = pref_find_locked(key);
+    if (!entry || entry->type != PREF_BYTES)
+        return NULL;
+    *len = entry->blob_len;
+    return entry->blob;
+}
+
+static int64_t j_Utility_putPreference(jctx *c)
+{
+    jobj *key = jarg_obj(c);
+    jobj *bytes = jarg_obj(c);
+    if (!key || !key->str)
+        return 0;
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    pref_put_blob_locked(key->str, bytes ? bytes->data : NULL,
+                         bytes ? (uint32_t)bytes->len : 0);
+    pthread_mutex_unlock(&preferences_lock);
+    JT("Utility.putPreference(\"%s\", %d bytes)", key->str,
+       bytes ? bytes->len : 0);
+    return 0;
+}
+
+static int64_t j_Utility_getPreference(jctx *c)
+{
+    jobj *key = jarg_obj(c);
+    const char *k = key && key->str ? key->str : "";
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    uint32_t len = 0;
+    const unsigned char *blob = pref_find_blob_locked(k, &len);
+    jobj *out = NULL;
+    if (blob) {
+        out = j_NewByteArray(NULL, (int32_t)len);
+        if (len)
+            memcpy(out->data, blob, len);
+    }
+    pthread_mutex_unlock(&preferences_lock);
+    JT("Utility.getPreference(\"%s\") -> %s", k,
+       out ? "byte[]" : "null");
+    return (int64_t)(uintptr_t)out;
+}
+
+static int64_t j_Utility_existPreference(jctx *c)
+{
+    jobj *key = jarg_obj(c);
+    const char *k = key && key->str ? key->str : "";
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    int found = pref_find_locked(k) != NULL;
+    pthread_mutex_unlock(&preferences_lock);
+    JT("Utility.existPreference(\"%s\") -> %d", k, found);
+    return found;
+}
+
+static int64_t j_Utility_removePreference(jctx *c)
+{
+    jobj *key = jarg_obj(c);
+    if (!key || !key->str)
+        return 0;
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    int removed = pref_remove_locked(key->str);
+    if (removed)
+        preferences_save_locked();
+    pthread_mutex_unlock(&preferences_lock);
+    JT("Utility.removePreference(\"%s\") -> %d", key->str, removed);
+    return 0;
+}
+
+static int key_index_cmp(const void *a, const void *b)
+{
+    return strcmp(preferences[*(const int *)a].key,
+                  preferences[*(const int *)b].key);
+}
+
+static int64_t j_Utility_getPreferenceKeys(jctx *c)
+{
+    (void)c;
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    int idx[MAX_PREFS];
+    for (int i = 0; i < preferences_count; i++)
+        idx[i] = i;
+    qsort(idx, (size_t)preferences_count, sizeof(int), key_index_cmp);
+    size_t cap = 64;
+    for (int i = 0; i < preferences_count; i++)
+        cap += strlen(preferences[i].key) * 2 + 4;
+    char *out = malloc(cap);
+    size_t n = 0;
+    for (int i = 0; i < preferences_count; i++) {
+        const char *key = preferences[idx[i]].key;
+        if (i)
+            out[n++] = ',';
+        out[n++] = '"';
+        for (const char *p = key; *p; p++) {
+            if (*p == ',' || *p == '&' || *p == '@' || *p == '\\')
+                out[n++] = '\\';
+            out[n++] = *p;
+        }
+        out[n++] = '"';
+    }
+    out[n] = 0;
+    pthread_mutex_unlock(&preferences_lock);
+    JT("Utility.getPreferenceKeys() -> \"%s\"", out);
+    jobj *s = mk_string(out);
+    free(out);
+    return (int64_t)(uintptr_t)s;
+}
+
+/* the `_plugin_*` keys kairo.android.plugin.Utility maintains itself */
+static void pref_put_text(const char *key, const char *text)
+{
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    pref_put_blob_locked(key, text, (uint32_t)strlen(text));
+    pthread_mutex_unlock(&preferences_lock);
+}
+
+static int pref_read_text_int(const char *key, int dflt)
+{
+    char buf[32];
+    uint32_t len = 0;
+    pthread_mutex_lock(&preferences_lock);
+    preferences_load_locked();
+    const unsigned char *blob = pref_find_blob_locked(key, &len);
+    if (blob && len < sizeof buf) {
+        memcpy(buf, blob, len);
+        buf[len] = 0;
+        int v = atoi(buf);
+        pthread_mutex_unlock(&preferences_lock);
+        return v;
+    }
+    pthread_mutex_unlock(&preferences_lock);
+    return dflt;
+}
+
+static int64_t j_Utility_setNotificationFilter(jctx *c)
+{
+    int32_t level = jarg_int(c);
+    char text[16];
+    snprintf(text, sizeof text, "%d", level);
+    pref_put_text("_plugin_notification_level", text);
+    JT("Utility.setNotificationFilter(%d)", level);
+    return 0;
+}
+
+static int64_t j_Utility_getNotificationFilter_impl(jctx *c)
+{
+    (void)c;
+    int v = pref_read_text_int("_plugin_notification_level", 3);
+    JT("Utility.getNotificationFilter() -> %d", v);
+    return v;
+}
+
+static int64_t j_Utility_setNotificationBackground(jctx *c)
+{
+    int32_t on = jarg_int(c) != 0;
+    pref_put_text("_plugin_notification_background", on ? "1" : "0");
+    JT("Utility.setNotificationBackground(%d)", on);
+    return 0;
+}
+
+static int64_t j_Utility_getNotificationBackground(jctx *c)
+{
+    (void)c;
+    int v = pref_read_text_int("_plugin_notification_background", 0) == 1;
+    JT("Utility.getNotificationBackground() -> %d", v);
+    return v;
 }
 
 static int64_t j_Prefs_getBoolean(jctx *c)
@@ -4336,10 +4611,41 @@ void gds_jni_init(void)
                  (void *)j_Utility_getNotificationData);
     gds_jni_bind("kairo/android/plugin/Utility", "getNotificationFilter",
                  "(Ljava/lang/Object;)I",
-                 (void *)j_Utility_getNotificationFilter);
+                 (void *)j_Utility_getNotificationFilter_impl);
     gds_jni_bind("kairo/android/plugin/Utility", "getNotificationFilter",
                  "(Landroid/content/Context;)I",
-                 (void *)j_Utility_getNotificationFilter);
+                 (void *)j_Utility_getNotificationFilter_impl);
+    gds_jni_bind("kairo/android/plugin/Utility", "getNotificationFilter",
+                 "()I", (void *)j_Utility_getNotificationFilter_impl);
+    gds_jni_bind("kairo/android/plugin/Utility", "setNotificationFilter",
+                 "(I)V", (void *)j_Utility_setNotificationFilter);
+    gds_jni_bind("kairo/android/plugin/Utility",
+                 "getNotificationBackground", "()I",
+                 (void *)j_Utility_getNotificationBackground);
+    gds_jni_bind("kairo/android/plugin/Utility",
+                 "getNotificationBackground", "()Z",
+                 (void *)j_Utility_getNotificationBackground);
+    gds_jni_bind("kairo/android/plugin/Utility",
+                 "setNotificationBackground", "(I)V",
+                 (void *)j_Utility_setNotificationBackground);
+    gds_jni_bind("kairo/android/plugin/Utility",
+                 "setNotificationBackground", "(Z)V",
+                 (void *)j_Utility_setNotificationBackground);
+    /* RecordStore persistence: the game's whole save system */
+    gds_jni_bind("kairo/android/plugin/Utility", "putPreference",
+                 "(Ljava/lang/String;[B)V", (void *)j_Utility_putPreference);
+    gds_jni_bind("kairo/android/plugin/Utility", "setPreference",
+                 "(Ljava/lang/String;[B)V", (void *)j_Utility_putPreference);
+    gds_jni_bind("kairo/android/plugin/Utility", "getPreference",
+                 "(Ljava/lang/String;)[B", (void *)j_Utility_getPreference);
+    gds_jni_bind("kairo/android/plugin/Utility", "existPreference",
+                 "(Ljava/lang/String;)Z", (void *)j_Utility_existPreference);
+    gds_jni_bind("kairo/android/plugin/Utility", "existPreference",
+                 "(Ljava/lang/String;)I", (void *)j_Utility_existPreference);
+    gds_jni_bind("kairo/android/plugin/Utility", "removePreference",
+                 "(Ljava/lang/String;)V", (void *)j_Utility_removePreference);
+    gds_jni_bind("kairo/android/plugin/Utility", "getPreferenceKeys",
+                 "()Ljava/lang/String;", (void *)j_Utility_getPreferenceKeys);
     /* PackageManager / PackageInfo / Signature (anti-tamper chain) */
     gds_jni_bind("android/content/Context", "getPackageManager",
                  "()Landroid/content/pm/PackageManager;",

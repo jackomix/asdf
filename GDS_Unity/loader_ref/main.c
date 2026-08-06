@@ -265,7 +265,7 @@ int gds_load_modules(void)
  * restores the original instruction and resumes.  Device-safe: off unless
  * the env var is set. */
 struct probe { uintptr_t addr; uint32_t orig; int hit; int cap; int kind; const char *tag; };
-#define MAX_PROBES 96
+#define MAX_PROBES 192
 static struct probe g_probes[MAX_PROBES];
 static int g_nprobes;
 static int g_in_dump;
@@ -511,8 +511,18 @@ static void arm_traps(uintptr_t il2b)
         {0x186a6c0, "GetNumRecords.files",     20},
         {0xe76ab8, "AppData.Init.entry",       3},
         {0x186a868, "RecordStore.Setup.entry", 22},
-        {0xe73e38, "form.FormManager.GetInstance", 23},
+        {0x186d61c, "Storage.Open.entry",      24},
+        {0x186a8d0, "Setup.postOpen",          3},
         {0x186a8e4, "RecordStore.Setup.store", 21},
+        {0xcb0ddc, "raiseAORE.stub",          19},
+        /* Storage::GetFolder folder in {1,4}, Android branch: the path is
+         * cut out of the base path via LastIndexOf(strA)+5..LastIndexOf(strB)
+         * then Substring(start,len) -- AORE if either index is -1. */
+        {0x186d07c, "GetFolder.basepath",      25},
+        {0x186d0c0, "GetFolder.idx1",          26},
+        {0x186d0dc, "GetFolder.idx2",          27},
+        {0x186d0ec, "GetFolder.substring",     28},
+        {0x186d214, "GetFolder.result",        29},
         {0xd952b0, "cxa_throw",               13},
     };
     if (!getenv("GDS_TRAP_AT"))
@@ -530,7 +540,7 @@ static void arm_traps(uintptr_t il2b)
         g_probes[g_nprobes].addr = a;
         g_probes[g_nprobes].orig = *(uint32_t *)a;
         g_probes[g_nprobes].hit = 0;
-        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : (T[i].kind == 19 ? 4 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : 1));
+        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : (T[i].kind == 24 ? 12 : ((T[i].kind >= 25 && T[i].kind <= 29) ? 6 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : 1)));
         g_probes[g_nprobes].kind = T[i].kind;
         g_probes[g_nprobes].tag = T[i].tag;
         *(uint32_t *)a = 0xd4200000; /* brk #0 */
@@ -563,8 +573,10 @@ static void disarm_throw(void)
 
 static void arm_late_throw(uintptr_t va)
 {
-    if (g_nprobes >= MAX_PROBES)
+    if (g_nprobes >= MAX_PROBES) {
+        fprintf(stderr, "[trap] !! arm_late_throw: MAX_PROBES full\n");
         return;
+    }
     uintptr_t a = g_il2b + va;
     for (int i = 0; i < g_nprobes; i++)
         if (g_probes[i].addr == a) {
@@ -613,6 +625,17 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
             if ((p->cap ? (p->hit >= p->cap) : p->hit) || (uintptr_t)pc != p->addr)
                 continue;
             p->hit++;
+            if (p->kind == 98) {
+                /* transient step-over: re-arm the parent probe at addr-4,
+                 * then take the generic one-shot path for ourselves below */
+                uintptr_t t = p->addr - 4;
+                uintptr_t tpg = t & ~0xfffUL;
+                if (mprotect((void *)tpg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    *(uint32_t *)t = 0xd4200000;
+                    __builtin___clear_cache((char *)t, (char *)t + 4);
+                    mprotect((void *)tpg, 0x1000, PROT_READ | PROT_EXEC);
+                }
+            }
             g_in_dump = 1;
             uintptr_t x30 = (uintptr_t)u->uc_mcontext.regs[30];
             if (p->kind != 13)
@@ -741,10 +764,11 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 uintptr_t mra = (trap_ptr_ok(spv) && trap_mapped(spv))
                                 ? *(uintptr_t *)spv : 0;
                 if (!strstr(nm, "NullReference")) {
-                    /* runtime AORE spam: log a few, recycle the probe hit */
+                    /* runtime AORE spam: log a few; the hit still counts and
+                     * flow falls through to the step-over trampoline (an
+                     * early return here re-trapped the same brk forever). */
                     static int g_skip_seen;
-                    p->hit--;
-                    if (g_skip_seen < 24) {
+                    if (g_skip_seen < 4) {
                         g_skip_seen++;
                         fprintf(stderr,
                             "[trap]   throw-skip %s.%s ra=il2cpp+%#lx\n",
@@ -752,8 +776,6 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                             (unsigned long)(trap_ptr_ok(mra) && mra >= g_il2b
                                             ? mra - g_il2b : mra));
                     }
-                    g_in_dump = 0;
-                    return;
                 }
                 fprintf(stderr,
                         "[trap]   NRE[%d] %s.%s ra=il2cpp+%#lx thunk=il2cpp+%#lx\n",
@@ -880,6 +902,47 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 } else {
                     fprintf(stderr, "[trap]   stored value is NULL/invalid\n");
                 }
+            } else if (p->kind == 24) {
+                /* Storage::Open(folder=w0, w1, x2, x3): multi-hit marker */
+                fprintf(stderr,
+                        "[trap]   Storage.Open folder=%ld w1=%ld caller=il2cpp+%#lx\n",
+                        (long)u->uc_mcontext.regs[0],
+                        (long)u->uc_mcontext.regs[1],
+                        (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
+            } else if (p->kind == 25) {
+                /* GetFolder base-path dump: x20 = IApplication.statics[0]->+0xf0 */
+                char b1[600];
+                uintptr_t s = (uintptr_t)u->uc_mcontext.regs[20];
+                trap_il2str(s, b1, sizeof b1);
+                fprintf(stderr,
+                        "[trap]   GetFolder: folder(w19)=%ld basepath(x20)='%s'\n",
+                        (long)u->uc_mcontext.regs[19], b1);
+            } else if (p->kind == 26 || p->kind == 27) {
+                /* post-LastIndexOf: w0 = index; also dump the literal arg. */
+                unsigned long slotva = p->kind == 26 ? 0x1ed2170 : 0x1ed2158;
+                uintptr_t slot = g_il2b + slotva;
+                uintptr_t rec = trap_mapped(slot) ? *(uintptr_t *)slot : 0;
+                uintptr_t lit = (trap_ptr_ok(rec) && trap_mapped(rec))
+                                ? *(uintptr_t *)rec : 0;
+                char b1[300];
+                trap_il2str(lit, b1, sizeof b1);
+                fprintf(stderr,
+                        "[trap]   GetFolder: %s=%ld literal='%s'\n",
+                        p->kind == 26 ? "idx1" : "idx2",
+                        (long)(int)u->uc_mcontext.regs[0], b1);
+            } else if (p->kind == 28) {
+                /* Substring(x0=this, w1=start, w2=len) call site */
+                fprintf(stderr,
+                        "[trap]   GetFolder: Substring start=%ld len=%ld\n",
+                        (long)(int)u->uc_mcontext.regs[1],
+                        (long)(int)u->uc_mcontext.regs[2]);
+            } else if (p->kind == 29) {
+                /* GetFolder shared epilogue: x0 = x20 = final folder string */
+                char b1[600];
+                trap_il2str((uintptr_t)u->uc_mcontext.regs[0], b1, sizeof b1);
+                fprintf(stderr,
+                        "[trap]   GetFolder: result='%s' folder(w19)=%ld\n",
+                        b1, (long)u->uc_mcontext.regs[19]);
             } else if (p->kind == 21) {
                 /* RecordStore::Setup store site: str x8, [x9, #0x18] --
                  * x8 = Storage::Open(4,1,0,0) result parked in X.statics[0x18]. */
@@ -1010,8 +1073,36 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 }
             }
             g_in_dump = 0;
-            if (p->cap && p->hit < p->cap)
-                return; /* multi-hit: leave brk armed */
+            if (p->cap && p->hit < p->cap) {
+                /* multi-hit: restore our original insn and park a transient
+                 * one-shot at +4 that re-arms us -- the old "leave brk armed"
+                 * simply re-trapped the same instruction cap-times, which
+                 * slowed storm paths to a crawl. */
+                uintptr_t pg2 = p->addr & ~0xfffUL;
+                if (mprotect((void *)pg2, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    *(uint32_t *)p->addr = p->orig;
+                    __builtin___clear_cache((char *)p->addr, (char *)p->addr + 4);
+                    mprotect((void *)pg2, 0x1000, PROT_READ | PROT_EXEC);
+                }
+                if (g_nprobes < MAX_PROBES) {
+                    struct probe *q = &g_probes[g_nprobes];
+                    uintptr_t a = p->addr + 4;
+                    uintptr_t qpg = a & ~0xfffUL;
+                    if (mprotect((void *)qpg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                        q->addr = a;
+                        q->orig = *(uint32_t *)a;
+                        q->hit = 0;
+                        q->cap = 0;
+                        q->kind = 98;
+                        q->tag = "step-over";
+                        *(uint32_t *)a = 0xd4200000;
+                        __builtin___clear_cache((char *)a, (char *)a + 4);
+                        mprotect((void *)qpg, 0x1000, PROT_READ | PROT_EXEC);
+                        g_nprobes++;
+                    }
+                }
+                return; /* PC at probe addr -> original insn executes */
+            }
             uintptr_t pg = p->addr & ~0xfffUL;
             if (mprotect((void *)pg, 0x1000,
                          PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
@@ -1215,7 +1306,7 @@ int main(int argc, char **argv)
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.64.0-ref)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.65.0-ref)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
