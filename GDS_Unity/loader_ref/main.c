@@ -487,6 +487,7 @@ static void arm_traps(uintptr_t il2b)
         {0xe81260, "Main.catch.pathB-NRE",     11},
         /* OnUpdate try-body stage markers: last one before the catch = source */
         {0xe80ed8, "Main.stage.AppDataGetInstance", 3},
+        {0xe80ef8, "Main.armThrowLate",       16},
         {0xe80f38, "Main.stage.FMExecute",     3},
         {0xe80f5c, "Main.stage.jingleBlr",     3},
         {0xe80fac, "Main.stage.SetJingle",     3},
@@ -496,12 +497,20 @@ static void arm_traps(uintptr_t il2b)
         {0xe810c0, "Main.stage.setTargetFps",  3},
         /* native throw entry: fp-walk gives the null-check raise site */
         {0x1894cdc, "Substring.entry",         15},
+        {0x17b4160, "ex.qA",                   3},
+        {0x18574a0, "NM.ctor.PlayerPrefs",     3},
+        {0x18574e0, "NM.ctor.Split",           3},
+        {0x1857568, "NM.ctor.ListAdd",         3},
+        {0x1857598, "NM.ctor.GetFilter",       3},
+        {0x17fdf94, "GetFilter.runner-null-check", 17},
         {0xd952b0, "cxa_throw",               13},
     };
     if (!getenv("GDS_TRAP_AT"))
         return;
     g_il2b = il2b;
     for (size_t i = 0; i < sizeof T / sizeof *T && g_nprobes < MAX_PROBES; i++) {
+        if (T[i].kind == 13)
+            continue;   /* late-armed by the kind-16 marker (skip AORE storm) */
         uintptr_t a = il2b + T[i].va;
         uintptr_t pg = a & ~0xfffUL;
         if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC)) {
@@ -523,6 +532,27 @@ static void arm_traps(uintptr_t il2b)
     }
 }
 
+
+static void arm_late_throw(uintptr_t va)
+{
+    if (g_nprobes >= MAX_PROBES)
+        return;
+    uintptr_t a = g_il2b + va;
+    uintptr_t pg = a & ~0xfffUL;
+    if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC))
+        return;
+    g_probes[g_nprobes].addr = a;
+    g_probes[g_nprobes].orig = *(uint32_t *)a;
+    g_probes[g_nprobes].hit = 0;
+    g_probes[g_nprobes].cap = 8;
+    g_probes[g_nprobes].kind = 13;
+    g_probes[g_nprobes].tag = "cxa_throw(late)";
+    *(uint32_t *)a = 0xd4200000;
+    __builtin___clear_cache((char *)a, (char *)a + 4);
+    mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+    g_nprobes++;
+    fprintf(stderr, "[trap] late-armed cxa_throw\n");
+}
 
 static void on_fault(int sig, siginfo_t *si, void *uc)
 {
@@ -732,6 +762,9 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                         fprintf(stderr, "\n");
                     }
                 }
+            } else if (p->kind == 16) {
+                fprintf(stderr, "[trap] arming throw probe now\n");
+                arm_late_throw(0xd952b0);
             } else if (p->kind == 15) {
                 /* Substring(this=str, startIndex, length): show inputs */
                 char s2[620];
@@ -744,6 +777,33 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                         "[trap]   Substring(%ld, start=%ld, len=%ld)\n[trap]   src='%s'\n",
                         slen, (long)u->uc_mcontext.regs[1],
                         (long)u->uc_mcontext.regs[2], s2);
+            } else if (p->kind == 17) {
+                /* GetNotificationFilter: who owns statics[0] (UI runner)? */
+                uintptr_t slot = g_il2b + 0x1ecff90;
+                uintptr_t kla = trap_mapped(slot) ? *(uintptr_t *)slot : 0;
+                char b1[96], b2[96];
+                fprintf(stderr, "[trap]   klass@0x1ecff90 = %#lx",
+                        (unsigned long)kla);
+                if (trap_ptr_ok(kla) && trap_mapped(kla)) {
+                    fprintf(stderr, " %s.%s",
+                            trap_cstr(*(uintptr_t *)(kla + 0x18), b2, sizeof b2),
+                            trap_cstr(*(uintptr_t *)(kla + 0x10), b1, sizeof b1));
+                    uintptr_t st = *(uintptr_t *)(kla + 0xb8);
+                    fprintf(stderr, " statics=%#lx", (unsigned long)st);
+                    if (trap_ptr_ok(st) && trap_mapped(st)) {
+                        uintptr_t inst = *(uintptr_t *)st;
+                        fprintf(stderr, " [0]=%#lx", (unsigned long)inst);
+                        if (trap_ptr_ok(inst) && trap_mapped(inst)) {
+                            uintptr_t ik = *(uintptr_t *)inst;
+                            char c1[96], c2[96];
+                            if (trap_ptr_ok(ik) && trap_mapped(ik))
+                                fprintf(stderr, " (%s.%s)",
+                                        trap_cstr(*(uintptr_t *)(ik + 0x18), c2, sizeof c2),
+                                        trap_cstr(*(uintptr_t *)(ik + 0x10), c1, sizeof c1));
+                        }
+                    }
+                }
+                fprintf(stderr, "\n");
             } else if (p->kind == 14) {
                 /* raise-helper entry: x30 = codegen out-of-range check site */
                 fprintf(stderr, "[trap]   ra=il2cpp+%#lx",
@@ -1023,7 +1083,7 @@ int main(int argc, char **argv)
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.62.0-ref)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.63.0-ref)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
