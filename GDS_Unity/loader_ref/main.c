@@ -1378,7 +1378,19 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.87.0-fmodstate)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.88.0-fmodtrim)\n", gds_gamedir);
+    /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
+     * failed to fire because the runtime cfg lost its edits (redeploy wipes
+     * it) and there was no positive signal either way. */
+    {
+        const char *kn[] = { "GDS_TRAP_AT", "GDS_DPI", "GDS_TABLET",
+                             "GDS_FMOD_RATE", "GDS_FMOD_CH",
+                             "GDS_DIALOG_RESULT", NULL };
+        fprintf(stderr, "[gds] knobs:");
+        for (int i = 0; kn[i]; i++)
+            fprintf(stderr, " %s=%s", kn[i], getenv(kn[i]) ? getenv(kn[i]) : "-");
+        fprintf(stderr, "\n");
+    }
 
     gds_jni_init();
     gds_egl_init();

@@ -24,7 +24,7 @@ BRANCH="${GDS_BRANCH:-arena/019fd2ed-asdf}"
 # a stale one).  That closes the old failure mode where a cached copy of THIS
 # script validated a stale zip against a stale baked version and everything
 # looked "fine".  Set GDS_EXPECT_VER env to force a value manually.
-GDS_EXPECT_VER_BAKED="0.87.0-fmodstate"
+GDS_EXPECT_VER_BAKED="0.88.0-fmodtrim"
 GDS_EXPECT_VER_ENV="${GDS_EXPECT_VER:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
@@ -164,10 +164,15 @@ echo "Installing and running..."
   # NullGL loader still printing frames during the next test)
   pkill -9 -x loader2 2>/dev/null || true
   sleep 1
+  # 0.88: preserve the user's gds_env.cfg knob edits across redeploys --
+  # zip contents reset every switch otherwise (already cost us a test run:
+  # GDS_TRAP_AT/GDS_DPI were silently off during the 0.87.0 run)
+  [ -f '$PORTS_DIR/gamedevstory/gds_env.cfg' ] && cp '$PORTS_DIR/gamedevstory/gds_env.cfg' /tmp/gds_env.cfg.keep || true
   rm -rf '$PORTS_DIR/gamedevstory'
   cd '$PORTS_DIR'
   unzip -o gamedevstory.zip >/dev/null 2>&1
   rm -f gamedevstory.zip
+  [ -f /tmp/gds_env.cfg.keep ] && cp /tmp/gds_env.cfg.keep '$PORTS_DIR/gamedevstory/gds_env.cfg' && rm -f /tmp/gds_env.cfg.keep || true
   chmod +x '$PORTS_DIR/Game Dev Story.sh' '$PORTS_DIR/gamedevstory/loader2'
   echo '=== running launcher (background, '$RUN_SECONDS's) ==='
   nohup bash '$PORTS_DIR/Game Dev Story.sh' >/dev/null 2>&1 &

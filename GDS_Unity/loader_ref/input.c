@@ -783,6 +783,14 @@ static float inp_Screen_get_dpi(void) {
     HITF(14, "Screen.get_dpi");
     extern int gds_dpi_override(void);
     int ov = gds_dpi_override();
+    /* 0.88: report the value the game actually gets once -- the GDS_DPI tab
+     * test needs positive evidence in the log, not just the knob echo. */
+    static int dpi_logged;
+    if (!dpi_logged) {
+        dpi_logged = 1;
+        fprintf(stderr, "[input] Screen.get_dpi -> %d (GDS_DPI %s)\n",
+                ov > 0 ? ov : 160, getenv("GDS_DPI") ? "applied" : "unset, default");
+    }
     return ov > 0 ? (float)ov : 160.0f;
 }
 static int inp_Screen_get_autorotateToPortrait(void) { return 0; }

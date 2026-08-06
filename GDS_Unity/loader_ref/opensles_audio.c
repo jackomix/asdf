@@ -1241,17 +1241,42 @@ static void *fmod_java_thread(void *arg)
             if (!gds_jni_fmod_should_run()) break;
             usleep(4000);
         }
+        /* 0.88 (device evidence, 0.87.0 run): steady-state blocks came back
+         * EXACTLY 75% zeros every call (512 of 2048 frames real -- one FMOD
+         * dsp quantum per fmodProcess, rest zero-padded by readData) while
+         * the SDL side consumed the padding as if it were music: pitch was
+         * right (rate labelling worked) but the music dilated ~4x = user's
+         * "correct pitch, heavy stutter ... twice as slow".  Fix: find the
+         * REAL written span and ring only that.  The buffer must be zeroed
+         * BEFORE the call or stale bytes from the previous call forge span.
+         * Leading zeros are kept (genuine mixed silence, part of timing);
+         * only the unwritten tail is dropped.  All-zero call (title
+         * silence) pushes nothing -- the SDL callback memsets on underrun,
+         * which is the same silence. */
+        {
+            uint8_t *pcm_mut = (uint8_t *)gds_jni_fmod_pcm();
+            if (pcm_mut) memset(pcm_mut, 0, bufsz);
+        }
         int rc = proc(gds_jni_env(), gds_jni_fmod_device(),
                       gds_jni_fmod_bytebuffer());
         if (rc >= 0) {
             const unsigned char *pcm = gds_jni_fmod_pcm();
+            unsigned frame = (g_fmod_player && g_fmod_player->num_channels)
+                             ? g_fmod_player->num_channels * 2u : 4u;
+            /* written span: highest nonzero byte, rounded up to a frame */
+            unsigned written = 0;
+            for (unsigned i = bufsz; i-- > 0; ) {
+                if (pcm[i]) { written = (i + frame) / frame * frame; break; }
+                if (i == 0) break;
+            }
             /* content probe (0.86): 'first-boot music is high-pitched and
              * stuttery' -- classify the stream w/o guessing.  Zero-pad
              * fraction tells starvation (readData pads on underrun): ~50%
              * zeros = FMOD producing at half the rate we consume (i.e.
              * content labelled 22050 but played 44100 = octave-up + gaps);
              * 100% = mixer silent; near-0% with nonzero peaks = dense PCM
-             * and the problem is downstream (SDL/ALSA rate). */
+             * and the problem is downstream (SDL/ALSA rate).  0.88: also
+             * log the real written span (wr=) every probed block. */
             unsigned zeros = 0;
             int peak = 0;
             for (unsigned i = 0; i < bufsz; i += 2) {
@@ -1261,12 +1286,14 @@ static void *fmod_java_thread(void *arg)
                 if (a > peak) peak = a;
             }
             unsigned zpct = zeros * 100 / (bufsz / 2);
-            if (g_fmod_player)
-                ring_write(g_fmod_player, pcm, bufsz);
+            if (g_fmod_player && written) {
+                if (written > bufsz) written = bufsz;
+                ring_write(g_fmod_player, pcm, written);
+            }
             blocks++;
             if (blocks <= 20 || blocks % 60 == 0) {
-                fprintf(stderr, "[audio] fmod block #%lu (rc=%d %uB, fill=%u, zeros=%u%%, peak=%d)\n",
-                        blocks, rc, bufsz,
+                fprintf(stderr, "[audio] fmod block #%lu (rc=%d %uB wr=%uB, fill=%u, zeros=%u%%, peak=%d)\n",
+                        blocks, rc, bufsz, written,
                         g_fmod_player ? ring_readable(g_fmod_player) : 0,
                         zpct, peak);
                 fflush(stderr);
