@@ -258,6 +258,49 @@ int gds_load_modules(void)
 /* A fault inside a module we mapped ourselves has no symbols and no link map,
  * so the only way to place it is to print the PC against the module bases.
  * Always on: it costs nothing until something goes wrong. */
+/* 0.90: company-name "Index was outside the bounds of the array" fix.
+ * Evidence (0.89.0 run, [trap] FepPanel.result): GetFepPanelResult delivered
+ * String[1] {text} to FepPanel::Update, which requires Length>=2 ([0] =
+ * button marker, non-null means positive; [1] = text) -- its own bounds
+ * check at 0x17f4aac fires and Main.catch shows the error dialog.
+ * Root cause (disasm of the result-delivery UIMethod @0x1809498+): it
+ * allocates string[1] {text} (mov w1,#1; bl array_new) and hands that to
+ * the result delegate, which stores it verbatim.  The game's own legacy
+ * text-panel path produces {t,t}; on a real device the delegate's compat
+ * transform clearly ends up with the same >=2 shape.  Patch the delivery
+ * to the game's own shape:
+ *   0x180959c  mov w1,#1  -> mov w1,#2        (allocate string[2])
+ *   0x18095dc  cbz x20,#NRE -> str x19,[x21,#0x28]  (elem[1] = text)
+ * The replaced cbz only guarded "delegate == null", a state that NREs on
+ * the very next invoke anyway, so no real behavior is lost. */
+static void arm_fep_fix(uintptr_t il2b)
+{
+    static const struct { uint32_t va; uint32_t expect; uint32_t patch;
+                          const char *what; } P[] = {
+        {0x180959c, 0x52800021u, 0x52800041u, "fep result: string[2] alloc"},
+        {0x18095dc, 0xB4000214u, 0xF90016B3u, "fep result: elem[1] = text"},
+    };
+    for (size_t i = 0; i < sizeof P / sizeof *P; i++) {
+        uintptr_t a = il2b + P[i].va;
+        uintptr_t pg = a & ~0xfffUL;
+        if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            fprintf(stderr, "[fix] %s: mprotect fail (SKIPPED)\n", P[i].what);
+            continue;
+        }
+        uint32_t cur = *(volatile uint32_t *)a;
+        if (cur != P[i].expect) {
+            fprintf(stderr, "[fix] %s: word %#x != expected %#x (SKIPPED, lib mismatch?)\n",
+                    P[i].what, cur, P[i].expect);
+            mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+            continue;
+        }
+        *(uint32_t *)a = P[i].patch;
+        __builtin___clear_cache((char *)a, (char *)a + 4);
+        mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+        fprintf(stderr, "[fix] applied %s @ il2cpp+%#x\n", P[i].what, P[i].va);
+    }
+}
+
 /* ---------------- one-shot brk probes (managed exception catcher) ---------
  * GDS_TRAP_AT=1 arms brk#0 patches over IApplication::Error and every
  * Kairosoft *Exception ctor in libil2cpp.so.  On SIGTRAP the handler dumps
@@ -1442,7 +1485,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.89.0-fepprobe)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.90.0-fepfix)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */
@@ -1481,6 +1524,7 @@ int main(int argc, char **argv)
     if (getenv("GDS_DEBUGBASE"))
         fprintf(stderr, "[gds] DEBUGBASE il2cpp=%p unity=%p main=%p\n",
                 (void *)il2->base, (void *)uni->base, (void *)main_mod->base);
+    arm_fep_fix((uintptr_t)il2->base);   /* always-on; not a probe */
     arm_traps((uintptr_t)il2->base);
 
     /* System.load(libmain.so): its constructors run before JNI_OnLoad. */
