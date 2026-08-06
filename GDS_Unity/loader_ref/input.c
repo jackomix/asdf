@@ -760,24 +760,43 @@ static int il_resolve(void) {
     return g_il_ready;
 }
 
-/* Locate (ns, name) across EVERY loaded image -- 0.79's CoreModule-only
- * filter missed UnityEngine.Input, which lives in
- * UnityEngine.InputLegacyModule.dll under this 2022.3 player (verifiable in
- * global-metadata).  Returns the class; logs the image it came from. */
-static void *il_find_class_anywhere(const char *ns, const char *name,
-                                    const char **out_image) {
+/* Locate (ns, name) in the FIRST image whose name matches one of the
+ * candidates (list of substring markers, NULL-terminated).  0.79's blind
+ * CoreModule-only filter missed UnityEngine.Input (it lives in
+ * UnityEngine.InputLegacyModule.dll in this 2022.3 player -- verified in
+ * global-metadata), but 0.80's naive scan of every image died inside the
+ * il2cpp runtime (SIGSEGV class+0x135 NULL deref on some image at frame 0 --
+ * loader.log crash dump).  So: name-filtered scans only, evidence-based
+ * image names, and step logging so any future fault is attributable from
+ * port_launch.log. */
+static void *il_find_class_in(const char *const *candidates, const char *ns,
+                              const char *name, const char **out_image,
+                              int step_log) {
     void *dom = il_domain_get();
     if (!dom) return NULL;
+    if (step_log) fprintf(stderr, "[input] step: domain_get_assemblies\n");
     size_t n = 0;
     const void **asms = il_domain_get_assemblies(dom, &n);
-    for (size_t i = 0; asms && i < n; i++) {
-        void *img = il_assembly_get_image(asms[i]);
-        if (!img) continue;
-        void *c = il_class_from_name(img, ns, name);
-        if (c) {
-            if (out_image)
-                *out_image = il_image_get_name ? il_image_get_name(img) : "?";
-            return c;
+    if (step_log) fprintf(stderr, "[input] step: %zu assemblies\n", n);
+    for (int c = 0; candidates[c]; c++) {
+        for (size_t i = 0; asms && i < n; i++) {
+            void *img = il_assembly_get_image(asms[i]);
+            if (!img) continue;
+            if (step_log && c == 0)
+                fprintf(stderr, "[input] step: image_get_name(%zu/%zu)\n", i, n);
+            const char *in = il_image_get_name ? il_image_get_name(img) : NULL;
+            if (step_log && c == 0)
+                fprintf(stderr, "[input] step:   image #%zu = '%s'\n",
+                        i, in ? in : "(null)");
+            if (!in || !strstr(in, candidates[c])) continue;
+            if (step_log)
+                fprintf(stderr, "[input] step: class_from_name(%s, %s, %s)\n",
+                        in, ns, name);
+            void *k = il_class_from_name(img, ns, name);
+            if (k) {
+                if (out_image) *out_image = in;
+                return k;
+            }
         }
     }
     return NULL;
@@ -841,12 +860,15 @@ static void set_landscape_game(void) {
         fprintf(stderr, "[input] LANDSCAPE_GAME: field APIs missing\n");
         return;
     }
+    static const char *const cfg_imgs[] = { "KairoLibrary", NULL };
     const char *img = "?";
-    void *kcfg = il_find_class_anywhere("kairo.common.cfg", "Config", &img);
+    void *kcfg = il_find_class_in(cfg_imgs, "kairo.common.cfg", "Config",
+                                  &img, 1);
     if (!kcfg) {
         fprintf(stderr, "[input] LANDSCAPE_GAME: kairo.common.cfg.Config NOT FOUND\n");
         return;
     }
+    fprintf(stderr, "[input] step: walk Config fields (%s)\n", img);
     void *field = NULL;
     void *iter = NULL;
     for (void *f = il_class_get_fields(kcfg, &iter); f;
@@ -861,6 +883,8 @@ static void set_landscape_game(void) {
     unsigned char before = 0xee, after = 0xee, one = 1;
     if (il_field_static_get_value)
         il_field_static_get_value(field, &before);
+    fprintf(stderr, "[input] step: LANDSCAPE_GAME static_set_value (before=%u)\n",
+            before);
     il_field_static_set_value(field, &one);
     if (il_field_static_get_value)
         il_field_static_get_value(field, &after);
@@ -877,11 +901,24 @@ static void try_install_hooks(void) {
         pp = 1;
         fprintf(stderr, "[input] il2cpp runtime ready; installing input hooks\n");
     }
+    static int attempts;
+    int sl = attempts < 3;   /* rich step logging for crash attribution */
+    attempts++;
+    /* verified image locations (global-metadata, 2022.3.62f2 il2cpp):
+     * Input/InputUnsafeUtility -> UnityEngine.InputLegacyModule.dll;
+     * Screen -> UnityEngine.CoreModule.dll */
+    static const char *const legacy_imgs[] = { "InputLegacy", "CoreModule", NULL };
+    static const char *const core_imgs[] = { "CoreModule", NULL };
     const char *img_i = "?", *img_u = "?", *img_s = "?";
-    void *k_input = il_find_class_anywhere("UnityEngine", "Input", &img_i);
-    void *k_unsafe = il_find_class_anywhere("UnityEngine.Internal",
-                                            "InputUnsafeUtility", &img_u);
-    void *k_screen = il_find_class_anywhere("UnityEngine", "Screen", &img_s);
+    if (sl) fprintf(stderr, "[input] step: locate UnityEngine.Input\n");
+    void *k_input = il_find_class_in(legacy_imgs, "UnityEngine", "Input",
+                                     &img_i, sl);
+    if (sl) fprintf(stderr, "[input] step: locate InputUnsafeUtility\n");
+    void *k_unsafe = il_find_class_in(legacy_imgs, "UnityEngine.Internal",
+                                      "InputUnsafeUtility", &img_u, sl);
+    if (sl) fprintf(stderr, "[input] step: locate UnityEngine.Screen\n");
+    void *k_screen = il_find_class_in(core_imgs, "UnityEngine", "Screen",
+                                      &img_s, sl);
     if (!k_input) {
         static int miss_logged;
         if (!miss_logged) {
@@ -890,10 +927,13 @@ static void try_install_hooks(void) {
         }
         return;
     }
+    if (sl) fprintf(stderr, "[input] step: set LANDSCAPE_GAME\n");
     set_landscape_game();
 
-    if (!g_empty_ilstr && il_string_new)
+    if (!g_empty_ilstr && il_string_new) {
+        if (sl) fprintf(stderr, "[input] step: il2cpp_string_new(\"\")\n");
         g_empty_ilstr = il_string_new("");
+    }
 
     int got = 0, total = 0;
     static char hooklog[4096];
