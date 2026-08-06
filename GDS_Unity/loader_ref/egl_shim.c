@@ -429,8 +429,41 @@ static void gds_capture_real_egl(void) {
       }
       if (fc && r_eglDestroyContext) r_eglDestroyContext(g_real_dpy, fc);
     }
-    /* NB: no share-root restore here -- capture now runs AFTER the SDL GL
-     * identity snapshot, and create_window finishes with an SDL unbind. */
+
+    /* 0.72 Phase B: SDL's OWN present route with distinct colors (C/M/Y).
+     * Device 0.71: raw swaps "succeed" (ok=1) with real rendered content in
+     * the backbuffer (preswap pixels 4b6791/19407a/2c44a0) yet the panel
+     * NEVER changes -- not even our own flash.  If SDL_GL_SwapWindow also
+     * flashes nothing, the SDL KMSDRM window/display plumbing itself is dead
+     * on this stack (the fmt-ladder "window failed" saga) and the fix is to
+     * route around SDL's window entirely.  User distinguishes by color:
+     * R/G/B = raw route, C/M/Y = SDL route. */
+    if (egl_window && egl_share_root && S.GL_SwapWindow &&
+        g_raw_glClear && g_raw_glClearColor) {
+      /* force a REAL rebind: SDL_GL_MakeCurrent early-outs when it thinks
+       * the context is already current, but Phase A unbound EGL beneath it */
+      if (S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, NULL);
+      if (S.GL_MakeCurrent && S.GL_MakeCurrent(egl_window, egl_share_root) == 0) {
+        static const float bcols[3][3] = { {0,1,1}, {1,0,1}, {1,1,0} };
+        for (int i = 0; i < 3; i++) {
+          g_raw_glClearColor(bcols[i][0], bcols[i][1], bcols[i][2], 1.0f);
+          g_raw_glClear(0x4000 /*GL_COLOR_BUFFER_BIT*/);
+          S.GL_SwapWindow(egl_window);
+          const char *e = S.GetError ? S.GetError() : 0;
+          int ge = g_raw_glGetError ? g_raw_glGetError() : -1;
+          fprintf(stderr, "[egl] SDL flash %d/3 glerr=0x%x sdlerr='%s'\n",
+                  i + 1, ge, (e && *e) ? e : "(none)");
+          struct timespec ts = { 0, 300000000 };
+          nanosleep(&ts, NULL);
+        }
+      } else {
+        fprintf(stderr, "[egl] SDL flash: rebind share root failed: %s\n",
+                S.GetError ? S.GetError() : "?");
+      }
+      S.GL_MakeCurrent(egl_window, NULL);
+    }
+    /* NB: capture runs AFTER the SDL GL identity snapshot; create_window
+     * finishes its own bookkeeping below (final state: nothing current). */
   }
 }
 
@@ -706,6 +739,9 @@ void egl_shim_create_window(void) {
     if (S.GetDesktopDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0) {
       width = mode.w; height = mode.h;
     }
+    printf("[egl] SDL desktop mode %dx%d@%d fmt=0x%x drv=%s\n",
+           mode.w, mode.h, mode.refresh_rate, mode.format,
+           S.GetCurrentVideoDriver ? S.GetCurrentVideoDriver() : "?");
   }
   if (width <= 0) width = 640;
   if (height <= 0) height = 480;
