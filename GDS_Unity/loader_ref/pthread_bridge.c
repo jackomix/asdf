@@ -20,6 +20,7 @@
 
 #define _GNU_SOURCE
 #include <stdlib.h>
+#include "musl_compat.h"
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>

@@ -13,6 +13,8 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "jni_cert.h"
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -29,7 +31,12 @@
 
 int gds_trace_jni = 0;
 
-#define JT(...) do { if (gds_trace_jni) nx_log("jni: " __VA_ARGS__); } while (0)
+/* JT used to go through nx_log which is itself gated on GDS_VERBOSE -- so
+ * GDS_JNILOG=1 alone silently printed nothing (another swallowed-trace trap).
+ * Log JT independently, straight to stderr. */
+#define JT(...) do { if (gds_trace_jni) { \
+    fprintf(stderr, "[jni] " __VA_ARGS__); \
+    fputc('\n', stderr); fflush(stderr); } } while (0)
 
 /* ------------------------------------------------------------- object model */
 
@@ -1408,6 +1415,1333 @@ static int64_t j_Unity_currentActivity(jctx *c)
     return (int64_t)(uintptr_t)armory_activity_object;
 }
 
+/* Kairosoft's native-dialog utility.  Unhandled, it used to return 0 with no
+ * trace; six frames later Unity's nativeRender returned keep=0 (quit).  Log
+ * the dialog payload so we can see what the game is asking/telling, and keep
+ * the return observable.  GDS_DIALOG_RESULT=n overrides the answer for
+ * experiments. */
+/* Utility.getScaleRatio(w,h,gameW,gameH): Kairosoft's letterbox scale.  The
+ * unhandled 0.0f was followed by their generic "An error has occurred." dialog
+ * (type 0) and a quit -- on a device this returns ~1-2.  Compute it like the
+ * plugin does (fit ratio) and log the args once for verification. */
+static int64_t float_bits(float f);
+static int64_t j_Kairo_getScaleRatio(jctx *c)
+{
+    int gw = jarg_int(c), gh = jarg_int(c), m1 = jarg_int(c), m2 = jarg_int(c);
+    /* 2.6.9 dex ground truth:
+     *   w = display.getWidth();  h = display.getHeight();
+     *   if (w > h) h = realSize.y;                 // landscape raw height
+     *   if (getSystemBarHeight() > 0) h -= bar;    // 0 here (fullscreen)
+     *   ratio = min((w+m1)*100/gw, (h+m2)*100/gh)
+     * The magic 1120403456 in the dex is the float 100.0 -- the result is a
+     * PERCENTAGE.  Unhandled 0.0f / 1.0f made the Kairosoft canvas compute
+     * ~0/1% scale -> degenerate layout -> "An error has occurred." (run28).
+     * Real window here: 640x480 (w>h branch -> h stays 480). */
+    float w = 640.0f, h = 480.0f;
+    float ratio = 100.0f;
+    if (gw > 0 && gh > 0) {
+        float rw = (w + m1) * 100.0f / (float)gw;
+        float rh = (h + m2) * 100.0f / (float)gh;
+        ratio = rw < rh ? rw : rh;
+    }
+    JT("getScaleRatio(%d,%d,%d,%d) -> %f", gw, gh, m1, m2, ratio);
+    return float_bits(ratio);
+}
+
+/* Utility.getNotificationData(): Kairosoft's pending-notification payload.
+ * APK decompile (2.6.9 classes.dex, kairo/android/plugin/Utility):
+ *   Preference p = Preference.get(currentActivity,
+ *                                 "_plugin_notification_data");
+ *   if (p != null) { ...parse lines... return String[n]; }
+ *   else           { return new String[0]; }
+ * It NEVER returns null.  Our unhandled NULL made the managed boot NRE and
+ * pop the generic "An error has occurred." dialog, then nativeRender keep=0
+ * quit at frame 6 (qemu run13).  Return a real empty String array. */
+static int64_t j_Utility_getNotificationData(jctx *c)
+{
+    (void)c;
+    jobj *arr = j_NewObjectArray(NULL, 0, mk_class("java/lang/String"), NULL);
+    if (arr)
+        arr->cls = "[Ljava/lang/String;";
+    JT("Utility.getNotificationData() -> String[0] (empty)");
+    return (int64_t)(uintptr_t)arr;
+}
+
+/* Utility.getNotificationFilter(ctx): APK decompile shows the preference
+ * "_plugin_notification_level" defaults to 3 when absent (also 3 on
+ * exception).  Our old unhandled 0 was off-spec. */
+static int64_t j_Utility_getNotificationFilter(jctx *c)
+{
+    (void)c;
+    JT("Utility.getNotificationFilter() -> 3 (plugin default)");
+    return 3;
+}
+
+/* Utility.getPackageName(): plugin decompile --
+ *   return UnityPlayer.currentActivity.getPackageName();
+ * Returning NULL (old unhandled path) is what a null Context would give and
+ * made the managed side NRE during KairoPlugin.Init (run14/23). */
+static int64_t j_Utility_getPackageName(jctx *c)
+{
+    (void)c;
+    JT("Utility.getPackageName() -> net.kairosoft.android.gamedev3en");
+    return (int64_t)(uintptr_t)mk_string(
+        "net.kairosoft.android.gamedev3en");
+}
+
+/* Utility.getAppWidth()/getAppHeight(): plugin decompile --
+ *   wm.getDefaultDisplay().getMetrics(displayMetrics_);
+ *   return displayMetrics_.widthPixels / .heightPixels;
+ * Unhandled, both returned 0 -- observed flowing straight into
+ * getScaleRatio(240,240,0,0) and the Kairosoft app-size math broke (run23).
+ * The real window on the target is 640x480 landscape (matches the
+ * DisplayMetrics chain we already serve). */
+static int64_t j_Utility_getAppWidth(jctx *c)
+{
+    (void)c;
+    JT("Utility.getAppWidth() -> 640");
+    return 640;
+}
+static int64_t j_Utility_getAppHeight(jctx *c)
+{
+    (void)c;
+    JT("Utility.getAppHeight() -> 480");
+    return 480;
+}
+
+/* Plugin also exposes getWidth()/getHeight() (width==appWidth; height ==
+ * appHeight - statusBar(0 for the fullscreen game)).  Same emulated values. */
+static int64_t j_Utility_getWidth(jctx *c)
+{
+    (void)c;
+    JT("Utility.getWidth() -> 640");
+    return 640;
+}
+static int64_t j_Utility_getHeight(jctx *c)
+{
+    (void)c;
+    JT("Utility.getHeight() -> 480");
+    return 480;
+}
+
+/* inventory callback helpers for gds_managed_stacktrace */
+static const char *(*g_inv_cgn)(void *);
+static const char *(*g_inv_cgns)(void *);
+static void *(*g_inv_cgm)(void *, void **);
+static const char *(*g_inv_mgn)(void *);
+static int g_inv_shown;
+
+static void gds_inv_report(void *klass, void *user)
+{
+    (void)user;
+    if (!klass || g_inv_shown >= 220)
+        return;
+    const char *ns = g_inv_cgns(klass);
+    const char *name = g_inv_cgn(klass);
+    if (!ns || !name)
+        return;
+    if (!strstr(ns, "kairo") && !strstr(ns, "Kairo"))
+        return;
+    fprintf(stderr, "  class %s.%s:\n    ", ns, name);
+    g_inv_shown++;
+    if (g_inv_cgm && g_inv_mgn) {
+        void *iter = NULL, *mi;
+        int shown = 0;
+        while (shown < 40 && (mi = g_inv_cgm(klass, &iter)) != NULL) {
+            fprintf(stderr, "%s%s", shown ? ", " : "", g_inv_mgn(mi));
+            shown++;
+        }
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* ---- managed stack trace via the exported il2cpp embedding API ----------
+ * libil2cpp.so exports il2cpp_domain_get / class_from_name / runtime_invoke
+ * (241 il2cpp_* symbols).  When the game pops its generic error dialog we
+ * invoke System.Environment.get_StackTrace() to learn the managed call
+ * chain that led there; otherwise the cause is invisible in a release build
+ * that never writes logcat. */
+static void gds_managed_stacktrace(const char *why)
+{
+    nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+    if (!il2cpp)
+        return;
+    void *(*domain_get)(void) = nx_lookup_in(il2cpp, "il2cpp_domain_get");
+    void **(*domain_get_assemblies)(void *, size_t *) =
+        nx_lookup_in(il2cpp, "il2cpp_domain_get_assemblies");
+    void *(*assembly_get_image)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_assembly_get_image");
+    void *(*class_from_name)(void *, const char *, const char *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_from_name");
+    void *(*class_get_method_from_name)(void *, const char *, int) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_method_from_name");
+    void *(*runtime_invoke)(void *, void *, void **, void **) =
+        nx_lookup_in(il2cpp, "il2cpp_runtime_invoke");
+    uint16_t *(*string_chars)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_string_chars");
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image ||
+        !class_from_name || !class_get_method_from_name || !runtime_invoke ||
+        !string_chars) {
+        fprintf(stderr, "[gds] stacktrace: il2cpp API incomplete\n");
+        return;
+    }
+    void *domain = domain_get();
+    size_t count = 0;
+    void **assemblies = domain_get_assemblies(domain, &count);
+    fprintf(stderr, "[gds] managed stack (%s), %zu assemblies:\n",
+            why ? why : "?", count);
+
+    /* find System.Diagnostics.StackTrace in any image */
+    void *st_class = NULL;
+    for (size_t i = 0; i < count && !st_class; i++) {
+        void *image = assembly_get_image(assemblies[i]);
+        if (image)
+            st_class = class_from_name(image, "System.Diagnostics",
+                                       "StackTrace");
+    }
+    if (!st_class) {
+        fprintf(stderr, "[gds] stacktrace: System.Diagnostics.StackTrace"
+                        " class not found\n");
+        return;
+    }
+    /* One-time method inventory: the exact member names differ across Unity
+     * versions and the class metadata is all we have to go on. */
+    {
+        void *(*class_get_methods)(void *, void **) =
+            nx_lookup_in(il2cpp, "il2cpp_class_get_methods");
+        const char *(*method_get_name)(void *) =
+            nx_lookup_in(il2cpp, "il2cpp_method_get_name");
+        static int dumped;
+        if (class_get_methods && method_get_name && !dumped) {
+            dumped = 1;
+            void *iter = NULL;
+            void *mi;
+            fprintf(stderr, "[gds] stacktrace: StackTrace methods:");
+            int shown = 0;
+            while (shown < 64 &&
+                   (mi = class_get_methods(st_class, &iter)) != NULL) {
+                fprintf(stderr, "%s%s", shown ? ", " : "\n  ",
+                        method_get_name(mi));
+                shown++;
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+    /* runtime_invoke on StackTrace's ctor segfaults inside libil2cpp
+     * (both overloads, both arg sets -- observed).  Inventory instead:
+     * enumerate kairo.unity* classes and their methods; the class list tells
+     * us which subsystem could have raised the error dialog. */
+    void (*class_for_each)(void (*)(void *, void *), void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_for_each");
+    const char *(*class_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_name");
+    const char *(*class_get_namespace)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_namespace");
+    (void)st_class;
+    if (!class_for_each || !class_get_name || !class_get_namespace) {
+        fprintf(stderr, "[gds] stacktrace: class_for_each unavailable\n");
+        return;
+    }
+    static int inventoried;
+    if (getenv("GDS_KAIRO_INV") && !inventoried) {
+        inventoried = 1;
+        void *(*class_get_methods)(void *, void **) =
+            nx_lookup_in(il2cpp, "il2cpp_class_get_methods");
+        const char *(*method_get_name)(void *) =
+            nx_lookup_in(il2cpp, "il2cpp_method_get_name");
+        fprintf(stderr, "[gds] kairo.unity class inventory:\n");
+        g_inv_cgn = class_get_name;
+        g_inv_cgns = class_get_namespace;
+        g_inv_cgm = class_get_methods;
+        g_inv_mgn = method_get_name;
+        g_inv_shown = 0;
+        class_for_each(gds_inv_report, NULL);
+        fprintf(stderr, "[gds] kairo.unity inventory end (%d classes)\n",
+                g_inv_shown);
+        fflush(stderr);
+    }
+    (void)class_for_each;
+
+    /* Proper managed stack trace.  Earlier attempts invoked the StackTrace
+     * ctor with obj=NULL -- ctors need a real instance -- which segfaulted in
+     * libil2cpp twice.  This uses il2cpp_object_new + 0-arg .ctor. */
+    void *(*object_new)(void *) = nx_lookup_in(il2cpp, "il2cpp_object_new");
+    static int trace_done;
+    if (!object_new || trace_done)
+        return;
+    trace_done = 1;
+    void *ctor0 = class_get_method_from_name(st_class, ".ctor", 0);
+    void *get_frame = class_get_method_from_name(st_class, "GetFrame", 1);
+    void *get_frame_count =
+        class_get_method_from_name(st_class, "get_FrameCount", 0);
+    if (!ctor0 || !get_frame || !get_frame_count) {
+        fprintf(stderr, "[gds] stacktrace: missing members (ctor0=%p"
+                        " GetFrame=%p frame_count=%p)\n",
+                ctor0, get_frame, get_frame_count);
+        return;
+    }
+    void *st = object_new(st_class);
+    void *exc = NULL;
+    runtime_invoke(ctor0, st, NULL, &exc);
+    if (exc) {
+        fprintf(stderr, "[gds] stacktrace: ctor threw %p\n", exc);
+        return;
+    }
+    exc = NULL;
+    void *fc_box = runtime_invoke(get_frame_count, st, NULL, &exc);
+    if (!fc_box || exc) {
+        fprintf(stderr, "[gds] stacktrace: frame_count failed (exc=%p)\n",
+                exc);
+        return;
+    }
+    int frames = *(int *)((char *)fc_box + 0x18);
+    if (frames < 0 || frames > 96)
+        frames = 96;
+    void *sf_class = NULL;
+    for (size_t i = 0; i < count && !sf_class; i++) {
+        void *image = assembly_get_image(assemblies[i]);
+        if (image)
+            sf_class = class_from_name(image, "System.Diagnostics",
+                                       "StackFrame");
+    }
+    void *get_method = sf_class
+        ? class_get_method_from_name(sf_class, "GetMethod", 0) : NULL;
+    void *sf_to_string = sf_class
+        ? class_get_method_from_name(sf_class, "ToString", 0) : NULL;
+    static void *get_decltype, *get_name_m, *type_get_fullname;
+    if (!get_name_m) {
+        for (size_t i = 0; i < count; i++) {
+            void *image = assembly_get_image(assemblies[i]);
+            if (!image)
+                continue;
+            void *mc = class_from_name(image, "System.Reflection",
+                                       "MemberInfo");
+            if (mc && !get_name_m)
+                get_name_m = class_get_method_from_name(mc, "get_Name", 0);
+            void *tc = class_from_name(image, "System", "Type");
+            if (tc && !type_get_fullname)
+                type_get_fullname =
+                    class_get_method_from_name(tc, "get_FullName", 0);
+            void *mbc = class_from_name(image, "System.Reflection",
+                                        "MethodBase");
+            if (mbc && !get_decltype)
+                get_decltype = class_get_method_from_name(
+                    mbc, "get_DeclaringType", 0);
+        }
+    }
+    for (int f = 0; f < frames; f++) {
+        int idx = f;
+        void *fa[1] = { &idx };
+        exc = NULL;
+        void *frame = runtime_invoke(get_frame, st, fa, &exc);
+        if (!frame || exc)
+            break;
+        /* StackFrame.ToString() */
+        exc = NULL;
+        void *ts = sf_to_string
+            ? runtime_invoke(sf_to_string, frame, NULL, &exc) : NULL;
+        exc = NULL;
+        void *mb = get_method
+            ? runtime_invoke(get_method, frame, NULL, &exc) : NULL;
+        char nbuf[256] = "", tbuf[512] = "", sbuf[1024] = "";
+        uint16_t *ch;
+        size_t n;
+        ch = ts ? string_chars(ts) : NULL;
+        for (n = 0; ch && ch[n] && n + 1 < sizeof sbuf; n++)
+            sbuf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+        sbuf[n] = 0;
+        if (mb) {
+            exc = NULL;
+            void *name_s = get_name_m
+                ? runtime_invoke(get_name_m, mb, NULL, &exc) : NULL;
+            exc = NULL;
+            void *dt = get_decltype
+                ? runtime_invoke(get_decltype, mb, NULL, &exc) : NULL;
+            exc = NULL;
+            void *full_s = (dt && type_get_fullname)
+                ? runtime_invoke(type_get_fullname, dt, NULL, &exc) : NULL;
+            ch = name_s ? string_chars(name_s) : NULL;
+            for (n = 0; ch && ch[n] && n + 1 < sizeof nbuf; n++)
+                nbuf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+            nbuf[n] = 0;
+            ch = full_s ? string_chars(full_s) : NULL;
+            for (n = 0; ch && ch[n] && n + 1 < sizeof tbuf; n++)
+                tbuf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+            tbuf[n] = 0;
+        }
+        fprintf(stderr, "  at %s.%s ()%s%s\n", tbuf, nbuf,
+                sbuf[0] ? "  [" : "", sbuf[0] ? sbuf : "");
+        if (sbuf[0])
+            fprintf(stderr, "     toString: %s\n", sbuf);
+    }
+    fflush(stderr);
+}
+
+/* String.getBytes([charset]): the Kairosoft plugin's Preference class calls
+ * String.valueOf(byte).getBytes() and getBytes(charset) when (de)serializing
+ * tiny prefs blobs; NULL (the old unhandled answer) NPEs inside their code.
+ * Charset name is ignored deliberately: ASCII/UTF-8 identity mapping covers
+ * everything the plugin encodes (Base64 alphabet, digits). */
+static int64_t j_String_getBytes(jctx *c)
+{
+    const char *lp = strchr(c->m->sig, 'L');
+    if (lp && lp < strchr(c->m->sig, ')'))
+        (void)jarg_obj(c);   /* charset name arg of the (String)[B overload */
+    const char *s = c->self && c->self->str ? c->self->str : "";
+    jobj *arr = j_NewByteArray(NULL, (int32_t)strlen(s));
+    memcpy(arr->data, s, (size_t)arr->len);
+    JT("String.getBytes(\"%s\") -> [%d bytes]", s, arr->len);
+    return (int64_t)(uintptr_t)arr;
+}
+
+/* ---- kairo-state sweep: find the exception behind the error dialog ----
+ * The managed exception text never reaches logcat (release build strips
+ * Log.GetThrowableLog output to "").  But the thrower almost always keeps
+ * state: sweep every kairo.unity.* class' static fields for objects whose
+ * class name contains "Exception" and print their message via the exported
+ * il2cpp API.  Also print static string fields named like error/message. */
+typedef struct {
+    void *mod;
+    void *(*object_get_class)(void *);
+    const char *(*class_get_name)(void *);
+    const char *(*class_get_namespace)(void *);
+    void *(*class_get_fields)(void *, void **);
+    const char *(*field_get_name)(void *);
+    int (*field_get_flags)(void *);
+    void *(*field_get_type)(void *);
+    void (*field_static_get_value)(void *, void *);
+    void *(*class_get_method_from_name)(void *, const char *, int);
+    void *(*runtime_invoke)(void *, void *, void **, void **);
+    uint16_t *(*string_chars)(void *);
+    int dumped;
+} sweep_ctx;
+static sweep_ctx g_sweep;
+
+static void sweep_invoke_string(void *obj, void *klass, const char *label,
+                                const char *fname)
+{
+    const char *cands[] = { "get_DisplayMessage", "get_Message",
+                            "ToString", NULL };
+    for (int i = 0; cands[i]; i++) {
+        void *m = g_sweep.class_get_method_from_name(klass, cands[i], 0);
+        if (!m)
+            continue;
+        void *exc = NULL;
+        void *s = g_sweep.runtime_invoke(m, obj, NULL, &exc);
+        if (!s || exc)
+            continue;
+        uint16_t *ch = g_sweep.string_chars(s);
+        char buf[2048];
+        size_t n;
+        for (n = 0; ch && ch[n] && n + 1 < sizeof buf; n++)
+            buf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+        buf[n] = 0;
+        fprintf(stderr, "    %s.%s: %s():\n    %s\n", label, fname,
+                cands[i], buf);
+    }
+}
+
+static void sweep_report_class(void *klass, void *user)
+{
+    (void)user;
+    if (!klass || g_sweep.dumped > 400)
+        return;
+    const char *ns = g_sweep.class_get_namespace(klass);
+    const char *cname = g_sweep.class_get_name(klass);
+    if (!ns || !cname || !strstr(ns, "kairo"))
+        return;
+    void *iter = NULL, *fld;
+    int shown = 0;
+    while ((fld = g_sweep.class_get_fields(klass, &iter)) != NULL &&
+           shown++ < 80) {
+        int flags = g_sweep.field_get_flags(fld);
+        if (!(flags & 0x10))   /* FIELD_ATTRIBUTE_STATIC */
+            continue;
+        const char *fname = g_sweep.field_get_name(fld);
+        void *ftype = g_sweep.field_get_type(fld);
+        unsigned tbyte = ftype ? *((const unsigned char *)ftype + 10) : 0;
+        /* 0x0e STRING, 0x12 CLASS, 0x1c OBJECT, 0x1d SZARRAY, 0x15 GENINST */
+        if (tbyte != 0x0e && tbyte != 0x12 && tbyte != 0x1c &&
+            tbyte != 0x1d && tbyte != 0x15)
+            continue;
+        void *val = NULL;
+        g_sweep.field_static_get_value(fld, &val);
+        if (!val)
+            continue;
+        if (tbyte == 0x0e) {
+            /* static string: only print error/message-ish names */
+            if (fname && (strstr(fname, "rror") || strstr(fname, "essa") ||
+                          strstr(fname, "xception"))) {
+                uint16_t *ch = g_sweep.string_chars(val);
+                char buf[256];
+                size_t n;
+                for (n = 0; ch && ch[n] && n + 1 < sizeof buf; n++)
+                    buf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+                buf[n] = 0;
+                fprintf(stderr, "    STR %s.%s.%s = \"%s\"\n", ns, cname,
+                        fname, buf);
+                g_sweep.dumped++;
+            }
+            continue;
+        }
+        void *vklass = g_sweep.object_get_class(val);
+        if (!vklass)
+            continue;
+        const char *vname = g_sweep.class_get_name(vklass);
+        if (!vname)
+            continue;
+        if (strstr(vname, "Exception") || strstr(vname, "Error")) {
+            fprintf(stderr, "  EXC-OBJ %s.%s.%s -> %s.%s@%p\n", ns, cname,
+                    fname ? fname : "?",
+                    g_sweep.class_get_namespace(vklass) ?: "", vname, val);
+            sweep_invoke_string(val, vklass, vname, fname ? fname : "?");
+            g_sweep.dumped++;
+        }
+    }
+}
+
+static void dump_field_value(void *klass, const char *ns, const char *cname,
+                             void *fld, void *obj, int is_static)
+{
+    const char *fname = g_sweep.field_get_name(fld);
+    void *ftype = g_sweep.field_get_type(fld);
+    unsigned tbyte = ftype ? *((const unsigned char *)ftype + 10) : 0;
+    int flags = g_sweep.field_get_flags(fld);
+    union { int64_t i; double d; void *p; } v;
+    memset(&v, 0, sizeof v);
+    if (is_static)
+        g_sweep.field_static_get_value(fld, &v);
+    else {
+        void *(*field_get_value)(void *, void *, void *) =
+            nx_lookup_in(g_sweep.mod, "il2cpp_field_get_value");
+        if (!field_get_value)
+            return;
+        field_get_value(obj, fld, &v);
+    }
+    char prefix[320];
+    snprintf(prefix, sizeof prefix, "  %s%s.%s.%s",
+             (flags & 0x10) ? "S " : "I ", ns, cname,
+             fname ? fname : "?");
+    switch (tbyte) {
+    case 0x02: /* BOOLEAN */
+        fprintf(stderr, "%s = %s (bool)\n", prefix, v.i ? "true" : "false");
+        break;
+    case 0x04: case 0x05: case 0x06: case 0x07:
+    case 0x08: case 0x09: case 0x0a: case 0x0b:
+        fprintf(stderr, "%s = %lld (int)\n", prefix, (long long)v.i);
+        break;
+    case 0x0c: /* R4 */
+        fprintf(stderr, "%s = %f (float)\n", prefix, (double)*(float *)&v.i);
+        break;
+    case 0x0d: /* R8 */
+        fprintf(stderr, "%s = %f (double)\n", prefix, v.d);
+        break;
+    case 0x0e: {/* STRING */
+        char buf[160] = "(null)";
+        if (v.p) {
+            uint16_t *ch = g_sweep.string_chars(v.p);
+            size_t n;
+            for (n = 0; ch && ch[n] && n + 1 < sizeof buf; n++)
+                buf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+            buf[n] = 0;
+        }
+        fprintf(stderr, "%s = \"%s\"\n", prefix, buf);
+        break; }
+    case 0x11: /* VALUETYPE/enum -- print raw 32 bits */
+        fprintf(stderr, "%s = %u (vt/enum)\n", prefix, (unsigned)v.i);
+        break;
+    default: { /* references */
+        if (!v.p) {
+            fprintf(stderr, "%s = null (obj t%02x)\n", prefix, tbyte);
+            break;
+        }
+        void *vk = g_sweep.object_get_class(v.p);
+        const char *vn = vk ? g_sweep.class_get_name(vk) : "?";
+        fprintf(stderr, "%s = obj %s@%p\n", prefix, vn ? vn : "?", v.p);
+        break; }
+    }
+}
+
+static void sweep_dump_class(void *klass, void *user)
+{
+    (void)user;
+    if (!klass || g_sweep.dumped > 160)
+        return;
+    const char *ns = g_sweep.class_get_namespace(klass);
+    const char *cname = g_sweep.class_get_name(klass);
+    if (!cname)
+        return;
+    ns = ns ? ns : "";
+    static const char *needles[] = {
+        "ApplicationManager", "KairoBase", "IApplication", "Language",
+        "Canvas", "KairoPlugin", NULL
+    };
+    int hit = 0;
+    for (int i = 0; needles[i]; i++)
+        if (strcmp(cname, needles[i]) == 0) {
+            hit = 1;
+            break;
+        }
+    if (!hit)
+        return;
+    fprintf(stderr, " CLASS %s.%s:\n", ns, cname);
+    g_sweep.dumped++;
+    void *iter = NULL, *fld;
+    int n = 0;
+    while ((fld = g_sweep.class_get_fields(klass, &iter)) != NULL && n++ < 80)
+        dump_field_value(klass, ns, cname, fld, NULL, 1);
+    /* dump the live singleton too, when the class exposes get_Current */
+    void *getcur = g_sweep.class_get_method_from_name(klass, "get_Current", 0);
+    void *getinst = getcur
+        ? NULL
+        : g_sweep.class_get_method_from_name(klass, "GetInstance", 0);
+    void *m = getcur ? getcur : getinst;
+    if (m) {
+        void *exc = NULL;
+        void *inst = g_sweep.runtime_invoke(m, NULL, NULL, &exc);
+        if (inst && !exc) {
+            fprintf(stderr, "  INSTANCE %s.%s@%p:\n", ns, cname, inst);
+            void *iter2 = NULL, *f2;
+            int k = 0;
+            while ((f2 = g_sweep.class_get_fields(klass, &iter2)) != NULL &&
+                   k++ < 80) {
+                int fl = g_sweep.field_get_flags(f2);
+                if (fl & 0x10)
+                    continue;   /* statics already printed */
+                if (fl & 0x40)
+                    continue;   /* literal: no per-object storage (crashes
+                                   il2cpp_field_get_value at off -1) */
+                dump_field_value(klass, ns, cname, f2, inst, 0);
+            }
+            /* also dump BASE CLASS instance fields (one level, covers
+             * KairoBase-derived Application classes) */
+            void *parent = NULL;
+            void *(*cgp)(void *) =
+                nx_lookup_in(g_sweep.mod, "il2cpp_class_get_parent");
+            if (cgp)
+                parent = cgp(klass);
+            if (parent) {
+                const char *pn = g_sweep.class_get_name(parent);
+                const char *pns = g_sweep.class_get_namespace(parent);
+                if (pn && strstr(pn, "airo")) {
+                    fprintf(stderr, "  BASE %s.%s:\n", pns ? pns : "", pn);
+                    void *iter3 = NULL, *f3;
+                    int j = 0;
+                    while ((f3 = g_sweep.class_get_fields(parent, &iter3))
+                               != NULL && j++ < 80) {
+                        int fl = g_sweep.field_get_flags(f3);
+                        dump_field_value(parent, pns ? pns : "", pn, f3,
+                                         inst, !(fl & 0x10));
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void gds_inspect_kairo_state(void)
+{
+    static int done;
+    if (done || !getenv("GDS_SWEEP"))
+        return;
+    done = 1;
+    nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+    if (!il2cpp)
+        return;
+    void (*class_for_each)(void (*)(void *, void *), void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_for_each");
+    memset(&g_sweep, 0, sizeof g_sweep);
+    g_sweep.mod = il2cpp;
+    g_sweep.object_get_class = nx_lookup_in(il2cpp, "il2cpp_object_get_class");
+    g_sweep.class_get_name = nx_lookup_in(il2cpp, "il2cpp_class_get_name");
+    g_sweep.class_get_namespace =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_namespace");
+    g_sweep.class_get_fields = nx_lookup_in(il2cpp, "il2cpp_class_get_fields");
+    g_sweep.field_get_name = nx_lookup_in(il2cpp, "il2cpp_field_get_name");
+    g_sweep.field_get_flags = nx_lookup_in(il2cpp, "il2cpp_field_get_flags");
+    g_sweep.field_get_type = nx_lookup_in(il2cpp, "il2cpp_field_get_type");
+    g_sweep.field_static_get_value =
+        nx_lookup_in(il2cpp, "il2cpp_field_static_get_value");
+    g_sweep.class_get_method_from_name =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_method_from_name");
+    g_sweep.runtime_invoke = nx_lookup_in(il2cpp, "il2cpp_runtime_invoke");
+    g_sweep.string_chars = nx_lookup_in(il2cpp, "il2cpp_string_chars");
+    if (!class_for_each || !g_sweep.object_get_class ||
+        !g_sweep.class_get_fields || !g_sweep.field_static_get_value) {
+        fprintf(stderr, "[gds] sweep: il2cpp field API incomplete\n");
+        return;
+    }
+    fprintf(stderr, "[gds] kairo static-field sweep (exception hunt):\n");
+    class_for_each(sweep_report_class, NULL);
+    fprintf(stderr, "[gds] sweep done (%d hits)\n", g_sweep.dumped);
+    fprintf(stderr, "[gds] kairo decision-class state dump:\n");
+    g_sweep.dumped = 0;
+    class_for_each(sweep_dump_class, NULL);
+    fprintf(stderr, "[gds] state dump done\n");
+    fflush(stderr);
+}
+
+/* The 4th showDialog parameter may be a RAW il2cpp object (il2cpp passes
+ * managed objects straight through as jobjects).  If it is, its class name
+ * and -- for kairo.unity.util.KairoException -- its DisplayMessage tell us
+ * exactly which managed exception produced the error dialog. */
+static void gds_probe_managed_object(void *obj, const char *why)
+{
+    if (!obj || (uintptr_t)obj < 0x10000)
+        return;
+    nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+    if (!il2cpp)
+        return;
+    void *(*object_get_class)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_object_get_class");
+    const char *(*class_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_name");
+    const char *(*class_get_namespace)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_namespace");
+    void *(*class_get_method_from_name)(void *, const char *, int) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_method_from_name");
+    void *(*runtime_invoke)(void *, void *, void **, void **) =
+        nx_lookup_in(il2cpp, "il2cpp_runtime_invoke");
+    uint16_t *(*string_chars)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_string_chars");
+    if (!object_get_class || !class_get_name)
+        return;
+    void *klass = object_get_class(obj);
+    if (!klass)
+        return;
+    const char *ns = class_get_namespace
+        ? class_get_namespace(klass) : NULL;
+    const char *name = class_get_name(klass);
+    fprintf(stderr, "[gds] probe(%s): object %p -> class %s.%s\n",
+            why ? why : "?", obj, ns ? ns : "", name ? name : "?");
+    if (!class_get_method_from_name || !runtime_invoke)
+        return;
+    /* KairoException exposes get_DisplayMessage; Message/get_Message is the
+     * System.Exception base.  Try both, and ToString as fallback. */
+    const char *candidates[] = { "get_DisplayMessage", "get_Message",
+                                 "ToString", "GetThrowableLog", NULL };
+    for (int i = 0; candidates[i]; i++) {
+        void *m = class_get_method_from_name(klass, candidates[i], 0);
+        if (!m)
+            continue;
+        void *exc = NULL;
+        void *s = runtime_invoke(m, obj, NULL, &exc);
+        if (!s || exc)
+            continue;
+        uint16_t *ch = string_chars ? string_chars(s) : NULL;
+        char buf[2048];
+        size_t n;
+        for (n = 0; ch && ch[n] && n + 1 < sizeof buf; n++)
+            buf[n] = ch[n] < 0x80 ? (char)ch[n] : '?';
+        buf[n] = 0;
+        fprintf(stderr, "[gds] probe(%s): %s():\n%s\n", why,
+                candidates[i], buf);
+    }
+    fflush(stderr);
+}
+
+/* ---- PackageManager / PackageInfo / Signature ---------------------------
+ * Boot evidence (run31 state sweep): KairoPlugin.signature_ was NULL and
+ * KairoBase.illegalPackage_ was TRUE -- the anti-tamper signature check had
+ * failed because Context.getPackageManager() returned NULL and the game
+ * could never read PackageInfo.signatures.  A null signature -> "illegal
+ * package" -> generic "An error has occurred." dialog -> quit. */
+static jobj *package_manager_object;
+static jobj *signature_object;
+static jobj *signatures_array;
+
+static int64_t j_Context_getPackageManager(jctx *c)
+{
+    (void)c;
+    if (!package_manager_object)
+        package_manager_object = mk_object("android/content/pm/PackageManager");
+    JT("getPackageManager() -> %p", (void *)package_manager_object);
+    return (int64_t)(uintptr_t)package_manager_object;
+}
+
+static int64_t j_PM_getPackageInfo(jctx *c)
+{
+    jobj *pkg = jarg_obj(c);
+    int flags = jarg_int(c);
+    jobj *info = mk_object("android/content/pm/PackageInfo");
+    info->str = strdup(pkg && pkg->str
+                           ? pkg->str
+                           : "net.kairosoft.android.gamedev3en");
+    info->prim = flags;
+    JT("PackageManager.getPackageInfo(\"%s\", %d) -> info",
+       info->str, flags);
+    return (int64_t)(uintptr_t)info;
+}
+
+static int64_t j_PackageInfo_getLong(jctx *c)
+{
+    return 0L;   /* versionCode / lastUpdateTime -- unused by the game */
+}
+static int64_t j_PackageInfo_getInt(jctx *c)
+{
+    return 0;
+}
+static int64_t j_PackageInfo_versionName(jctx *c)
+{
+    return (int64_t)(uintptr_t)mk_string("2.6.9");
+}
+static int64_t j_PackageInfo_packageName(jctx *c)
+{
+    return (int64_t)(uintptr_t)mk_string(
+        "net.kairosoft.android.gamedev3en");
+}
+static int64_t j_PackageInfo_signatures(jctx *c)
+{
+    (void)c;
+    if (!signature_object) {
+        signature_object = mk_object("android/content/pm/Signature");
+        jobj *der = j_NewByteArray(NULL, GDS_CERT_DER_LEN);
+        memcpy(der->data, gds_cert_der, GDS_CERT_DER_LEN);
+        signature_object->data = der;   /* DER bytes, for toByteArray() */
+        signatures_array =
+            j_NewObjectArray(NULL, 1, mk_class("android/content/pm/Signature"),
+                             signature_object);
+        if (signatures_array)
+            signatures_array->cls = "[Landroid/content/pm/Signature;";
+    }
+    JT("PackageInfo.signatures -> [1 signature]");
+    return (int64_t)(uintptr_t)signatures_array;
+}
+
+static int64_t j_Signature_hashCode(jctx *c)
+{
+    (void)c;
+    JT("Signature.hashCode() -> %d", GDS_CERT_DER_JHASH);
+    return GDS_CERT_DER_JHASH;
+}
+
+static int64_t j_Signature_toByteArray(jctx *c)
+{
+    jobj *der = j_NewByteArray(NULL, GDS_CERT_DER_LEN);
+    memcpy(der->data, gds_cert_der, GDS_CERT_DER_LEN);
+    JT("Signature.toByteArray() -> [%d bytes]", GDS_CERT_DER_LEN);
+    return (int64_t)(uintptr_t)der;
+}
+
+/* ---- managed call-stack dump via il2cpp frame-at --------------------------
+ * The stock capture path (libgcc _Unwind across frame-pointer-less code and
+ * dl_iterate_phdr for .eh_frame_hdr) can't see our self-loaded libil2cpp, so
+ * get_frame_at() comes up empty.  il2cpp_override_stack_backtrace(func) lets
+ * us supply the native backtrace ourselves: func(void **buf, int max) fills
+ * raw return addresses, il2cpp resolves them to MethodInfo* itself.  Walk the
+ * x29 frame chain -- il2cpp codegen/libunity/our loader all keep frame
+ * pointers on arm64. */
+static int gds_addr_mapped(uintptr_t a);
+static int gds_fp_backtrace(void **buf, int max)
+{
+    /* The x29 chain dies inside libunity's -fomit-frame-pointer frames, so
+     * instead scan the raw stack for return addresses that land inside
+     * libil2cpp's code: those are the managed frames' return sites (all
+     * game logic is compiled into libil2cpp).  il2cpp resolves each IP to a
+     * MethodInfo itself (garbage candidates resolve to nothing and are
+     * skipped by its visitor), which gives us the full managed call chain. */
+    static uint8_t *code_lo, *code_hi;
+    if (!code_lo) {
+        nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+        if (!il2cpp)
+            return 0;
+        /* executable program headers cover the generated managed code;
+         * use the module span (conservative superset) as the filter */
+        code_lo = il2cpp->base;
+        code_hi = il2cpp->base + il2cpp->span;
+    }
+    uintptr_t *sp = (uintptr_t *)__builtin_frame_address(0);
+    uintptr_t here = (uintptr_t)sp;
+    /* stack grows down: walk upward; stay well inside this thread's stack
+     * (the dialog site is deep beneath Unity, plenty of mapped room) */
+    uintptr_t limit = (here + 0x30000) & ~7UL;
+    int n = 0;
+    for (uintptr_t p = here & ~7UL; p < limit && n < max; p += 8) {
+        if (!gds_addr_mapped(p + 8))
+            break;
+        uintptr_t v = *(uintptr_t *)p;
+        if (v >= (uintptr_t)code_lo && v < (uintptr_t)code_hi)
+            buf[n++] = (void *)v;
+    }
+    static int bt_dbg = 3;
+    if (bt_dbg-- > 0) {
+        nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+        int inited = -1;
+        if (il2cpp)
+            inited = *(volatile uint8_t *)((uint8_t *)il2cpp->base +
+                                           0x20077e0);
+        fprintf(stderr,
+                "[gds] backtrace: %d candidates in [%p,%p) sp=%p max=%d "
+                "init=%d first=%p last=%p\n",
+                n, code_lo, code_hi, (void *)here, max, inited,
+                n ? buf[0] : 0, n ? buf[n - 1] : 0);
+    }
+    return n;
+}
+
+static int gds_bt_override_installed;
+
+static struct {
+    const char *(*method_get_name)(void *);
+    void *(*method_get_class)(void *);
+    const char *(*class_get_name)(void *);
+    const char *(*class_get_namespace)(void *);
+    int n, cap;
+} g_framecb;
+
+static void gds_framecb(const void *entry, void *ud)
+{
+    (void)ud;
+    if (!entry || g_framecb.n >= g_framecb.cap)
+        return;
+    void *mi = *(void * const *)entry;
+    if ((uintptr_t)mi < 0x10000)
+        return;
+    void *kl = g_framecb.method_get_class
+                   ? g_framecb.method_get_class(mi)
+                   : NULL;
+    const char *ns = kl ? g_framecb.class_get_namespace(kl) : "?";
+    const char *cn = kl ? g_framecb.class_get_name(kl) : "?";
+    const char *mn = g_framecb.method_get_name(mi);
+    fprintf(stderr, "  P%02d %s%s%s:%s\n", g_framecb.n++,
+            ns ? ns : "", (ns && *ns) ? "." : "", cn ? cn : "?",
+            mn ? mn : "?");
+}
+
+static void gds_install_bt_override(nx_mod *il2cpp)
+{
+    if (gds_bt_override_installed)
+        return;
+    void (*override_bt)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_override_stack_backtrace");
+    if (override_bt) {
+        override_bt((void *)gds_fp_backtrace);
+        gds_bt_override_installed = 1;
+        fprintf(stderr, "[gds] installed frame-pointer backtrace override\n");
+    }
+}
+
+/* ---- managed exception sniffing ------------------------------------------
+ * Scan raw memory (current stack) for words whose [0] is an Il2CppClass*
+         * derived from System.Exception.  The klass pointer is validated by
+     * bouncing through the metadata: object_get_class gives the same class for
+     * live objects; IsAssignableFrom does the rest.  Yesterday's dialog
+     * handlers catch the exception in managed space right before us, so a live
+     * copy is almost always still on the stack. */
+static int gds_addr_mapped(uintptr_t a)
+{
+    static struct {
+        uintptr_t lo, hi;
+    } ranges[320];
+    static int nranges = -1;
+    if (nranges < 0) {
+        nranges = 0;
+        FILE *f = fopen("/proc/self/maps", "r");
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof line, f) && nranges < 320) {
+                unsigned long long lo, hi;
+                if (sscanf(line, "%llx-%llx", &lo, &hi) == 2) {
+                    ranges[nranges].lo = lo;
+                    ranges[nranges].hi = hi;
+                    nranges++;
+                }
+            }
+            fclose(f);
+        }
+    }
+    for (int i = 0; i < nranges; i++)
+        if (a >= ranges[i].lo && a < ranges[i].hi)
+            return 1;
+    return 0;
+}
+
+static int gds_is_exception_object(nx_mod *il2cpp, uintptr_t cand,
+                                   void *exc_class)
+{
+    if (!gds_addr_mapped(cand))
+        return 0;
+    static void *(*object_get_class)(const void *);
+    static int (*class_is_assignable_from)(void *, const void *);
+    if (!object_get_class)
+        object_get_class = nx_lookup_in(il2cpp, "il2cpp_object_get_class");
+    if (!class_is_assignable_from)
+        class_is_assignable_from =
+            nx_lookup_in(il2cpp, "il2cpp_class_is_assignable_from");
+    if (!object_get_class || !class_is_assignable_from)
+        return 0;
+    void *klass = *(void * const *)cand; /* validated mapped by caller */
+    if ((uintptr_t)klass < 0x10000)
+        return 0;
+    /* cheap pre-filter: klass must come from libil2cpp's data/rodata span */
+    if ((uintptr_t)klass < (uintptr_t)il2cpp->base ||
+        (uintptr_t)klass >= (uintptr_t)(il2cpp->base + il2cpp->span))
+        return 0;
+    return class_is_assignable_from(exc_class, (const void *)cand);
+}
+
+static void gds_sniff_exceptions(const char *why)
+{
+    nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+    if (!il2cpp)
+        return;
+    void *(*get_corlib)(void) = nx_lookup_in(il2cpp, "il2cpp_get_corlib");
+    void *(*class_from_name)(const void *, const char *, const char *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_from_name");
+    void *(*image_get_class_count)(const void *) =
+        nx_lookup_in(il2cpp, "il2cpp_image_get_class_count");
+    void *(*image_get_class)(const void *, size_t) =
+        nx_lookup_in(il2cpp, "il2cpp_image_get_class");
+    void *(*class_get_parent)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_parent");
+    const char *(*class_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_name");
+    if (!get_corlib || !class_from_name || !class_get_parent ||
+        !class_get_name)
+        return;
+    struct Il2CppStringHead {
+        void *klass;
+        void *monitor;
+        int32_t length;
+        uint16_t chars[1];
+    };
+    void *(*object_get_class)(const void *) =
+        nx_lookup_in(il2cpp, "il2cpp_object_get_class");
+    const void *corlib = get_corlib();
+    void *exc = corlib ? class_from_name(corlib, "System", "Exception")
+                       : NULL;
+    if (!exc)
+        return;
+    uintptr_t *sp = (uintptr_t *)__builtin_frame_address(0);
+    uintptr_t here = (uintptr_t)sp;
+    uintptr_t limit = (here + 0x60000) & ~7UL;
+    int hits = 0;
+    fprintf(stderr, "[gds] exception sniff (%s):\n", why ? why : "?");
+    for (uintptr_t p = here & ~7UL; p < limit && hits < 12; p += 8) {
+        if (!gds_addr_mapped(p + 8))
+            break; /* end of the contiguous stack mapping */
+        uintptr_t cand = *(uintptr_t *)p;
+        if (cand < 0x10000 || cand > 0x800000000000 || (cand & 7))
+            continue;
+        if (!gds_is_exception_object(il2cpp, cand, exc))
+            continue;
+        /* found an exception object (or a stack slot that aliases one);
+         * walk up its class chain for the concrete type name */
+        void *k = object_get_class((const void *)cand);
+        fprintf(stderr, "  exc@%p slot=%p class=", (void *)cand, (void *)p);
+        for (void *kk = k; kk; kk = class_get_parent(kk)) {
+            const char *n = class_get_name(kk);
+            fprintf(stderr, "%s%s", n ? n : "?",
+                    class_get_parent(kk) ? " < " : "\n");
+        }
+        /* System.Exception.message lives right past the object header:
+         * className at +16, message/DisplayMessage at +24..+32 range */
+        for (int off = 16; off <= 48; off += 8) {
+            struct Il2CppStringHead *msg =
+                *(struct Il2CppStringHead **)(cand + off);
+            if ((uintptr_t)msg <= 0x10000 ||
+                (uintptr_t)msg > 0x800000000000)
+                continue;
+            void *mk = object_get_class(msg);
+            const char *mn = mk ? class_get_name(mk) : NULL;
+            if (!mn || strcmp(mn, "String") != 0 || msg->length < 0 ||
+                msg->length > 4000)
+                continue;
+            char b[120];
+            int o = 0;
+            while (o < 119 && o < msg->length) {
+                uint16_t ch = msg->chars[o];
+                b[o] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+                o++;
+            }
+            b[o] = 0;
+            fprintf(stderr, "    [+%d] \"%s\"\n", off, b);
+        }
+        hits++;
+    }
+    fprintf(stderr, "[gds] exception sniff done, hits=%d\n", hits);
+}
+
+/* The two catch sites that call IApplication.Error (in Update at 0x1756330
+ * and in OnGUI at 0x1758de8) both compare the caught exception against the
+ * type in static slot [base+0x1ebf330].  Read the runtime value and print the
+ * compared type name -- it tells us which exception family their error
+ * reporter expects here. */
+static void gds_dump_catch_type(nx_mod *il2cpp)
+{
+    void *(*class_from_type)(const void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_from_type");
+    const char *(*class_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_name");
+    const char *(*class_get_namespace)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_namespace");
+    void **slot = (void **)((uint8_t *)il2cpp->base + 0x1ebf330);
+    void *t = slot ? *slot : NULL;
+    fprintf(stderr, "[gds] catch-compare slot[0x1ebf330] = %p", t);
+    if (t && class_from_type && class_get_name) {
+        /* maybe it IS an Il2CppType* */
+        uint8_t tb = ((uint8_t *)t)[10];
+        fprintf(stderr, " (typebyte=%u)", tb);
+        void *k = class_from_type(t);
+        fprintf(stderr, " -> klass:%s.%s",
+                k && class_get_namespace ? class_get_namespace(k) : "?",
+                k ? class_get_name(k) : "?");
+        /* maybe it's a live System.Type object instead */
+        void *(*object_get_class)(const void *) =
+            nx_lookup_in(il2cpp, "il2cpp_object_get_class");
+        if (object_get_class) {
+            void *ok = object_get_class(t);
+            fprintf(stderr, " / as-object klass:%s.%s",
+                    ok && class_get_namespace ? class_get_namespace(ok)
+                                              : "?",
+                    ok ? class_get_name(ok) : "?");
+            /* System.Type.Name via runtime invoke */
+            void *(*class_get_method_from_name)(void *, const char *,
+                                                int) =
+                nx_lookup_in(il2cpp, "il2cpp_class_get_method_from_name");
+            void *(*runtime_invoke)(const void *, void *, void **,
+                                    void **) =
+                nx_lookup_in(il2cpp, "il2cpp_runtime_invoke");
+            void *(*object_get_class2)(const void *) = object_get_class;
+            if (class_get_method_from_name && runtime_invoke && k) {
+                void *mi =
+                    class_get_method_from_name(ok, "get_Name", 0);
+                if (mi) {
+                    void *exc2 = NULL;
+                    void *r =
+                        runtime_invoke(mi, t, NULL, &exc2);
+                    if (r && !exc2) {
+                        const uint16_t *(*chars)(const void *) =
+                            nx_lookup_in(il2cpp, "il2cpp_string_chars");
+                        if (chars) {
+                            const uint16_t *u = chars(r);
+                            char b[64];
+                            int i = 0;
+                            while (i < 63 && u[i]) {
+                                b[i] = u[i] < 128 ? (char)u[i] : '?';
+                                i++;
+                            }
+                            b[i] = 0;
+                            fprintf(stderr, " / Name=\"%s\"", b);
+                        }
+                    } else if (exc2) {
+                        fprintf(stderr, " / get_Name threw");
+                    }
+                }
+            }
+            (void)object_get_class2;
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
+static void gds_dump_managed_frames(const char *why)
+{
+    nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+    if (!il2cpp)
+        return;
+    int (*get_frame_at)(int, void **) =
+        nx_lookup_in(il2cpp, "il2cpp_current_thread_get_frame_at");
+    int (*get_stack_depth)(void) =
+        nx_lookup_in(il2cpp, "il2cpp_current_thread_get_stack_depth");
+    const char *(*method_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_method_get_name");
+    void *(*method_get_class)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_method_get_class");
+    const char *(*class_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_name");
+    const char *(*class_get_namespace)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_get_namespace");
+    if (!get_frame_at || !method_get_name || !method_get_class ||
+        !class_get_name || !class_get_namespace) {
+        fprintf(stderr, "[gds] frame dump: il2cpp frame API missing\n");
+        return;
+    }
+    gds_install_bt_override(il2cpp);
+    int depth = get_stack_depth ? get_stack_depth() : -1;
+    fprintf(stderr, "[gds] managed frames (%s), pushed-depth=%d:\n",
+            why ? why : "?", depth);
+    /* The per-thread pushed-frame array (32-byte entries, MethodInfo* at
+     * +0) covers the il2cpp frames nearest the native boundary -- exactly
+     * the frames libunwind-blind get_frame_at misses. */
+    if (depth > 0) {
+        void (*walk)(void (*)(const void *, void *), void *) =
+            nx_lookup_in(il2cpp, "il2cpp_current_thread_walk_frame_stack");
+        if (walk) {
+            g_framecb.method_get_name = method_get_name;
+            g_framecb.method_get_class = method_get_class;
+            g_framecb.class_get_name = class_get_name;
+            g_framecb.class_get_namespace = class_get_namespace;
+            g_framecb.n = 0;
+            g_framecb.cap = depth + 2;
+            walk(gds_framecb, &g_framecb);
+        }
+    }
+    for (int i = 0; i < 60; i++) {
+        void *mi = NULL;
+        int ok = get_frame_at(i, &mi);
+        if (!ok || !mi)
+            break;
+        void *kl = method_get_class(mi);
+        const char *ns = kl ? class_get_namespace(kl) : "?";
+        const char *cn = kl ? class_get_name(kl) : "?";
+        fprintf(stderr, "  #%02d %s%s%s:%s\n", i,
+                ns ? ns : "", (ns && *ns) ? "." : "",
+                cn ? cn : "?", method_get_name(mi) ? method_get_name(mi)
+                                                  : "?");
+    }
+    fprintf(stderr, "[gds] end of frames\n");
+}
+
+static int64_t j_Kairo_showDialog(jctx *c)
+{
+    int type = jarg_int(c);
+    jobj *title = jarg_obj(c);
+    jobj *message = jarg_obj(c);
+    jobj *audience = jarg_obj(c);
+    int result = 0;
+    const char *v = getenv("GDS_DIALOG_RESULT");
+    if (v && *v)
+        result = atoi(v);
+    fprintf(stderr, "[jni] KairoshowDialog type=%d title=\"%s\" message=\"%s\" "
+            "audience=%s -> %d%s\n", type,
+            title && title->str ? title->str : "(null)",
+            message && message->str ? message->str : "(null)",
+            audience && audience->cls ? audience->cls : "(none)",
+            result, (v && *v) ? " (GDS_DIALOG_RESULT)" : "");
+    /* Zombie archaeology probes (audience/catch-type sniff, frame walker)
+     * kill the render thread with SEGVs (gds_is_exception_object funnel) and
+     * have never produced evidence.  Off by default; GDS_PROBE_JUNK=1 re-arms.
+     * The brk catcher in main.c (GDS_TRAP_AT) replaced them. */
+    if (getenv("GDS_PROBE_JUNK")) {
+        gds_probe_managed_object(audience, "showDialog audience");
+        gds_sniff_exceptions("Kairosoft showDialog");
+        {
+            nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+            if (il2cpp)
+                gds_dump_catch_type(il2cpp);
+        }
+        gds_dump_managed_frames("Kairosoft showDialog");
+        if (getenv("GDS_STACKTRACE"))
+            gds_managed_stacktrace("Kairosoft showDialog");
+    }
+    return result;
+}
+
+/* ---- display metrics chain (Kairosoft kairo.unity.util.DisplayMetrics) ----
+ * Boot evidence (qemu NullGL run6): the game called
+ *   UnityPlayer.getWindowManager()Ljava/lang/Object;   -> unhandled -> NULL
+ * and the managed side immediately NRE'd in DisplayMetrics.Update(); the
+ * exception cascaded through Canvas and left IApplication.Awake() dead while
+ * frames kept rendering.  Emulate the Android side exactly as the game uses
+ * it: getWindowManager -> WindowManager.getDefaultDisplay -> Display,
+ * Display.getMetrics(metrics), then field reads on the metrics object. */
+static jobj *window_manager_object;
+static jobj *display_object;
+
+extern int egl_shim_screen_w(void);
+extern int egl_shim_screen_h(void);
+
+/* Defaults match the R36S panel (640x480, ~230dpi) and remain sane even if a
+ * field is read before getMetrics ran. */
+static struct {
+    int w, h, dpi;
+    float density, scaled, xdpi, ydpi;
+} g_metrics = { 640, 480, 240, 1.5f, 1.5f, 240.0f, 240.0f };
+
+static int64_t j_Unity_getWindowManager(jctx *c)
+{
+    (void)c;
+    if (!window_manager_object)
+        window_manager_object = mk_object("android/view/WindowManager");
+    return (int64_t)(uintptr_t)window_manager_object;
+}
+
+static int64_t j_Wmgr_getDefaultDisplay(jctx *c)
+{
+    (void)c;
+    if (!display_object)
+        display_object = mk_object("android/view/Display");
+    return (int64_t)(uintptr_t)display_object;
+}
+
+static int64_t j_Display_getMetrics(jctx *c)
+{
+    (void)jarg_obj(c);           /* the android.util.DisplayMetrics instance */
+    int w = egl_shim_screen_w(), h = egl_shim_screen_h();
+    if (w > 0) g_metrics.w = w;
+    if (h > 0) g_metrics.h = h;
+    JT("Display.getMetrics -> %dx%d dpi=%d", g_metrics.w, g_metrics.h,
+       g_metrics.dpi);
+    return 0;
+}
+
+static int64_t j_Context_getSystemService(jctx *c)
+{
+    jobj *name = jarg_obj(c);
+    const char *s = name && name->str ? name->str : "(null)";
+    if (strcmp(s, "window") == 0) {
+        JT("getSystemService(\"window\") -> WindowManager");
+        return j_Unity_getWindowManager(c);
+    }
+    /* Every other service stays NULL, exactly as before this binding: callers
+     * already handled the missing-service path. */
+    JT("getSystemService(%s) -> null", s);
+    return 0;
+}
+
+/* android/opengl/GLES20 Java bridge: KairoPlugin.SupportsDepth24() calls
+ * GLES20.glGetString(GLES20.GL_EXTENSIONS) through JNI and parses it; unhandled
+ * it returned NULL and the managed .Contains() NRE'd.  Answers come from the
+ * strings captured on the real context (device) or the NullGL set (headless). */
+extern const char *gds_gl_string_for_jni(unsigned name);
+static int64_t j_GLES20_GL_EXTENSIONS(jctx *c) { (void)c; return 0x1F03; }
+static int64_t j_GLES20_glGetString(jctx *c)
+{
+    int name = jarg_int(c);
+    const char *s = gds_gl_string_for_jni((unsigned)name);
+    JT("GLES20.glGetString(0x%x) -> \"%.*s%s\"", name,
+       70, s ? s : "", s && strlen(s) > 70 ? "..." : "");
+    return (int64_t)(uintptr_t)(s ? mk_string(s) : NULL);
+}
+
+/* Display.getRealSize(Point): pack w/h into the Point's prim slot; the x/y
+ * field getters unpack it.  Points built elsewhere keep prim=0 -> x=y=0,
+ * i.e. exactly the old unhandled->0 behaviour for every other Point. */
+extern int egl_shim_screen_w(void);
+extern int egl_shim_screen_h(void);
+static int64_t j_Display_getRealSize(jctx *c)
+{
+    jobj *point = jarg_obj(c);
+    int64_t w = egl_shim_screen_w(), h = egl_shim_screen_h();
+    if (w <= 0) w = 640;
+    if (h <= 0) h = 480;
+    if (point)
+        point->prim = (w << 32) | (h & 0xffffffff);
+    JT("Display.getRealSize -> %lldx%lld", (long long)w, (long long)h);
+    return 0;
+}
+static int64_t j_Point_x(jctx *c) { return (int32_t)(c->self ? (c->self->prim >> 32) : 0); }
+static int64_t j_Point_y(jctx *c) { return (int32_t)(c->self ? (c->self->prim & 0xffffffff) : 0); }
+
+/* android/os/Message.what: obtainMessage already stores what in prim. */
+static int64_t j_Message_what(jctx *c) { return c->self ? c->self->prim : 0; }
+
+/* Handler.postDelayed: claiming the post FAILED (old unhandled->0) makes the
+ * caller retry/error; our fake looper accepts and reports success. */
+static int64_t j_Handler_postDelayed(jctx *c) { (void)c; return 1; }
+
+static int64_t j_DM_width(jctx *c)  { (void)c; return g_metrics.w; }
+static int64_t j_DM_height(jctx *c) { (void)c; return g_metrics.h; }
+static int64_t j_DM_dpi(jctx *c)    { (void)c; return g_metrics.dpi; }
+static int64_t float_bits(float f) { int32_t b; memcpy(&b, &f, sizeof b); return b; }
+static int64_t j_DM_fdensity(jctx *c) { (void)c; return float_bits(g_metrics.density); }
+static int64_t j_DM_fscaled(jctx *c)  { (void)c; return float_bits(g_metrics.scaled); }
+static int64_t j_DM_fxdpi(jctx *c)    { (void)c; return float_bits(g_metrics.xdpi); }
+static int64_t j_DM_fydpi(jctx *c)    { (void)c; return float_bits(g_metrics.ydpi); }
+
 static int64_t j_Armory_getUnityPlayer(jctx *c)
 {
     (void)c;
@@ -2310,6 +3644,29 @@ static int64_t dispatch(void *e, jobj *self, void *mid, va_list *ap,
         JT("call on unknown method id %p", mid);
         return 0;
     }
+    /* Reflected Field/Method handles are our numeric registry ids, not jobj
+     * pointers: ReflectionHelper.getFieldID returns the id and Unity then
+     * calls methods ON it (java/lang/reflect/Field.getDeclaringClass etc).
+     * Treating the id as a jobj* dereferences garbage at self->boxed and
+     * segfaults -- observed where DisplayMetrics.density (id 39) met
+     * Field.getDeclaringClass (id 334). */
+    if ((uintptr_t)self >= 1 && (uintptr_t)self <= 0x10000 && m->cls &&
+        (strcmp(m->cls, "java/lang/reflect/Field") == 0 ||
+         strcmp(m->cls, "java/lang/reflect/Method") == 0 ||
+         strcmp(m->cls, "java/lang/reflect/AccessibleObject") == 0)) {
+        const jmethod *fld = by_id(self);
+        if (fld) {
+            if (strcmp(m->name, "getDeclaringClass") == 0)
+                return (int64_t)(uintptr_t)mk_class(
+                    fld->cls ? fld->cls : "java/lang/Object");
+            if (strcmp(m->name, "getName") == 0)
+                return (int64_t)(uintptr_t)mk_string(
+                    fld->name ? fld->name : "");
+            JT("reflect %s.%s on field %s.%s -> 0", m->cls, m->name,
+               fld->cls ? fld->cls : "?", fld->name ? fld->name : "?");
+            return 0;
+        }
+    }
     if (self && self->boxed && is_unbox(m->name)) {
         JT("unboxed %s.%s -> %lld", self->cls, m->name, (long long)self->prim);
         return self->prim;
@@ -2641,8 +3998,23 @@ static uint16_t f_char(void *e, jobj *o, void *f) { return (uint16_t)(uintptr_t)
 static int16_t f_short(void *e, jobj *o, void *f) { return (int16_t)(uintptr_t)f_obj(e, o, f); }
 static int32_t f_int(void *e, jobj *o, void *f) { return (int32_t)(uintptr_t)f_obj(e, o, f); }
 static int64_t f_long(void *e, jobj *o, void *f) { return (int64_t)(uintptr_t)f_obj(e, o, f); }
-static float f_float(void *e, jobj *o, void *f) { (void)e; (void)o; (void)f; return 0.0f; }
-static double f_double(void *e, jobj *o, void *f) { (void)e; (void)o; (void)f; return 0.0; }
+static float f_float(void *e, jobj *o, void *f)
+{
+    /* float fields used to be unconditional 0.0f; DisplayMetrics wants real
+     * values, so dispatch and reinterpret the raw bits like f_int does. */
+    int64_t v = dispatch(e, o, f, NULL, NULL);
+    int32_t bits = (int32_t)v;
+    float out;
+    memcpy(&out, &bits, sizeof out);
+    return out;
+}
+static double f_double(void *e, jobj *o, void *f)
+{
+    int64_t v = dispatch(e, o, f, NULL, NULL);
+    double out;
+    memcpy(&out, &v, sizeof out);
+    return out;
+}
 static void f_set(void *e, jobj *o, void *f, ...) { (void)e; (void)o; (void)f; }
 
 static int32_t j_RegisterNatives(void *e, jobj *c, const void *m, int32_t n)
@@ -2915,6 +4287,124 @@ void gds_jni_init(void)
                  (void *)j_Unity_setSoftInputStr);
     gds_jni_bind("com/unity3d/player/UnityPlayer", "hideSoftInput", "()V",
                  (void *)j_Unity_hideSoftInput);
+    /* DisplayMetrics chain (see j_Context_getSystemService comment block) */
+    gds_jni_bind("com/unity3d/player/UnityPlayer", "getWindowManager",
+                 "()Ljava/lang/Object;", (void *)j_Unity_getWindowManager);
+    gds_jni_bind("com/unity3d/player/UnityPlayer", "getWindowManager",
+                 "()Landroid/view/WindowManager;", (void *)j_Unity_getWindowManager);
+    gds_jni_bind("android/app/Activity", "getWindowManager",
+                 "()Landroid/view/WindowManager;", (void *)j_Unity_getWindowManager);
+    gds_jni_bind("android/view/WindowManager", "getDefaultDisplay",
+                 "()Landroid/view/Display;", (void *)j_Wmgr_getDefaultDisplay);
+    gds_jni_bind("android/view/WindowManager", "getDefaultDisplay",
+                 "()Ljava/lang/Object;", (void *)j_Wmgr_getDefaultDisplay);
+    gds_jni_bind("android/view/Display", "getMetrics",
+                 "(Landroid/util/DisplayMetrics;)V", (void *)j_Display_getMetrics);
+    gds_jni_bind("android/util/DisplayMetrics", "widthPixels", "I",
+                 (void *)j_DM_width);
+    gds_jni_bind("android/util/DisplayMetrics", "heightPixels", "I",
+                 (void *)j_DM_height);
+    gds_jni_bind("android/util/DisplayMetrics", "densityDpi", "I",
+                 (void *)j_DM_dpi);
+    gds_jni_bind("android/util/DisplayMetrics", "scaledDensity", "F",
+                 (void *)j_DM_fscaled);
+    gds_jni_bind("android/util/DisplayMetrics", "density", "F",
+                 (void *)j_DM_fdensity);
+    gds_jni_bind("android/util/DisplayMetrics", "xdpi", "F",
+                 (void *)j_DM_fxdpi);
+    gds_jni_bind("android/util/DisplayMetrics", "ydpi", "F",
+                 (void *)j_DM_fydpi);
+    gds_jni_bind("android/content/Context", "getSystemService",
+                 "(Ljava/lang/String;)Ljava/lang/Object;",
+                 (void *)j_Context_getSystemService);
+    gds_jni_bind("android/app/Activity", "getSystemService",
+                 "(Ljava/lang/String;)Ljava/lang/Object;",
+                 (void *)j_Context_getSystemService);
+    gds_jni_bind("com/unity3d/player/UnityPlayer", "getSystemService",
+                 "(Ljava/lang/String;)Ljava/lang/Object;",
+                 (void *)j_Context_getSystemService);
+    gds_jni_bind("kairo/android/plugin/Utility", "showDialog",
+                 "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/Object;)I",
+                 (void *)j_Kairo_showDialog);
+    gds_jni_bind("kairo/android/plugin/Utility", "getScaleRatio",
+                 "(IIII)F", (void *)j_Kairo_getScaleRatio);
+    gds_jni_bind("kairo/android/plugin/Utility", "getNotificationData",
+                 "()[Ljava/lang/String;",
+                 (void *)j_Utility_getNotificationData);
+    gds_jni_bind("kairo/android/plugin/Utility", "getNotificationData",
+                 "()Ljava/lang/Object;",
+                 (void *)j_Utility_getNotificationData);
+    gds_jni_bind("kairo/android/plugin/Utility", "getNotificationFilter",
+                 "(Ljava/lang/Object;)I",
+                 (void *)j_Utility_getNotificationFilter);
+    gds_jni_bind("kairo/android/plugin/Utility", "getNotificationFilter",
+                 "(Landroid/content/Context;)I",
+                 (void *)j_Utility_getNotificationFilter);
+    /* PackageManager / PackageInfo / Signature (anti-tamper chain) */
+    gds_jni_bind("android/content/Context", "getPackageManager",
+                 "()Landroid/content/pm/PackageManager;",
+                 (void *)j_Context_getPackageManager);
+    gds_jni_bind("android/content/Context", "getPackageManager",
+                 "()Ljava/lang/Object;",
+                 (void *)j_Context_getPackageManager);
+    gds_jni_bind("android/app/Activity", "getPackageManager",
+                 "()Landroid/content/pm/PackageManager;",
+                 (void *)j_Context_getPackageManager);
+    gds_jni_bind("android/app/Activity", "getPackageManager",
+                 "()Ljava/lang/Object;",
+                 (void *)j_Context_getPackageManager);
+    gds_jni_bind("com/unity3d/player/UnityPlayer", "getPackageManager",
+                 "()Landroid/content/pm/PackageManager;",
+                 (void *)j_Context_getPackageManager);
+    gds_jni_bind("android/content/pm/PackageManager", "getPackageInfo",
+                 "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+                 (void *)j_PM_getPackageInfo);
+    gds_jni_bind("android/content/pm/PackageInfo", "versionCode", "I",
+                 (void *)j_PackageInfo_getInt);
+    gds_jni_bind("android/content/pm/PackageInfo", "longVersionCode", "J",
+                 (void *)j_PackageInfo_getLong);
+    gds_jni_bind("android/content/pm/PackageInfo", "versionName",
+                 "Ljava/lang/String;", (void *)j_PackageInfo_versionName);
+    gds_jni_bind("android/content/pm/PackageInfo", "packageName",
+                 "Ljava/lang/String;", (void *)j_PackageInfo_packageName);
+    gds_jni_bind("android/content/pm/PackageInfo", "signatures",
+                 "[Landroid/content/pm/Signature;",
+                 (void *)j_PackageInfo_signatures);
+    gds_jni_bind("android/content/pm/PackageInfo", "signingInfo",
+                 "Landroid/content/pm/SigningInfo;",
+                 (void *)j_PackageInfo_signatures);
+    gds_jni_bind("android/content/pm/Signature", "hashCode", "()I",
+                 (void *)j_Signature_hashCode);
+    gds_jni_bind("android/content/pm/Signature", "toByteArray", "()[B",
+                 (void *)j_Signature_toByteArray);
+    /* App-size / package identity (KairoPlugin.Init chain, run14/23) */
+    gds_jni_bind("kairo/android/plugin/Utility", "getPackageName",
+                 "()Ljava/lang/String;", (void *)j_Utility_getPackageName);
+    gds_jni_bind("kairo/android/plugin/Utility", "getAppWidth",
+                 "()I", (void *)j_Utility_getAppWidth);
+    gds_jni_bind("kairo/android/plugin/Utility", "getAppHeight",
+                 "()I", (void *)j_Utility_getAppHeight);
+    gds_jni_bind("kairo/android/plugin/Utility", "getWidth",
+                 "()I", (void *)j_Utility_getWidth);
+    gds_jni_bind("kairo/android/plugin/Utility", "getHeight",
+                 "()I", (void *)j_Utility_getHeight);
+    /* GLES20 Java bridge (SupportsDepth24) */
+    gds_jni_bind("android/opengl/GLES20", "GL_EXTENSIONS", "I",
+                 (void *)j_GLES20_GL_EXTENSIONS);
+    gds_jni_bind("android/opengl/GLES20", "glGetString",
+                 "(I)Ljava/lang/String;", (void *)j_GLES20_glGetString);
+    /* Display.getRealSize / Point / Message / Handler */
+    gds_jni_bind("android/view/Display", "getRealSize",
+                 "(Landroid/graphics/Point;)V", (void *)j_Display_getRealSize);
+    gds_jni_bind("android/graphics/Point", "x", "I", (void *)j_Point_x);
+    gds_jni_bind("android/graphics/Point", "y", "I", (void *)j_Point_y);
+    gds_jni_bind("android/os/Message", "what", "I", (void *)j_Message_what);
+    gds_jni_bind("android/os/Handler", "postDelayed",
+                 "(Ljava/lang/Runnable;J)Z", (void *)j_Handler_postDelayed);
+    gds_jni_bind("android/os/Handler", "post",
+                 "(Ljava/lang/Runnable;)Z", (void *)j_Handler_postDelayed);
+    gds_jni_bind("android/os/Handler", "sendEmptyMessage", "(I)Z",
+                 (void *)j_Handler_postDelayed);
 
     input_device = mk_object("android/view/InputDevice");
     touch_device = mk_object("android/view/InputDevice");
@@ -3243,6 +4733,10 @@ void gds_jni_init(void)
                  "()Ljava/lang/String;", (void *)j_Environment_mounted);
     gds_jni_bind("android/os/Environment", "MEDIA_MOUNTED",
                  "Ljava/lang/String;", (void *)j_Environment_mounted);
+    gds_jni_bind("java/lang/String", "getBytes", "(Ljava/lang/String;)[B",
+                 (void *)j_String_getBytes);
+    gds_jni_bind("java/lang/String", "getBytes", "()[B",
+                 (void *)j_String_getBytes);
     gds_jni_bind("java/lang/String", "equals", "(Ljava/lang/Object;)Z",
                  (void *)j_String_equals);
     gds_jni_bind("java/lang/StringBuilder", "toString",

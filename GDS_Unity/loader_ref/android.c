@@ -12,6 +12,7 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>

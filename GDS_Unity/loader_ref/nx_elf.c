@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
@@ -336,7 +337,10 @@ static void apply(nx_mod *m, Elf64_Rela *r, size_t n, int *missing)
                 a = resolve(m, name, missing);
             if (!a) {
                 if (name && *name && ELF64_ST_BIND(sym->st_info) != STB_WEAK)
-                    nx_log("  unresolved %s <- %s", m->name, name);
+                    /* 0.61: always print - "N relocations unresolved" without
+                     * names was undiagnosable without GDS_VERBOSE. */
+                    fprintf(stderr, "[gamedevstory]   unresolved %s <- %s\n",
+                            m->name, name);
                 *slot = 0;
             } else {
                 *slot = (uintptr_t)a + r[i].r_addend;

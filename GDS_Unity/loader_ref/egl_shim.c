@@ -14,6 +14,7 @@
  * and eglSwapBuffers presents it.
  */
 #include "egl_shim.h"
+#include "musl_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,6 +111,16 @@ static pthread_mutex_t egl_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int next_context_id = 1;
 static int g_did_init = 0;
 
+/* 0.61: always-on call trace (stderr; swap/getproc are hot -> capped). */
+static int g_trc_cap = 400;
+static int g_trc_n = 0;
+static void TR(const char *msg) {
+  if (g_trc_n >= g_trc_cap) return;
+  g_trc_n++;
+  fprintf(stderr, "[egl] %s\n", msg);
+}
+
+
 /* ---- per-call counters (diagnostics: is Unity actually driving our EGL?) ---- */
 static volatile int g_n_eglGetDisplay, g_n_eglInitialize, g_n_eglChooseConfig;
 static volatile int g_n_eglCreateContext, g_n_eglMakeCurrent, g_n_eglSwapBuffers;
@@ -130,14 +141,203 @@ typedef struct {
 static _Thread_local _egl_context *current_context = NULL;
 static _Thread_local int has_real_gl = 0;
 
+/* ---- NullGL: fake GL backdrop for headless iteration (qemu/CI) -------------
+ * Engages ONLY when the real SDL/Mali bootstrap failed (auto) or when forced
+ * with GDS_NULLGL=2; GDS_NULLGL=0 disables it entirely.  When engaged,
+ * eglCreateContext/eglMakeCurrent/eglSwapBuffers succeed symbolically and
+ * eglGetProcAddress hands out deterministic fake GL entry points whose answers
+ * mimic the R36S's Mali-G31 ES2 context, so Unity's logic can run to the next
+ * real bug without a GPU.  The device happy path (real SDL window + context)
+ * is untouched: g_nullgl stays 0 there. */
+static int g_nullgl = 0;       /* engaged */
+static int g_nullgl_cfg = -1;  /* parsed env: 0=off 1=auto 2=force */
+static int nullgl_mode(void) {
+  if (g_nullgl_cfg < 0) {
+    const char *e = getenv("GDS_NULLGL");
+    g_nullgl_cfg = e ? atoi(e) : 1;
+  }
+  return g_nullgl_cfg;
+}
+static void nullgl_engage(const char *why) {
+  if (g_nullgl || nullgl_mode() == 0) return;
+  g_nullgl = 1;
+  fprintf(stderr, "[egl] *** NullGL fallback engaged (%s) -- no real GPU; "
+                  "GL calls become deterministic no-ops ***\n", why);
+}
+
+static unsigned nullgl_next_id = 1;
+static void nullgl_gen(int n, unsigned *ids) {
+  if (!ids) return;
+  for (int i = 0; i < n && i < 0x10000; i++) ids[i] = nullgl_next_id++;
+}
+static unsigned nullgl_create_one(void) { return nullgl_next_id++; }
+
+static const unsigned char *nullgl_GetString(unsigned name) {
+  switch (name) {
+  case 0x1F00: return (const unsigned char *)"ARM";
+  case 0x1F01: return (const unsigned char *)"Mali-G31";
+  case 0x1F02: return (const unsigned char *)"OpenGL ES 2.0 v1.NullGL";
+  case 0x8B8C: return (const unsigned char *)"OpenGL ES GLSL ES 1.00";
+  case 0x1F03: return (const unsigned char *)
+      "GL_OES_rgb8_rgba8 GL_OES_depth24 GL_OES_packed_depth_stencil "
+      "GL_EXT_texture_format_BGRA8888 GL_OES_texture_npot";
+  default:     return (const unsigned char *)"";
+  }
+}
+static unsigned nullgl_GetError(void) { return 0; } /* GL_NO_ERROR */
+
+static void nullgl_GetIntegerv(unsigned pname, int *p) {
+  if (!p) return;
+  switch (pname) {
+  case 0x0D33: p[0] = 8192; break;                       /* MAX_TEXTURE_SIZE */
+  case 0x0D3A: p[0] = 8192; p[1] = 8192; break;          /* MAX_VIEWPORT_DIMS */
+  case 0x80A9: p[0] = 8192; break;                       /* MAX_CUBE_MAP_TEXTURE_SIZE */
+  case 0x84E8: p[0] = 8192; break;                       /* MAX_RENDERBUFFER_SIZE */
+  case 0x8872: p[0] = 8; break;                          /* MAX_TEXTURE_IMAGE_UNITS */
+  case 0x8B4D: p[0] = 8; break;                          /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */
+  case 0x8DFB: p[0] = 4; break;                          /* MAX_VERTEX_TEXTURE_IMAGE_UNITS */
+  case 0x8869: p[0] = 16; break;                         /* MAX_VERTEX_ATTRIBS */
+  case 0x8DFD: p[0] = 128; break;                        /* MAX_VERTEX_UNIFORM_VECTORS */
+  case 0x8DFC: p[0] = 64; break;                         /* MAX_FRAGMENT_UNIFORM_VECTORS */
+  case 0x8DF9: p[0] = 15; break;                         /* MAX_VARYING_VECTORS */
+  case 0x821D: p[0] = 0; break;                          /* NUM_EXTENSIONS */
+  case 0x8B8D: p[0] = 200; break;                        /* MAX_TEXTURE_MAX_ANISOTROPY? (harmless) */
+  case 0x0B71: p[0] = 1; break;                          /* SUBPIXEL_BITS */
+  case 0x0C50: p[0] = 1; p[1] = 4064; break;             /* ALIASED_LINE_WIDTH_RANGE (ints) */
+  default:     p[0] = 0; break;
+  }
+}
+static void nullgl_GetFloatv(unsigned pname, float *p) {
+  if (!p) return;
+  switch (pname) {
+  case 0x84FF: p[0] = 16.0f; break;                      /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */
+  case 0x0C50: p[0] = 1.0f; p[1] = 4064.0f; break;       /* ALIASED_LINE_WIDTH_RANGE */
+  case 0x0C52: p[0] = 1.0f; p[1] = 4064.0f; break;       /* ALIASED_POINT_SIZE_RANGE */
+  case 0x846D: p[0] = 255.0f; p[1] = 255.0f; break;      /* DEPTH_RANGE */
+  case 0x0D3A: p[0] = 8192.0f; p[1] = 8192.0f; break;
+  default:     p[0] = 0.0f; break;
+  }
+}
+static void nullgl_GetBooleanv(unsigned pname, unsigned char *p) {
+  if (!p) return;
+  (void)pname;
+  p[0] = 0; /* GL_FALSE */
+}
+static unsigned nullgl_CheckFramebufferStatus(unsigned target) {
+  (void)target; return 0x8CD5; /* GL_FRAMEBUFFER_COMPLETE */
+}
+static void nullgl_GetShaderiv(unsigned shader, unsigned pname, int *p) {
+  (void)shader; if (!p) return;
+  switch (pname) {
+  case 0x8B81: p[0] = 1; break;  /* COMPILE_STATUS ok */
+  case 0x8B84: p[0] = 0; break;  /* INFO_LOG_LENGTH */
+  case 0x8B80: p[0] = 0; break;  /* DELETE_STATUS */
+  case 0x8B89: p[0] = 0x8B31; break; /* SHADER_TYPE = FRAGMENT (arbitrary) */
+  default:     p[0] = 0; break;
+  }
+}
+static void nullgl_GetProgramiv(unsigned program, unsigned pname, int *p) {
+  (void)program; if (!p) return;
+  switch (pname) {
+  case 0x8B82: p[0] = 1; break;  /* LINK_STATUS ok */
+  case 0x8B83: p[0] = 1; break;  /* VALIDATE_STATUS ok */
+  case 0x8B84: p[0] = 0; break;  /* INFO_LOG_LENGTH */
+  case 0x8B80: p[0] = 0; break;  /* DELETE_STATUS */
+  case 0x8B86: p[0] = 0; break;  /* ACTIVE_UNIFORMS */
+  case 0x8B87: p[0] = 0; break;  /* ACTIVE_ATTRIBUTES */
+  case 0x8B8A: p[0] = 0; break;  /* ATTACHED_SHADERS */
+  default:     p[0] = 0; break;
+  }
+}
+static void nullgl_InfoLog(unsigned obj, int bufsize, int *length, char *log) {
+  (void)obj;
+  if (length) *length = 0;
+  if (log && bufsize > 0) log[0] = 0;
+}
+static void nullgl_ReadPixels(int x, int y, int w, int h, unsigned fmt, unsigned type, void *pix) {
+  (void)x; (void)y; (void)fmt; (void)type;
+  if (!pix || w <= 0 || h <= 0 || w > 8192 || h > 8192) return;
+  memset(pix, 0, (size_t)w * (size_t)h * 4); /* worst-case RGBA8 footprint */
+}
+static void nullgl_GetActiveAny(unsigned prog, unsigned idx, int bufsize, int *length,
+                                int *size, unsigned *type, char *name) {
+  (void)prog; (void)idx; (void)size;
+  if (length) *length = 0;
+  if (type) *type = 0;
+  if (name && bufsize > 0) name[0] = 0;
+}
+static void nullgl_GetShaderPrecisionFormat(unsigned st, unsigned pt, int *range, int *precision) {
+  (void)st; (void)pt;
+  if (range) { range[0] = 127; range[1] = 127; }
+  if (precision) *precision = 23;
+}
+static int nullgl_false0(void) { return 0; }
+static long nullgl_noop(void) { return 0; } /* generic: args ignored, returns 0/NULL */
+
+void *nullgl_gl_proc(const char *n) {
+  static const struct { const char *n; void *f; } t[] = {
+    {"glGetString", nullgl_GetString}, {"glGetStringi", nullgl_noop},
+    {"glGetError", nullgl_GetError},
+    {"glGetIntegerv", nullgl_GetIntegerv}, {"glGetFloatv", nullgl_GetFloatv},
+    {"glGetBooleanv", nullgl_GetBooleanv},
+    {"glCheckFramebufferStatus", nullgl_CheckFramebufferStatus},
+    {"glGetShaderiv", nullgl_GetShaderiv}, {"glGetProgramiv", nullgl_GetProgramiv},
+    {"glGetShaderInfoLog", nullgl_InfoLog}, {"glGetProgramInfoLog", nullgl_InfoLog},
+    {"glGenTextures", nullgl_gen}, {"glGenBuffers", nullgl_gen},
+    {"glGenFramebuffers", nullgl_gen}, {"glGenRenderbuffers", nullgl_gen},
+    {"glGenVertexArraysOES", nullgl_gen}, {"glGenVertexArrays", nullgl_gen},
+    {"glCreateShader", nullgl_create_one}, {"glCreateProgram", nullgl_create_one},
+    {"glReadPixels", nullgl_ReadPixels},
+    {"glGetActiveUniform", nullgl_GetActiveAny}, {"glGetActiveAttrib", nullgl_GetActiveAny},
+    {"glGetShaderPrecisionFormat", nullgl_GetShaderPrecisionFormat},
+    {"glGetUniformLocation", nullgl_false0}, {"glGetAttribLocation", nullgl_false0},
+    {"glIsEnabled", nullgl_false0}, {"glIsTexture", nullgl_false0},
+    {"glIsBuffer", nullgl_false0}, {"glIsProgram", nullgl_false0},
+    {"glIsShader", nullgl_false0}, {"glIsFramebuffer", nullgl_false0},
+    {"glIsRenderbuffer", nullgl_false0}, {"glIsVertexArray", nullgl_false0},
+    {"glIsVertexArrayOES", nullgl_false0},
+    {"glUnmapBuffer", nullgl_false0}, {"glUnmapBufferOES", nullgl_false0},
+    {"glGetVertexAttribPointerv", nullgl_noop},
+    {"glMapBuffer", nullgl_noop}, {"glMapBufferOES", nullgl_noop},
+    {"glMapBufferRange", nullgl_noop}, {"glMapBufferRangeEXT", nullgl_noop},
+    {0, 0}
+  };
+  for (int i = 0; t[i].n; i++) if (strcmp(t[i].n, n) == 0) return t[i].f;
+  return nullgl_noop; /* every other entry point: benign no-op */
+}
+
 int egl_shim_screen_w(void) { return g_screen_w; }
 int egl_shim_screen_h(void) { return g_screen_h; }
+
+/* Real GL answers captured at bootstrap (1 when available); the JNI GLES20
+ * bridge reads these so Kairosoft's SupportsDepth24-style checks see the same
+ * extensions the real context has, on any thread. */
+static char g_gl_str_cache[5][3072]; /* vendor renderer version sl extensions */
+static int g_gl_str_cached = 0;
+const char *gds_gl_string_for_jni(unsigned name) {
+  if (g_gl_str_cached) {
+    switch (name) {
+    case 0x1F00: return g_gl_str_cache[0];
+    case 0x1F01: return g_gl_str_cache[1];
+    case 0x1F02: return g_gl_str_cache[2];
+    case 0x8B8C: return g_gl_str_cache[3];
+    case 0x1F03: return g_gl_str_cache[4];
+    default: return "";
+    }
+  }
+  return (const char *)nullgl_GetString(name);
+}
 
 /* ---- window + share-root context creation (must run on the main thread) ---- */
 void egl_shim_create_window(void) {
   if (g_did_init) return;
   g_did_init = 1;
-  if (!sdl_load()) { printf("[egl] SDL2 unavailable: %s\n", S.GetError ? S.GetError() : "?"); return; }
+  if (nullgl_mode() == 2) { nullgl_engage("GDS_NULLGL=2 (forced)"); return; }
+  if (!sdl_load()) {
+    printf("[egl] SDL2 unavailable: %s\n", S.GetError ? S.GetError() : "?");
+    nullgl_engage("SDL2 unavailable");
+    return;
+  }
   /* SDL must be initialized before any window/context call, or SDL_CreateWindow
    * can't set up the video driver / load the EGL/GL library ("Can't load EGL/GL
    * library on window creation").  This is why the first on-device run had
@@ -189,7 +389,11 @@ void egl_shim_create_window(void) {
     }
     if (egl_share_root) { g_alpha_size = fmts[f][0]; g_depth_size = fmts[f][1]; g_stencil_size = fmts[f][2]; }
   }
-    if (!egl_share_root) { printf("[egl] no GL context created\n"); return; }
+    if (!egl_share_root) {
+      printf("[egl] no GL context created\n");
+      nullgl_engage("SDL GL context creation failed");
+      return;
+    }
     printf("[egl] window=%p context=%p (SDL_CreateWindow may have logged a surface warning)\n",
            (void *)egl_window, (void *)egl_share_root);
 
@@ -198,13 +402,28 @@ void egl_shim_create_window(void) {
   if (g_screen_h <= 0) g_screen_h = height;
   if (S.GL_SetSwapInterval) S.GL_SetSwapInterval(1);
 
-  /* log the real GL identity (proves the Mali driver is behind the context) */
+  /* log the real GL identity (proves the Mali driver is behind the context)
+   * and cache the strings: android/opengl/GLES20.glGetString goes through our
+   * JNI bridge on threads where no context is current, so the real driver
+   * answer has to be captured here while the root context is bound. */
   void *gs = S.GL_GetProcAddress ? S.GL_GetProcAddress("glGetString") : NULL;
   if (gs) {
     const unsigned char *(*g)(unsigned) = (const unsigned char *(*)(unsigned))gs;
-    printf("[egl] GL_VENDOR=%s\n", g(0x1F00));   /* GL_VENDOR */
-    printf("[egl] GL_RENDERER=%s\n", g(0x1F01)); /* GL_RENDERER */
-    printf("[egl] GL_VERSION=%s\n", g(0x1F02));  /* GL_VERSION */
+    static const struct { unsigned name; const char *tag; } rows[5] = {
+      { 0x1F00, "GL_VENDOR" }, { 0x1F01, "GL_RENDERER" }, { 0x1F02, "GL_VERSION" },
+      { 0x8B8C, "GL_SL" },     { 0x1F03, "GL_EXTENSIONS" },
+    };
+    for (int i = 0; i < 5; i++) {
+      const unsigned char *s = g(rows[i].name);
+      snprintf(g_gl_str_cache[i], sizeof g_gl_str_cache[i], "%s",
+               s ? (const char *)s : "");
+      if (i < 3)
+        printf("[egl] %s=%s\n", rows[i].tag, g_gl_str_cache[i]);
+      else
+        printf("[egl] %s: %u bytes\n", rows[i].tag,
+               (unsigned)strlen(g_gl_str_cache[i]));
+    }
+    g_gl_str_cached = 1;
   }
   printf("[egl] window %dx%d context ready (ES%d)\n", g_screen_w, g_screen_h, g_es_major);
 
@@ -213,6 +432,7 @@ void egl_shim_create_window(void) {
 }
 
 int egl_shim_ensure_current(void) {
+  if (g_nullgl) return 1;
   if (!egl_window || !egl_share_root) return 0;
   if (has_real_gl) return 1;
   if (current_context && current_context->sdl_context) {
@@ -227,10 +447,12 @@ void egl_shim_swap(void) { if (egl_window && S.GL_SwapWindow) S.GL_SwapWindow(eg
 
 /* ---- EGL API ---- */
 EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id) {
+  { char b[96]; snprintf(b,sizeof b,"eglGetDisplay(%p)",(void*)display_id); TR(b); }
   (void)display_id; g_n_eglGetDisplay++; return (EGLDisplay)&g_did_init;
 }
 
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor) {
+  TR("eglInitialize");
   (void)dpy; if (major) *major = 1; if (minor) *minor = 4;
   g_n_eglInitialize++; if (g_n_eglInitialize == 1) egl_show_counts("after Initialize");
   return EGL_TRUE;
@@ -247,6 +469,7 @@ EGLBoolean eglTerminate(EGLDisplay dpy) {
 
 EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig *configs,
                            EGLint config_size, EGLint *num_config) {
+  { char b[1024], *q=b; q+=snprintf(q,sizeof(b)-(q-b),"eglChooseConfig want:"); if(attrib_list) for(int i=0;attrib_list[i]!=0x3038&&i<40;i+=2) q+=snprintf(q,(b+sizeof b)-q," %x=%x",attrib_list[i],attrib_list[i+1]); void *ra=__builtin_return_address(0); extern const char *gds_mod_at(const void *, void **); void *base=0; const char *mod=gds_mod_at(ra,&base); q+=snprintf(q,(b+sizeof b)-q,"  (from %s+%lx)", mod?mod:"?", (unsigned long)ra-(unsigned long)base); TR(b); }
   (void)dpy; (void)attrib_list;
   g_n_eglChooseConfig++;
   if (configs && config_size > 0) configs[0] = (EGLConfig)&g_did_init;
@@ -256,22 +479,34 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig 
 
 EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win,
                                   const EGLint *attrib_list) {
+  TR("eglCreateWindowSurface");
   (void)dpy; (void)config; (void)win; (void)attrib_list;
   g_n_eglCreateWindowSurface++;
   return (EGLSurface)&g_did_init; /* the real window lives in SDL; surface is symbolic */
 }
 
 EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint *attrib_list) {
+  TR("eglCreatePbufferSurface");
   (void)dpy; (void)config; (void)attrib_list;
   return (EGLSurface)&g_did_init;
 }
 
 EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
                             const EGLint *attrib_list) {
+  { char b[128]; int v=-1; if(attrib_list) for(int i=0; attrib_list[i]!=0x3038; i+=2) if(attrib_list[i]==0x3098) v=attrib_list[i+1]; snprintf(b,sizeof b,"eglCreateContext client_version=%d share=%p",v,(void*)share_context); TR(b); }
   (void)dpy; (void)config; (void)share_context; (void)attrib_list;
   _egl_context *c = (_egl_context *)calloc(1, sizeof(_egl_context));
   if (!c) return EGL_NO_CONTEXT;
-  if (!egl_window || !S.GL_CreateContext) { free(c); return EGL_NO_CONTEXT; }
+  if (!egl_window || !S.GL_CreateContext) {
+    if (g_nullgl) {
+      c->sdl_context = NULL;
+      c->id = next_context_id++;
+      g_n_eglCreateContext++;
+      printf("[egl] eglCreateContext -> %p [ctx_id=%d, NullGL]\n", (void *)c, c->id);
+      return (EGLContext)c;
+    }
+    free(c); return EGL_NO_CONTEXT;
+  }
   pthread_mutex_lock(&egl_ctx_mutex);
   S.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
   S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, g_es_major);
@@ -293,6 +528,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
 }
 
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
+  { char b[96]; snprintf(b,sizeof b,"eglMakeCurrent draw=%p ctx=%p",(void*)draw,(void*)ctx); TR(b); }
   (void)dpy; (void)read;
   g_n_eglMakeCurrent++;
   _egl_context *context = (_egl_context *)ctx;
@@ -343,6 +579,7 @@ EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
 }
 
 EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute, EGLint *value) {
+  { char b[96]; snprintf(b,sizeof b,"eglQuerySurface attr=0x%x",(int)attribute); TR(b); }
   (void)dpy; (void)surface;
   if (!value) return EGL_TRUE;
   if (attribute == 0x3057) *value = g_screen_w;      /* EGL_WIDTH */
@@ -352,6 +589,7 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute,
 }
 
 EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint *value) {
+  { char b[160]; void *ra=__builtin_return_address(0); extern const char *gds_mod_at(const void *, void **); void *base=0; const char *mod=gds_mod_at(ra,&base); snprintf(b,sizeof b,"eglGetConfigAttrib attr=0x%x from %s+%lx",(int)attribute, mod?mod:"?", (unsigned long)ra-(unsigned long)base); TR(b); }
   (void)dpy; (void)config;
   if (!value) return EGL_TRUE;
   switch (attribute) {
@@ -367,6 +605,13 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
   case 0x3033: *value = 0x0005; break;              /* EGL_SURFACE_TYPE = WINDOW|PBUFFER */
   case 0x3040: *value = 0x04; break;                /* EGL_RENDERABLE_TYPE = ES2 */
   case 0x3042: *value = 0x04; break;
+  /* EGL_DEPTH_ENCODING_NV: a real EGL without the extension returns
+   * EGL_BAD_ATTRIBUTE here and Unity's helper substitutes 0x30E3 (NONE).
+   * We used to answer 0 -- Unity's config descriptor then recorded
+   * "nonlinear NV depth" ([desc+0x38]=0) which a later pure-CPU sanity check
+   * rejects, producing "Graphics device is null" with no further EGL calls.
+   * Evidence: local qemu run (run3.log) + libunity disasm 0x62aaf0-0x62ab30. */
+  case 0x30e2: *value = 0x30e3; break;              /* EGL_DEPTH_ENCODING_NONE_NV */
   case 0x3039: *value = 0x308E; break;              /* EGL_COLOR_BUFFER_TYPE = RGB */
   default: *value = 0; break;
   }
@@ -387,12 +632,14 @@ void *eglGetProcAddress(const char *procname) {
       if (S.GL_GetProcAddress) { ptr = S.GL_GetProcAddress(stripped); if (ptr) return ptr; }
     }
   }
+  if (g_nullgl && procname) return nullgl_gl_proc(procname);
   return NULL;
 }
 
-EGLBoolean eglBindAPI(unsigned api) { (void)api; return EGL_TRUE; }
+EGLBoolean eglBindAPI(unsigned api) { { char b[64]; snprintf(b,sizeof b,"eglBindAPI(0x%x)",api); TR(b); } (void)api; return EGL_TRUE; }
 
 const char *eglQueryString(EGLDisplay dpy, EGLint name) {
+  { char b[96]; snprintf(b,sizeof b,"eglQueryString(0x%x)",(int)name); TR(b); }
   (void)dpy;
   switch (name) {
   case 0x3053: return "GDS";             /* EGL_VENDOR */
@@ -404,6 +651,7 @@ const char *eglQueryString(EGLDisplay dpy, EGLint name) {
 }
 
 EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
+  { char b[64]; snprintf(b,sizeof b,"eglSwapInterval(%d)",(int)interval); TR(b); }
   (void)dpy; if (S.GL_SetSwapInterval) S.GL_SetSwapInterval(interval); return EGL_TRUE;
 }
 
@@ -412,6 +660,7 @@ EGLContext eglGetCurrentContext(void) { return (EGLContext)current_context; }
 EGLSurface eglGetCurrentSurface(EGLint readdraw) { (void)readdraw; return (EGLSurface)&g_did_init; }
 
 EGLBoolean eglSurfaceAttrib(EGLDisplay dpy, EGLSurface s, EGLint a, EGLint v) {
+  { char b[96]; snprintf(b,sizeof b,"eglSurfaceAttrib a=0x%x v=0x%x",(int)a,(int)v); TR(b); }
   (void)dpy; (void)s; (void)a; (void)v; return EGL_TRUE;
 }
 

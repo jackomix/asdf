@@ -4,6 +4,7 @@
  * reference bionic.c table lists the whole family, so provide all of them. */
 #define _GNU_SOURCE
 #include <stddef.h>
+#include "musl_compat.h"
 #include <dlfcn.h>
 #include "zlib.h"
 

@@ -13,6 +13,7 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
@@ -67,7 +68,7 @@
 
 /* ------------------------------------------------------------------ logging */
 
-int gds_log_level = 0;   /* GDS_LOGCAT=1 mirrors the game's own log */
+int gds_log_level = 1;   /* game logcat mirrored by default; GDS_LOGCAT=0 mutes */
 
 static const char lvl[] = "?????VDIWEFS";
 
@@ -379,6 +380,23 @@ struct bionic_sigaction {
 static int my_sigaction(int sig, const struct bionic_sigaction *na,
                         struct bionic_sigaction *oa)
 {
+    /* 0.61: keep OUR unified fault dump on crash signals.  Unity's
+     * POSIXCrashReporter reinstalls handlers for these as it boots, which
+     * takes the trap away from on_fault and leaves only its own (here muted)
+     * logcat output before the process dies.  Pretend success instead. */
+    if (na && (sig == SIGILL || sig == SIGTRAP || sig == SIGABRT ||
+               sig == SIGBUS || sig == SIGFPE || sig == SIGSEGV ||
+               sig == SIGSYS)) {
+        static int blocked[64];
+        if (sig < 64 && !blocked[sig]) {
+            blocked[sig] = 1;
+            fprintf(stderr, "[gds] sigaction(%d) by engine blocked; loader fault dump stays armed\n",
+                    sig);
+        }
+        if (oa)
+            memset(oa, 0, sizeof *oa);
+        return 0;
+    }
     struct sigaction g, og;
     if (na) {
         memset(&g, 0, sizeof g);
@@ -505,6 +523,23 @@ static int my_lstat(const char *p, struct stat *st) { return gds_lstat(p, st); }
 static int my_access(const char *p, int m) { return gds_access(p, m); }
 static int my_faccessat(int df, const char *p, int m, int f) { return gds_faccessat(df, p, m, f); }
 
+/* The game's kairo.unity.util.Log writes through a pipe/file, not logcat --
+ * its exception reports (e.g. "Log:Info(String, Exception)\n...Awake()\n")
+ * were invisible until mirrored.  watch fd1/fd2 writes from the engine. */
+static ssize_t my_write(int fd, const void *buf, size_t n)
+{
+    if ((fd == 1 || fd == 2) && buf && n) {
+        /* prefix raw engine output so it stands out in a noisy log */
+        static const char tag[] = "[gdsw] ";
+        fwrite(tag, 1, sizeof tag - 1, stderr);
+        fwrite(buf, 1, n, stderr);
+        if (((const char *)buf)[n - 1] != '\n')
+            fputc('\n', stderr);
+        fflush(stderr);
+    }
+    return write(fd, buf, n);
+}
+
 static DIR *my_opendir(const char *path)
 {
     DIR *d = opendir(path);
@@ -594,7 +629,11 @@ static nx_import tab[] = {
     M(__errno), M(__stack_chk_fail),
     M(__cxa_atexit), M(__cxa_finalize), M(__cxa_pure_virtual),
     A("__register_atfork", my___register_atfork),
-    A("__sF", gds_sF), A("_ctype_", &gds_ctype_ptr),
+    /* 0.61: libil2cpp has a GLOB_DAT reloc on `environ` that the reloc phase
+     * used to leave zeroed (only my_dlsym served it before) -> mono's
+     * environment enumeration dereferences a NULL char**.  Old freestanding
+     * loader provided it; restore. */
+    A("__sF", gds_sF), A("_ctype_", &gds_ctype_ptr), A("environ", &environ),
     M(__ctype_get_mb_cur_max),
 
     /* FORTIFY */
@@ -673,7 +712,8 @@ static nx_import tab[] = {
     M(getauxval), M(stat), M(opendir),
 
     /* files */
-    M(open), M(open64), E(openat), E(close), E(read), E(write), E(pread),
+    M(open), M(open64), E(openat), E(close), E(read), A("write", my_write),
+    E(pread),
     E(pwrite), E(pread64), E(pwrite64), E(readv), E(writev), E(lseek),
     E(lseek64), E(fstat), M(lstat), E(fstatat), E(statfs),
     E(fstatfs), E(statvfs), E(fsync), E(fdatasync), E(ftruncate),

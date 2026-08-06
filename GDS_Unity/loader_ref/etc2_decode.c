@@ -7,6 +7,7 @@
  * the validated NextOS GTA ports.
  */
 #include <stdint.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 
 static const int etc_mod[8][2] = {

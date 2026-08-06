@@ -5,6 +5,7 @@
  * callbacks.  No SDL2 headers needed - reached through dlsym. */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>

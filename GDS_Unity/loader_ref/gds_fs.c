@@ -7,6 +7,7 @@
  * data/ dir so the game can find its files. */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>

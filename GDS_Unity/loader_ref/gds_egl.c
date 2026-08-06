@@ -6,6 +6,7 @@
  * to create the real SDL window + GLES2 context BEFORE Unity's graphics init. */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>

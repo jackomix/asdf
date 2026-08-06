@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include "musl_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -19,6 +20,7 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <ucontext.h>
+#include <sys/mman.h>
 
 #include "nx_elf.h"
 #include "gds.h"
@@ -126,9 +128,10 @@ static void *watchdog_thread(void *arg)
 void gds_arm_frame_watchdog(void)
 {
     const char *v = getenv("GDS_WATCHDOG");
-    if (!v || !*v)
-        return;
-    watchdog_seconds = atoi(v);
+    /* 0.61: default ON (30s).  A hung first frame used to leave a black screen
+     * forever; the watchdog faults the render thread so the log shows where it
+     * is stuck.  GDS_WATCHDOG=0 disables, or names another timeout. */
+    watchdog_seconds = v && *v ? atoi(v) : 30;
     if (watchdog_seconds <= 0)
         return;
     watchdog_tid = (pid_t)syscall(SYS_gettid);
@@ -182,7 +185,9 @@ static void read_env(void)
 {
     const char *v;
     nx_verbose   = (v = getenv("GDS_VERBOSE")) && *v != '0';
-    gds_log_level = (v = getenv("GDS_LOGCAT")) && *v != '0';
+    /* 0.61: game logcat defaults ON (GDS_LOGCAT=0 turns it off).  A trap with
+     * logcat muted hid Unity's own fatal message. */
+    gds_log_level = (v = getenv("GDS_LOGCAT")) ? (*v != '0') : 1;
     gds_trace_jni = (v = getenv("GDS_JNILOG")) && *v != '0';
     gds_trace_gl  = (v = getenv("GDS_GLLOG")) && *v != '0';
     if ((v = getenv("GDS_FRAMES")))
@@ -252,12 +257,581 @@ int gds_load_modules(void)
 /* A fault inside a module we mapped ourselves has no symbols and no link map,
  * so the only way to place it is to print the PC against the module bases.
  * Always on: it costs nothing until something goes wrong. */
+/* ---------------- one-shot brk probes (managed exception catcher) ---------
+ * GDS_TRAP_AT=1 arms brk#0 patches over IApplication::Error and every
+ * Kairosoft *Exception ctor in libil2cpp.so.  On SIGTRAP the handler dumps
+ * the exception's klass name / message / KairoException.displayMessage_
+ * (obj+0x90 per metadata) / inner-exception chain and the caller (x30),
+ * restores the original instruction and resumes.  Device-safe: off unless
+ * the env var is set. */
+struct probe { uintptr_t addr; uint32_t orig; int hit; int cap; int kind; const char *tag; };
+#define MAX_PROBES 96
+static struct probe g_probes[MAX_PROBES];
+static int g_nprobes;
+static int g_in_dump;
+static uintptr_t g_il2b;
+
+static int trap_ptr_ok(uintptr_t p)
+{
+    return p > 0x10000 && p < 0x800000000000UL;
+}
+
+/* Mapping check for probe-time derefs.  Uses raw mincore(2): no fd needed,
+ * so it cannot flake under fd pressure inside the signal handler, and it
+ * always reflects the current address space (the IL2CPP GC heap grows
+ * while the game boots). */
+static int trap_mapped(uintptr_t a)
+{
+    unsigned char vec[1];
+    if (!trap_ptr_ok(a))
+        return 0;
+    return syscall(232 /*SYS_mincore*/, (void *)(a & ~0xfffUL), 1, vec) == 0;
+}
+
+static const char *trap_cstr(uintptr_t va, char *buf, size_t cap)
+{
+    size_t n = 0;
+    const char *s = (const char *)va;
+    if (!trap_ptr_ok(va))
+        return "?";
+    if (!trap_mapped(va))
+        return "<unmapped>";
+    while (n + 1 < cap && n < 96 && s[n] >= 0x20 && (unsigned char)s[n] < 0x7f) {
+        buf[n] = s[n];
+        n++;
+    }
+    buf[n] = 0;
+    return buf;
+}
+
+static void trap_il2str(uintptr_t str_va, char *out, size_t cap)
+{
+    /* Il2CppString: +0x10 int32 length, +0x14 utf16 chars */
+    size_t n = 0;
+    if (!trap_ptr_ok(str_va)) { snprintf(out, cap, "(null)"); return; }
+    if (!trap_mapped(str_va)) { snprintf(out, cap, "<unmapped>"); return; }
+    int len = *(volatile int *)(str_va + 0x10);
+    if (len < 0 || len > 512) { snprintf(out, cap, "(badlen %d)", len); return; }
+    const uint16_t *c = (const uint16_t *)(str_va + 0x14);
+    for (int i = 0; i < len && n + 2 < cap; i++) {
+        uint16_t ch = c[i];
+        out[n++] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
+    }
+    out[n] = 0;
+}
+
+/* fully-guarded one-line object brief: value, klass, ns.name, +0x10 string */
+static void trap_brief(uintptr_t obj, const char *what)
+{
+    char b1[96], b2[96], s[600];
+    fprintf(stderr, "[trap]   %s=%#lx", what, (unsigned long)obj);
+    if (!trap_ptr_ok(obj) || !trap_mapped(obj)) { fprintf(stderr, " (bad)\n"); return; }
+    uintptr_t k = *(uintptr_t *)obj;
+    if (!trap_ptr_ok(k) || !trap_mapped(k)) {
+        fprintf(stderr, " klass=(bad %#lx)\n", (unsigned long)k);
+        return;
+    }
+    fprintf(stderr, " %s.%s", trap_cstr(*(uintptr_t *)(k + 0x18), b2, sizeof b2),
+            trap_cstr(*(uintptr_t *)(k + 0x10), b1, sizeof b1));
+    trap_il2str(*(uintptr_t *)(obj + 0x10), s, sizeof s);
+    fprintf(stderr, " msg='%s'\n", s);
+}
+
+static void trap_dump_exc(uintptr_t obj, uintptr_t x30, const char *what)
+{    char nm[128], ns[128], msg[600];
+    uintptr_t klass = trap_ptr_ok(obj) ? *(uintptr_t *)obj : 0;
+    if (!trap_ptr_ok(klass))
+        return;
+    fprintf(stderr, "[trap] %s=%#lx class=%s.%s caller=il2cpp+%#lx\n",
+            what, (unsigned long)obj,
+            trap_cstr(*(uintptr_t *)(klass + 0x18), ns, sizeof ns),
+            trap_cstr(*(uintptr_t *)(klass + 0x10), nm, sizeof nm),
+            (unsigned long)(x30 - g_il2b));
+    trap_il2str(*(uintptr_t *)(obj + 0x10), msg, sizeof msg);
+    fprintf(stderr, "[trap]   message        : '%s'\n", msg);
+    trap_il2str(*(uintptr_t *)(obj + 0x90), msg, sizeof msg);
+    fprintf(stderr, "[trap]   displayMessage_: '%s'\n", msg);
+    uintptr_t inner = *(uintptr_t *)(obj + 0x20);
+    for (int d = 0; d < 4 && trap_ptr_ok(inner); d++) {
+        uintptr_t ik = *(uintptr_t *)inner;
+        if (!trap_ptr_ok(ik))
+            break;
+        trap_il2str(*(uintptr_t *)(inner + 0x10), msg, sizeof msg);
+        fprintf(stderr, "[trap]   inner[%d] %s.%s: '%s'\n", d,
+                trap_cstr(*(uintptr_t *)(ik + 0x18), ns, sizeof ns),
+                trap_cstr(*(uintptr_t *)(ik + 0x10), nm, sizeof nm), msg);
+        inner = *(uintptr_t *)(inner + 0x20);
+    }
+}
+
+/* ask the il2cpp runtime itself which images resolve form.SpForm */
+static void trap_spform_lookup(void)
+{
+    nx_mod *il2cpp = nx_find_mod("libil2cpp.so");
+    if (!il2cpp)
+        return;
+    void *(*domain_get)(void) = nx_lookup_in(il2cpp, "il2cpp_domain_get");
+    void **(*get_assemblies)(void *, size_t *) =
+        nx_lookup_in(il2cpp, "il2cpp_domain_get_assemblies");
+    void *(*assembly_get_image)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_assembly_get_image");
+    void *(*class_from_name)(void *, const char *, const char *) =
+        nx_lookup_in(il2cpp, "il2cpp_class_from_name");
+    const char *(*image_get_name)(void *) =
+        nx_lookup_in(il2cpp, "il2cpp_image_get_name");
+    if (!image_get_name)
+        image_get_name = nx_lookup_in(il2cpp, "il2cpp_image_get_filename");
+    if (!domain_get || !get_assemblies || !assembly_get_image ||
+        !class_from_name) {
+        fprintf(stderr, "[trap]   spform lookup: exports missing\n");
+        return;
+    }
+    size_t na = 0;
+    void **asms = get_assemblies(domain_get(), &na);
+    int found = 0;
+    for (size_t i = 0; i < na && asms; i++) {
+        void *img = assembly_get_image(asms[i]);
+        void *cls = img ? class_from_name(img, "form", "SpForm") : 0;
+        if (cls) {
+            found = 1;
+            fprintf(stderr, "[trap]   SpForm FOUND asm[%zu] img=%p name=%s cls=%p\n",
+                    i, img, image_get_name ? image_get_name(img) : "?",
+                    (void *)cls);
+        }
+    }
+    if (!found)
+        fprintf(stderr, "[trap]   SpForm NOT FOUND in any of %zu assemblies\n", na);
+}
+
+static void arm_traps(uintptr_t il2b)
+{
+    static const struct { uint32_t va; const char *tag; int kind; } T[] = {
+        {0x1757230, "IApplication::Error",        1},
+        {0x17d06f8, "KairoException.ctorA",       2},
+        {0x17d0764, "KairoException.ctorB",       2},
+        {0x17d4108, "NotPermitException.ctorA",   2},
+        {0x17d413c, "NotPermitException.ctorB",   2},
+        {0x17ce940, "SignInException.ctorA",      2},
+        {0x17ce948, "SignInException.ctorB",      2},
+        {0x17ce950, "IllegalFileException.ctorA", 2},
+        {0x17ce958, "IllegalFileException.ctorB", 2},
+        {0x17cee78, "JarFormatException.ctor",    2},
+        {0x179aff8, "UIException.ctor",           2},
+        {0x1866584, "ConnectionException.ctor",   2},
+        {0x1856bec, "IllegalPurchaseException.ctor", 2},
+        {0x17bd558, "java.io.EOFException.ctor",  2},
+        /* boot-gate / dialog-source candidates (kind 3: tag + caller) */
+        {0x17fb140, "KairoPlugin.ShowDialog",     3},
+        {0x17549a0, "IApplication.BootError",     3},
+        {0x175be48, "IApplication.OnNotPermit",   3},
+        {0x175bfbc, "IApplication.ShowPermissionError", 3},
+        {0x175bc04, "IApplication.OnPermit",      3},
+        {0x175c0cc, "IApplication.RequestPermission", 3},
+        {0x17565b8, "IApplication.TerminateCheck", 5},
+        {0x1759dc4, "IApplication.GooglePlayLicenseCheck", 3},
+        {0x175c734, "IApplication.DoProcOnSrv",   3},
+        {0x175a968, "IApplication.Terminate",     3},
+        {0x1842a00, "KairoBase.OnStart",          3},
+        {0x183fa4c, "KairoBase.Start",            3},
+        /* termination-dialog + form-flow resolution */
+        {0x17b6120, "FormManagerBase.DoTerminationDialog", 2},
+        {0x17b7918, "FormManagerBase.ShowTerminationDialog", 2},
+        {0x17b7930, "FormManagerBase.CheckShowTerminationDialog", 3},
+        {0x174b6b0, "ui.Dialog.ShowSelection",    2},
+        {0x17b34c4, "FormManagerBase.Push(A)",    4},
+        {0x17b34e4, "FormManagerBase.Push(B)",    4},
+        {0x17b1224, "FormManagerBase.Push(C)",    4},
+        {0x17569bc, "GetEntryAssembly.result",    8},
+        {0x17b18a0, "FormManagerBase.GetFormsNum", 3},
+        /* boot-chain: does the app ever boot? */
+        {0x1754ae4, "IApplication.Start",         3},
+        {0x1719d38, "ApplicationManager.Boot(A)", 2},
+        {0x1719da0, "ApplicationManager.Boot(B)", 2},
+        {0x171a2dc, "ApplicationManager.BeginContainerPlugin", 2},
+        {0x171a65c, "ApplicationManager.GetRootPlugin", 4},
+        {0x171a04c, "ApplicationManager.ReadSystemRecord", 3},
+        {0x1719ed4, "ApplicationManager.GetGamePlayData", 3},
+        {0x1755a0c, "Update.Push.site",           4},
+        {0x175543c, "IApplication.Update",        3},
+        {0x1755960, "Update.postGetType",         3},
+        {0x1756210, "Update.assembly-null-exit",  3},
+        {0x17560fc, "Update.entrycheck-skip",     3},
+        /* mscorlib: confirm GetType args + catch the thrown exception type */
+        {0x1914cb8, "Assembly.GetType",         2},
+        {0x1918094, "RuntimeAssembly.GetType",    2},
+        {0x19e5048, "TypeLoadException.ctor1",    2},
+        {0x19e9044, "TypeLoadException.ctor2",    2},
+        {0x19ea798, "TypeLoadException.ctor3",    2},
+        {0x19ea7e0, "TypeLoadException.ctor4",    2},
+        {0x19ea838, "TypeLoadException.ctor5",    2},
+        {0x192170c, "FileNotFoundException.ctor1",2},
+        {0x1918984, "FileNotFoundException.ctor2",2},
+        {0x1921768, "FileNotFoundException.ctor3",2},
+        {0x1921a20, "FileNotFoundException.ctor4",2},
+        /* service boot chain: is the game's KairoService ever created/started? */
+        {0xdb1594, "KairoService..ctor",        3},
+        {0xdb19f8, "KairoService.GetInstance",  3},
+        {0xdb1ae0, "KairoService.OnInit",       3},
+        {0xdb1b74, "KairoService.OnStart",      3},
+        {0xe86b38, "form.FormManager..ctor",    3},
+        {0xe73e38, "form.FormManager.GetInstance", 3},
+        /* main game class lifecycle (virtual-dispatch only) */
+        {0xe806d0, "main.Main..ctor",           3},
+        {0xe80808, "main.Main.OnCreate",        3},
+        {0xe80e40, "main.Main.OnUpdate",        3},
+        {0xe81708, "main.Main.OnDraw",          3},
+        /* IApplication::Start's virtual dispatch site (blr x9, vtable+0x198) */
+        {0x1754eb4, "Start.blrsite",            9},
+        /* main.Main::OnUpdate catch: what is actually thrown? */
+        {0xe81130, "Main.catch.entry",         10},
+        {0xe81260, "Main.catch.pathB-NRE",     11},
+        /* OnUpdate try-body stage markers: last one before the catch = source */
+        {0xe80ed8, "Main.stage.AppDataGetInstance", 3},
+        {0xe80f38, "Main.stage.FMExecute",     3},
+        {0xe80f5c, "Main.stage.jingleBlr",     3},
+        {0xe80fac, "Main.stage.SetJingle",     3},
+        {0xe8100c, "Main.stage.CheckKeyState", 3},
+        {0xe8108c, "Main.stage.setVsync",      3},
+        {0xe81098, "Main.stage.GetTargetFps",  3},
+        {0xe810c0, "Main.stage.setTargetFps",  3},
+        /* native throw entry: fp-walk gives the null-check raise site */
+        {0x1894cdc, "Substring.entry",         15},
+        {0xd952b0, "cxa_throw",               13},
+    };
+    if (!getenv("GDS_TRAP_AT"))
+        return;
+    g_il2b = il2b;
+    for (size_t i = 0; i < sizeof T / sizeof *T && g_nprobes < MAX_PROBES; i++) {
+        uintptr_t a = il2b + T[i].va;
+        uintptr_t pg = a & ~0xfffUL;
+        if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            fprintf(stderr, "[trap] arm %s: mprotect fail\n", T[i].tag);
+            continue;
+        }
+        g_probes[g_nprobes].addr = a;
+        g_probes[g_nprobes].orig = *(uint32_t *)a;
+        g_probes[g_nprobes].hit = 0;
+        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : 1);
+        g_probes[g_nprobes].kind = T[i].kind;
+        g_probes[g_nprobes].tag = T[i].tag;
+        *(uint32_t *)a = 0xd4200000; /* brk #0 */
+        __builtin___clear_cache((char *)a, (char *)a + 4);
+        mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+        g_nprobes++;
+        if (0) (void)0;
+        { fprintf(stderr, "[trap] armed %s @ il2cpp+%#x\n", T[i].tag, T[i].va); }
+    }
+}
+
+
 static void on_fault(int sig, siginfo_t *si, void *uc)
 {
     ucontext_t *u = uc;
     unsigned long pc = (unsigned long)u->uc_mcontext.pc;
-    fprintf(stderr, "\n[gds] signal %d at pc=%#lx addr=%p\n", sig, pc,
-            si ? si->si_addr : NULL);
+    if (g_in_dump) {
+        write(2, "[trap] nested fault in dump\n", 28);
+        _exit(3);
+    }
+    /* one-shot brk probes: identify, dump, restore, resume */
+    if (sig == SIGTRAP && g_nprobes) {
+        for (int i = 0; i < g_nprobes; i++) {
+            struct probe *p = &g_probes[i];
+            if ((p->cap ? (p->hit >= p->cap) : p->hit) || (uintptr_t)pc != p->addr)
+                continue;
+            p->hit++;
+            g_in_dump = 1;
+            uintptr_t x30 = (uintptr_t)u->uc_mcontext.regs[30];
+            if (p->kind != 13)
+                fprintf(stderr, "\n[trap] hit %s @ il2cpp+%#lx caller=il2cpp+%#lx\n",
+                        p->tag, (unsigned long)(p->addr - g_il2b),
+                        (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
+            if (p->addr == g_il2b + 0x1914cb8) {
+                uintptr_t k2 = trap_ptr_ok((uintptr_t)u->uc_mcontext.regs[0])
+                    ? *(uintptr_t *)u->uc_mcontext.regs[0] : 0;
+                if (trap_ptr_ok(k2) && trap_mapped(k2))
+                    fprintf(stderr, "[trap]   impl vtable+0x2b8=%#lx (il2cpp+%#lx) +0x2c0=%#lx\n",
+                            *(volatile uintptr_t *)(k2 + 0x2b8),
+                            *(volatile uintptr_t *)(k2 + 0x2b8) - g_il2b,
+                            *(volatile uintptr_t *)(k2 + 0x2c0));
+            }
+            if (p->kind == 1) {
+                /* Error(this, ex): x1 is the exception about to be shown */
+                trap_dump_exc((uintptr_t)u->uc_mcontext.regs[1], x30, "ex");
+            } else if (p->kind == 2) {
+                /* ctor / static entry: x0 = object, x1..x3 = string args */
+                trap_dump_exc((uintptr_t)u->uc_mcontext.regs[0], x30, "obj");
+                for (int r = 1; r <= 3; r++) {
+                    char b[600];
+                    trap_il2str((uintptr_t)u->uc_mcontext.regs[r], b, sizeof b);
+                    fprintf(stderr, "[trap]   x%d='%s'\n", r, b);
+                }
+            } else if (p->kind == 5) {
+                /* TerminateCheck decision state */
+                uintptr_t th = (uintptr_t)u->uc_mcontext.regs[0];
+                char nm2[128], ns2[128];
+                fprintf(stderr, "[trap]   flag=x1=%ld this=%#lx\n",
+                        (long)u->uc_mcontext.regs[1], (unsigned long)th);
+                if (trap_ptr_ok(th)) {
+                    fprintf(stderr, "[trap]   app.bootStageSnapshot(0x58)=%d countdown(0x140)=%d ts(0xb0)=%ld\n",
+                            *(volatile int *)(th + 0x58),
+                            *(volatile int *)(th + 0x140),
+                            *(volatile long *)(th + 0xb0));
+                }
+                /* entry-class name GetType(name) is called with */
+                {
+                    char es[600];
+                    es[0] = 0;
+                    uintptr_t sp2 = *(uintptr_t *)(g_il2b + 0x1ecd798);
+                    trap_il2str(trap_ptr_ok(sp2) ? *(uintptr_t *)sp2 : 0,
+                                es, sizeof es);
+                    fprintf(stderr, "[trap]   entry-name slot[0x1ecd798]='%s'\n", es);
+                }
+                unsigned soffs[3] = {0x1ebf338, 0x1ebf2c8, 0x1ebf2d8};
+                for (int s = 0; s < 3; s++) {
+                    uintptr_t slot = g_il2b + soffs[s];
+                    if (!trap_ptr_ok(slot)) { continue; }
+                    uintptr_t cls = *(uintptr_t *)slot;
+                    fprintf(stderr, "[trap]   static[+%x] classptr=%#lx", soffs[s],
+                            (unsigned long)cls);
+                    if (!trap_ptr_ok(cls) || (cls & 7)) { fprintf(stderr, " (bad)\n"); continue; }
+                    uintptr_t st = *(volatile uintptr_t *)(cls + 0xb8);
+                    fprintf(stderr, " statics=%#lx", (unsigned long)st);
+                    if (!trap_ptr_ok(st) || (st & 7) || st < 0x10000) { fprintf(stderr, " (bad)\n"); continue; }
+                    fprintf(stderr, " f0x30=%d f0x50=%d f0x60=%d\n",
+                            *(volatile unsigned char *)(st + 0x30),
+                            *(volatile int *)(st + 0x50),
+                            *(volatile unsigned char *)(st + 0x60));
+                }
+            } else if (p->kind == 8) {
+                /* GetEntryAssembly result: which slot, which assembly image */
+                uintptr_t res = (uintptr_t)u->uc_mcontext.regs[0];
+                fprintf(stderr, "[trap]   chosen x8=%ld result=%#lx\n",
+                        (long)u->uc_mcontext.regs[8], (unsigned long)res);
+                uintptr_t asmp = trap_ptr_ok(res) ? *(uintptr_t *)(res + 0x10) : 0;
+                fprintf(stderr, "[trap]   native asm=%#lx\n", (unsigned long)asmp);
+                uintptr_t kla = trap_ptr_ok(res) ? *(uintptr_t *)res : 0;
+                if (trap_ptr_ok(kla) && trap_mapped(kla)) {
+                    fprintf(stderr, "[trap]   klass vtable+0x258=%#lx (il2cpp+%#lx) +0x260=%#lx\n",
+                            *(volatile uintptr_t *)(kla + 0x258),
+                            *(volatile uintptr_t *)(kla + 0x258) - g_il2b,
+                            *(volatile uintptr_t *)(kla + 0x260));
+                }
+                trap_spform_lookup();
+            } else if (p->kind == 9) {
+                /* virtual dispatch site: dump target reg + this (x19) vtable */
+                for (int r = 0; r <= 9; r++) {
+                    if (r > 1 && r < 8) continue;   /* x0,x1,x8,x9 only */
+                    uintptr_t v = (uintptr_t)u->uc_mcontext.regs[r];
+                    fprintf(stderr, "[trap]   x%d=%#lx%s%#lx%s\n", r,
+                            (unsigned long)v,
+                            (v >= g_il2b && v < g_il2b + 0x2400000) ? " (il2cpp+" : "",
+                            (v >= g_il2b && v < g_il2b + 0x2400000) ? (unsigned long)(v - g_il2b) : 0,
+                            (v >= g_il2b && v < g_il2b + 0x2400000) ? ")" : "");
+                }
+                uintptr_t th9 = (uintptr_t)u->uc_mcontext.regs[19];
+                if (trap_ptr_ok(th9)) {
+                    uintptr_t k9 = *(uintptr_t *)th9;
+                    char nm2[128], ns2[128];
+                    const char *cname = "?", *nname = "?";
+                    if (trap_ptr_ok(k9) && trap_mapped(k9)) {
+                        nname = trap_cstr(*(uintptr_t *)(k9 + 0x10), nm2, sizeof nm2);
+                        cname = trap_cstr(*(uintptr_t *)(k9 + 0x18), ns2, sizeof ns2);
+                        fprintf(stderr, "[trap]   this(x19)=%#lx klass=%#lx %s.%s\n",
+                                (unsigned long)th9, (unsigned long)k9, cname, nname);
+                        for (uintptr_t sl = 0x180; sl <= 0x1b0; sl += 8) {
+                            uintptr_t fn = *(volatile uintptr_t *)(k9 + sl);
+                            fprintf(stderr, "[trap]     vtable+%#lx=%#lx (il2cpp+%#lx)\n",
+                                    (unsigned long)sl, (unsigned long)fn,
+                                    (fn >= g_il2b && fn < g_il2b + 0x2400000)
+                                        ? (unsigned long)(fn - g_il2b) : 0);
+                        }
+                    }
+                }
+            } else if (p->kind == 13) {
+                /* one line per throw: managed exception class + raise site.
+                 * The raise thunk pushed its x30 just under the current sp;
+                 * that value is the codegen raise call site (+4). */
+                uintptr_t obj = (uintptr_t)u->uc_mcontext.regs[0];
+                uintptr_t mex = (trap_ptr_ok(obj) && trap_mapped(obj))
+                                ? *(uintptr_t *)obj : 0;
+                const char *nm = "?", *ns = "?";
+                char b1[96], b2[96];
+                if (trap_ptr_ok(mex) && trap_mapped(mex)) {
+                    uintptr_t k = *(uintptr_t *)mex;
+                    if (trap_ptr_ok(k) && trap_mapped(k)) {
+                        ns = trap_cstr(*(uintptr_t *)(k + 0x18), b2, sizeof b2);
+                        nm = trap_cstr(*(uintptr_t *)(k + 0x10), b1, sizeof b1);
+                    }
+                }
+                uintptr_t spv = (uintptr_t)u->uc_mcontext.sp;
+                uintptr_t mra = (trap_ptr_ok(spv) && trap_mapped(spv))
+                                ? *(uintptr_t *)spv : 0;
+                if (!strstr(nm, "NullReference")) {
+                    /* runtime AORE spam: log a few, recycle the probe hit */
+                    static int g_skip_seen;
+                    p->hit--;
+                    if (g_skip_seen < 8) {
+                        g_skip_seen++;
+                        fprintf(stderr,
+                            "[trap]   throw-skip %s.%s ra=il2cpp+%#lx\n",
+                            ns, nm,
+                            (unsigned long)(trap_ptr_ok(mra) && mra >= g_il2b
+                                            ? mra - g_il2b : mra));
+                    }
+                    g_in_dump = 0;
+                    return;
+                }
+                fprintf(stderr,
+                        "[trap]   NRE[%d] %s.%s ra=il2cpp+%#lx thunk=il2cpp+%#lx\n",
+                        p->hit, ns, nm,
+                        (unsigned long)(trap_ptr_ok(mra) && mra >= g_il2b ?
+                                        mra - g_il2b : mra),
+                        (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
+                if (trap_ptr_ok(spv) && trap_mapped(spv)) {
+                    for (int q = 1; q < 8; q++) {
+                        uintptr_t v = *(uintptr_t *)(spv + 8 * q);
+                        if (!trap_ptr_ok(v))
+                            continue;
+                        const char *zone = v >= g_il2b && v < g_il2b + 0x2400000
+                                           ? "il2cpp" : "";
+                        fprintf(stderr, "[trap]     sp+%d=%#lx %s%#lx%s\n",
+                                q * 8, (unsigned long)v, zone,
+                                zone[0] ? (unsigned long)(v - g_il2b) : 0UL,
+                                zone[0] ? ")" : "");
+                    }
+                }
+            } else if (p->kind == 11) {
+                /* managed exception at x29: dump cls + all fields +0x10..0x78;
+                 * string-shaped values get text, array-shaped get elements */
+                uintptr_t ex = (uintptr_t)u->uc_mcontext.regs[29];
+                trap_brief(ex, "ex");
+                if (trap_ptr_ok(ex) && trap_mapped(ex)) {
+                    for (uintptr_t off = 0x10; off <= 0x78; off += 8) {
+                        uintptr_t v = *(uintptr_t *)(ex + off);
+                        char s[300];
+                        fprintf(stderr, "[trap]   ex+%#lx = %#lx",
+                                (unsigned long)off, (unsigned long)v);
+                        if (trap_ptr_ok(v) && trap_mapped(v)) {
+                            int len = *(volatile int *)(v + 0x10);
+                            int alen = *(volatile int *)(v + 0x18);
+                            if (len >= 0 && len <= 512) {
+                                trap_il2str(v, s, sizeof s);
+                                fprintf(stderr, "  str='%s'", s);
+                            } else if (alen > 0 && alen <= 64 &&
+                                       trap_mapped(v + 0x20)) {
+                                fprintf(stderr, "  arr[%d]=", alen);
+                                for (int i = 0; i < alen && i < 12; i++) {
+                                    uintptr_t ip =
+                                        *(uintptr_t *)(v + 0x20 + 8 * i);
+                                    fprintf(stderr, " %#lx",
+                                            (unsigned long)(ip >= g_il2b ?
+                                                            ip - g_il2b : ip));
+                                }
+                            }
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            } else if (p->kind == 15) {
+                /* Substring(this=str, startIndex, length): show inputs */
+                char s2[620];
+                uintptr_t st = (uintptr_t)u->uc_mcontext.regs[0];
+                trap_il2str(st, s2, sizeof s2);
+                long slen = -1;
+                if (trap_ptr_ok(st) && trap_mapped(st))
+                    slen = *(volatile int *)(st + 0x10);
+                fprintf(stderr,
+                        "[trap]   Substring(%ld, start=%ld, len=%ld)\n[trap]   src='%s'\n",
+                        slen, (long)u->uc_mcontext.regs[1],
+                        (long)u->uc_mcontext.regs[2], s2);
+            } else if (p->kind == 14) {
+                /* raise-helper entry: x30 = codegen out-of-range check site */
+                fprintf(stderr, "[trap]   ra=il2cpp+%#lx",
+                        (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
+                uintptr_t o = (uintptr_t)u->uc_mcontext.regs[0];
+                if (trap_ptr_ok(o) && trap_mapped(o)) {
+                    uintptr_t k = *(uintptr_t *)o;
+                    if (trap_ptr_ok(k) && trap_mapped(k)) {
+                        char b1[96], b2[96];
+                        fprintf(stderr, " arg=%s.%s",
+                                trap_cstr(*(uintptr_t *)(k + 0x18), b2, sizeof b2),
+                                trap_cstr(*(uintptr_t *)(k + 0x10), b1, sizeof b1));
+                    }
+                }
+                fprintf(stderr, "\n");
+                uintptr_t fp = (uintptr_t)u->uc_mcontext.regs[29];
+                for (int f = 0; f < 10 && trap_ptr_ok(fp) && trap_mapped(fp); f++) {
+                    uintptr_t ra = *(uintptr_t *)(fp + 8);
+                    fprintf(stderr, "[trap]     frame[%d] ra=%#lx (il2cpp+%#lx)\n",
+                            f, (unsigned long)ra,
+                            (unsigned long)(ra >= g_il2b ? ra - g_il2b : ra));
+                    uintptr_t next = *(uintptr_t *)fp;
+                    if (!trap_ptr_ok(next) || next <= fp || next - fp > 0x100000)
+                        break;
+                    fp = next;
+                }
+            } else if (p->kind == 10) {
+                /* catch-site: guarded briefs of thrown object / wrapper */
+                uintptr_t r23 = (uintptr_t)u->uc_mcontext.regs[23];
+                uintptr_t r25 = (uintptr_t)u->uc_mcontext.regs[25];
+                uintptr_t r29 = (uintptr_t)u->uc_mcontext.regs[29];
+                trap_brief(r23, "x23");
+                trap_brief(r25, "x25");
+                trap_brief(r29, "x29");
+                if (trap_ptr_ok(r23) && trap_mapped(r23))
+                    trap_brief(*(uintptr_t *)r23, "*x23");
+                if (trap_ptr_ok(r25) && trap_mapped(r25))
+                    trap_brief(*(uintptr_t *)r25, "*x25");
+            } else if (p->kind == 7) {
+                /* Update entry-form creation: x22 = Type from GetType(),
+                 * x20 = created form (later regs); entry-name static slot. */
+                uintptr_t t = (uintptr_t)u->uc_mcontext.regs[22];
+                char nm2[128], ns2[128], es[600];
+                const char *cname = "?", *nname = "?";
+                if (trap_ptr_ok(t)) {
+                    uintptr_t k = *(uintptr_t *)t;
+                    if (trap_ptr_ok(k)) {
+                        nname = trap_cstr(*(uintptr_t *)(k + 0x10), nm2, sizeof nm2);
+                        cname = trap_cstr(*(uintptr_t *)(k + 0x18), ns2, sizeof ns2);
+                    }
+                }
+                fprintf(stderr, "[trap]   x22(Type)=%#lx (%s.%s)\n",
+                        (unsigned long)t, cname, nname);
+                uintptr_t sp2 = *(uintptr_t *)(g_il2b + 0x1ecd798);
+                trap_il2str(trap_ptr_ok(sp2) ? *(uintptr_t *)sp2 : 0, es, sizeof es);
+                fprintf(stderr, "[trap]   entry-name slot[0x1ecd798]: '%s'\n", es);
+            } else if (p->kind == 4) {
+                /* value probe: dump x0 and x1 as raw ptr + klass name */
+                for (int r = 0; r <= 1; r++) {
+                    uintptr_t o = (uintptr_t)u->uc_mcontext.regs[r];
+                    char nm2[128], ns2[128];
+                    const char *cname = "?", *nname = "?";
+                    if (trap_ptr_ok(o)) {
+                        uintptr_t k = *(uintptr_t *)o;
+                        if (trap_ptr_ok(k)) {
+                            nname = trap_cstr(*(uintptr_t *)(k + 0x10), nm2, sizeof nm2);
+                            cname = trap_cstr(*(uintptr_t *)(k + 0x18), ns2, sizeof ns2);
+                        }
+                    }
+                    fprintf(stderr, "[trap]   x%d=%#lx (%s.%s)\n", r,
+                            (unsigned long)o, cname, nname);
+                }
+            }
+            g_in_dump = 0;
+            if (p->cap && p->hit < p->cap)
+                return; /* multi-hit: leave brk armed */
+            uintptr_t pg = p->addr & ~0xfffUL;
+            if (mprotect((void *)pg, 0x1000,
+                         PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                *(uint32_t *)p->addr = p->orig;
+                __builtin___clear_cache((char *)p->addr, (char *)p->addr + 4);
+                mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+            }
+            return; /* PC still at probe addr -> re-execute original insn */
+        }
+    }
+    fprintf(stderr, "\n[gds] signal %d (si_code=%d) at pc=%#lx addr=%p\n",
+            sig, si ? si->si_code : 0, pc, si ? si->si_addr : NULL);
     for (size_t i = 0; i < sizeof LIBS / sizeof *LIBS; i++) {
         nx_mod *m = nx_find_mod(LIBS[i].soname);
         if (!m)
@@ -299,6 +873,14 @@ static void install_fault_handler(void)
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
+    /* 0.61: SIGTRAP/SIGABRT/SIGSYS were missed - a bare `brk` (Unity/il2cpp
+     * fail-fast paths use __builtin_trap) used to take the default action and
+     * left a silent "Trace/breakpoint trap" in the launcher log.  bionic.c's
+     * my_sigaction blocks the engine from overwriting these. */
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGSYS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
 
     /* SIGTERM/SIGINT seguem o caminho do SELECT+START (pause/save/saída),
      * nunca morte seca: frontends e supervisores mandam TERM primeiro. */
@@ -421,6 +1003,10 @@ static void run_unity(void)
 int main(int argc, char **argv)
 {
     setvbuf(stderr, NULL, _IOLBF, 0);
+    /* 0.61: stdout fully unbuffered.  egl_shim.c logs via printf; when the
+     * launcher redirected stdout into the log FILE, libc block-buffered it and
+     * every EGL diagnostic silently vanished when the process was SIGTRAP'd. */
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     /* EmulationStation's application wrapper exports C.UTF-8.  This Android
      * Unity player was built against Bionic's locale ABI; when its native
@@ -437,10 +1023,13 @@ int main(int argc, char **argv)
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.60.0-ref)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.62.0-ref)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
+    /* 0.62 lesson from the old loader (0.30): SDL_Init(VIDEO)/kmsdrm and the
+     * Mali blob reinstall default crash-signal handlers over ours.  Re-arm. */
+    install_fault_handler();
     build_imports();
 
     int missing = gds_load_modules();
@@ -451,6 +1040,10 @@ int main(int argc, char **argv)
     nx_mod *il2 = nx_find_mod("libil2cpp.so");
     if (!main_mod || !uni || !il2)
         nx_die("required Unity module disappeared after relocation");
+    if (getenv("GDS_DEBUGBASE"))
+        fprintf(stderr, "[gds] DEBUGBASE il2cpp=%p unity=%p main=%p\n",
+                (void *)il2->base, (void *)uni->base, (void *)main_mod->base);
+    arm_traps((uintptr_t)il2->base);
 
     /* System.load(libmain.so): its constructors run before JNI_OnLoad. */
     nx_run_init(main_mod);
