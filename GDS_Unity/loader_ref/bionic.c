@@ -74,9 +74,29 @@ static const char lvl[] = "?????VDIWEFS";
 
 int my___android_log_write(int prio, const char *tag, const char *msg)
 {
-    if (gds_log_level)
-        fprintf(stderr, "[%c/%s] %s\n", lvl[prio & 15], tag ? tag : "?",
-                msg ? msg : "");
+    if (!gds_log_level)
+        return 0;
+    /* 0.91 dedupe: Unity spams the same multi-line AndroidJNIHelper warning
+     * + stack every LateUpdate (dozens per boot).  Exact-same (prio,tag,msg)
+     * repeats collapse to one in 8, with a count line when the run ends. */
+    static char last[2048];
+    static const char *ltag;
+    static unsigned streak;
+    if (msg && tag) {
+        if (ltag == tag && !strcmp(msg, last)) {
+            streak++;
+            if (streak % 8 != 1)
+                return 0;
+        } else {
+            if (streak > 8)
+                fprintf(stderr, "[logcat] (previous message x%u)\n", streak);
+            streak = 1;
+            snprintf(last, sizeof last, "%s", msg);
+            ltag = tag;
+        }
+    }
+    fprintf(stderr, "[%c/%s] %s\n", lvl[prio & 15], tag ? tag : "?",
+            msg ? msg : "");
     return 0;
 }
 

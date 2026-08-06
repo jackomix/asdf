@@ -1305,7 +1305,7 @@ static void *fmod_java_thread(void *arg)
                 ring_write(g_fmod_player, pcm, written);
             }
             blocks++;
-            if (blocks <= 20 || blocks % 60 == 0) {
+            if (blocks <= 4 || blocks % 300 == 0) {
                 fprintf(stderr, "[audio] fmod block #%lu (rc=%d %uB wr=%uB, fill=%u, zeros=%u%%, peak=%d)\n",
                         blocks, rc, bufsz, written,
                         g_fmod_player ? ring_readable(g_fmod_player) : 0,

@@ -275,10 +275,13 @@ int gds_load_modules(void)
  * the very next invoke anyway, so no real behavior is lost. */
 static void arm_fep_fix(uintptr_t il2b)
 {
+    /* 0.91: the 0.90 pokes (string[2] alloc + elem[1] store in the UIMethod
+     * at 0x1809498) are WITHDRAWN: the 0.90.0 device run proved the
+     * delivered result array was still len=1 with the same trace -- F3 is
+     * the show-side initial-text path, not the result builder.  Harness and
+     * byte-verification kept for the next (delegate-identified) poke. */
     static const struct { uint32_t va; uint32_t expect; uint32_t patch;
                           const char *what; } P[] = {
-        {0x180959c, 0x52800021u, 0x52800041u, "fep result: string[2] alloc"},
-        {0x18095dc, 0xB4000214u, 0xF90016B3u, "fep result: elem[1] = text"},
     };
     for (size_t i = 0; i < sizeof P / sizeof *P; i++) {
         uintptr_t a = il2b + P[i].va;
@@ -1093,6 +1096,34 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                     if (st && trap_mapped(st + 0x199))
                         fprintf(stderr, "[trap]   fepflag(statics+0x199)=%d\n",
                                 *(volatile unsigned char *)(st + 0x199));
+                    /* 0.91: the 1-elem array is built by a DELEGATE invoked
+                     * from b__91_0's tail branch (0.90's F3 attribution was
+                     * WRONG -- pokes applied but delivered array unchanged).
+                     * Dump the delegate at compat-statics[0x10]: its klass,
+                     * target and METHOD POINTER = the real builder, which I
+                     * can then read offline instead of attributing on faith. */
+                    if (st && trap_mapped(st + 0x10)) {
+                        uintptr_t d = *(uintptr_t *)(st + 0x10);
+                        fprintf(stderr, "[trap]   result-delegate=%#lx", (unsigned long)d);
+                        if (!trap_ptr_ok(d) || !trap_mapped(d)) {
+                            fprintf(stderr, " (bad)\n");
+                        } else {
+                            uintptr_t dk = *(uintptr_t *)d;
+                            char db1[96], db2[96];
+                            if (trap_ptr_ok(dk) && trap_mapped(dk))
+                                fprintf(stderr, " class=%s.%s",
+                                        trap_cstr(*(uintptr_t *)(dk + 0x18), db2, sizeof db2),
+                                        trap_cstr(*(uintptr_t *)(dk + 0x10), db1, sizeof db1));
+                            uintptr_t mi = *(uintptr_t *)(d + 0x8);
+                            uintptr_t tgt = *(uintptr_t *)(d + 0x10);
+                            uintptr_t mp  = *(uintptr_t *)(d + 0x18);
+                            fprintf(stderr,
+                                    "\n[trap]     target=%#lx methodinfo=%#lx method_ptr=%#lx (il2cpp+%#lx)\n",
+                                    (unsigned long)tgt, (unsigned long)mi, (unsigned long)mp,
+                                    (unsigned long)(mp >= g_il2b && mp < g_il2b + 0x2000000
+                                                    ? mp - g_il2b : 0));
+                        }
+                    }
                 }
                 uintptr_t kc2 = g_il2b + 0x1ebf660;
                 if (trap_mapped(kc2)) {
@@ -1485,7 +1516,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.90.0-fepfix)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.91.0-fepfix2)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */
