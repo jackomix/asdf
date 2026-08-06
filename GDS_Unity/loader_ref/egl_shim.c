@@ -260,6 +260,48 @@ static int gds_flash_enabled(void) {
   return cached;
 }
 
+/* 0.75 THEORY SWITCHES -- one binary, many experiments (gds_env.cfg).
+ * Horizon Chase's OWN split (verbatim from its egl_shim.c):
+ *   mali/fbdev          -> raw EGL ownership and swap
+ *   KMSDRM/Wayland/etc. -> SDL owns bind, unbind and page-flip
+ *   "Moving Unity's context between threads through raw eglMakeCurrent while
+ *    SDL owns KMS presents an untouched black buffer."
+ * We ARE KMSDRM.  GDS_CTXMODEL=sdl reproduces Horizon's shipped KMSDRM
+ * model (SDL-created contexts, SDL_GL_MakeCurrent, SDL_GL_SwapWindow);
+ * =raw keeps our 0.73/74 model as control.  GDS_PRESENT toggles the swap
+ * route inside the raw model.  GDS_RTFLASH=1 runs mid-game flash probes:
+ * frame 60 clears MAGENTA through Unity's own raw context (does raw-ctx
+ * content reach the panel at all?), frames 120/180 clear YELLOW/CYAN
+ * through the SDL share root (does share-root content still display
+ * mid-game?) with a same-address readPixels comparison between the two
+ * contexts -- the definitive render-target-aliasing test. */
+static int ctx_model_sdl(void) {
+  static int m = -1;
+  if (m < 0) {
+    const char *e = getenv("GDS_CTXMODEL");
+    m = (e && strcmp(e, "sdl") == 0) ? 1 : 0;
+  }
+  return m;
+}
+static int present_raw(void) {
+  static int p = -1;
+  if (p < 0) {
+    const char *e = getenv("GDS_PRESENT");
+    p = (e && strcmp(e, "raw") == 0) ? 1 : 0;
+  }
+  return p;
+}
+static int rtflash_on(void) {
+  static int f = -1;
+  if (f < 0) {
+    const char *e = getenv("GDS_RTFLASH");
+    f = (e && atoi(e) > 0) ? 1 : 0;
+    if (f)
+      fprintf(stderr, "[egl] GDS_RTFLASH=1: mid-game flash probes at frames 60/120/180\n");
+  }
+  return f;
+}
+
 static void gds_capture_real_egl(void) {
   if (g_nullgl) return;
   const char *drv = getenv("SDL_VIDEO_EGL_DRIVER");
@@ -490,62 +532,62 @@ static void gds_capture_real_egl(void) {
      * finishes its own bookkeeping below (final state: nothing current). */
   }
 
-  /* 0.74 WINDOW-MATCHING CONFIG.  Unity's window-bound context must be
-   * created from a config EQUAL to SDL's real window config (d%d/s%d as
-   * negotiated), not from the d24/s8 contract config used only to satisfy
-   * Unity's minimum-spec matcher.  0.73 device evidence: raw ctx on the
-   * contract config bound to the window renders into driver-private buffers
-   * (preswap readPixels show perfect frames) while the GBM bo SDL flips
-   * stays black -- identical signature to the invisible raw Phase-A flashes
-   * vs the visible Phase-B flashes (whose share root shares the surface's
-   * own config). */
-  if (g_real_cfg && r_eglChooseConfig && r_eglGetConfigAttrib) {
-    int want_rbits = g_best_es_major >= 3 ? HC_EGL_OPENGL_ES3_BIT_KHR
-                                          : HC_EGL_OPENGL_ES2_BIT;
-    int wa[] = {
-        HC_EGL_RED_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
-        HC_EGL_GREEN_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
-        HC_EGL_BLUE_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
-        HC_EGL_ALPHA_SIZE, HC_EGL_RGBA_CHANNEL_BITS,
-        HC_EGL_DEPTH_SIZE, g_depth_size,
-        HC_EGL_STENCIL_SIZE, g_stencil_size,
-        HC_EGL_SURFACE_TYPE, HC_EGL_WINDOW_BIT | HC_EGL_PBUFFER_BIT,
-        HC_EGL_RENDERABLE_TYPE, want_rbits,
-        HC_EGL_NONE
-    };
-    void *wcfgs[32];
-    int wn = 0;
-    if (r_eglChooseConfig(g_real_dpy, wa, wcfgs, 32, &wn) && wn > 0) {
-      for (int i = 0; i < wn && i < 32; i++) {
-        int dr = -1, st = -1, rb = 0, surf = 0, nv = 0;
-        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_DEPTH_SIZE, &dr);
-        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_STENCIL_SIZE, &st);
-        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_RENDERABLE_TYPE, &rb);
-        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_SURFACE_TYPE, &surf);
-        r_eglGetConfigAttrib(g_real_dpy, wcfgs[i], HC_EGL_NATIVE_VISUAL_TYPE, &nv);
-        /* EXACT depth/stencil equality against SDL's negotiated window --
-         * "at least" reintroduces the mismatch-invisible-render problem. */
-        if (dr == g_depth_size && st == g_stencil_size &&
-            (rb & want_rbits) == want_rbits &&
-            (surf & HC_EGL_WINDOW_BIT) && nv != 0x108) {
-          g_win_cfg = wcfgs[i];
-          break;
-        }
+  /* 0.75 EXACT SURFACE-CONFIG PARITY + full config-table dump.
+   * 0.74 showed property matching can't reconstruct SDL's window config
+   * (exact d0/s8 query -> (nil)).  Deterministic instead: ask the window
+   * surface for its OWN EGL_CONFIG_ID and fetch that exact row.  Evidence
+   * base: every context that ever displayed on this panel (SDL share root,
+   * Phase B flashes) holds the surface's own config; every raw context on
+   * the d24/s8 contract config renders into driver-private buffers
+   * (readPixels: perfect frames; flipped GBM bo: black).  Also dump the
+   * whole table once -- the guesswork about what this blob offers ends. */
+  if (g_real_dpy && r_eglQuerySurface && r_eglChooseConfig &&
+      r_eglGetConfigAttrib && g_win_surf) {
+    int want_cid = -1;
+    if (!r_eglQuerySurface(g_real_dpy, g_win_surf, 0x3028 /*EGL_CONFIG_ID*/,
+                           &want_cid))
+      want_cid = -1;
+    fprintf(stderr, "[egl] window surface CONFIG_ID=%d\n", want_cid);
+    static const int all_attrs[] = { HC_EGL_NONE };
+    void *cfgs[32];
+    int n = 0;
+    if (r_eglChooseConfig(g_real_dpy, all_attrs, cfgs, 32, &n) && n > 0) {
+      int rows = n < 32 ? n : 32;
+      for (int i = 0; i < rows; i++) {
+        int cid = -1, buf = 0, r = 0, g = 0, b = 0, a = 0, d = 0, s = 0,
+            smp = 0, rb = 0, st = 0, nvt = 0, nvid = 0;
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], 0x3028, &cid);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], 0x3020, &buf);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_RED_SIZE, &r);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_GREEN_SIZE, &g);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_BLUE_SIZE, &b);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_ALPHA_SIZE, &a);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_DEPTH_SIZE, &d);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_STENCIL_SIZE, &s);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_SAMPLES, &smp);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_RENDERABLE_TYPE, &rb);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_SURFACE_TYPE, &st);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], HC_EGL_NATIVE_VISUAL_TYPE, &nvt);
+        r_eglGetConfigAttrib(g_real_dpy, cfgs[i], 0x302e, &nvid);
+        int is_win = (cid == want_cid);
+        if (is_win && !g_win_cfg) g_win_cfg = cfgs[i];
+        fprintf(stderr,
+                "[egl]   cfg[%02d] id=%3d buf=%d rgba=%d/%d/%d/%d d=%d s=%d "
+                "smp=%d rb=0x%x surf=0x%x nvt=0x%x nvid=0x%x%s\n",
+                i, cid, buf, r, g, b, a, d, s, smp, rb, st, nvt, nvid,
+                is_win ? "  == WINDOW" : "");
       }
-      fprintf(stderr,
-              "[egl] window-matching cfg (d%d s%d rb=0x%x) -> %p (candidates=%d)\n",
-              g_depth_size, g_stencil_size, want_rbits, g_win_cfg, wn);
+      fprintf(stderr, "[egl] surface-config parity g_win_cfg=%p (of %d)\n",
+              g_win_cfg, n);
     } else {
-      fprintf(stderr,
-              "[egl] window-matching cfg choose failed n=%d -- raw ctxs keep "
-              "contract cfg (present may stay black)\n", wn);
+      fprintf(stderr, "[egl] full config dump failed n=%d\n", n);
     }
     if (g_win_cfg && r_eglCreatePbufferSurface) {
       static const int pb2[] = { 0x3057, 16, 0x3056, 16, HC_EGL_NONE };
       void *pb = r_eglCreatePbufferSurface(g_real_dpy, g_win_cfg, pb2);
       if (pb) {
         fprintf(stderr,
-                "[egl] window-matching worker pbuffer = %p (replaces %p)\n",
+                "[egl] parity worker pbuffer = %p (replaces %p)\n",
                 pb, g_pbuf);
         g_pbuf = pb;
       }
@@ -982,6 +1024,9 @@ void egl_shim_create_window(void) {
    * returning empty strings (SDL believed its share root was still bound). */
   gds_capture_real_egl();
 
+  printf("[egl] theories: ctxmodel=%s present=%s rtflash=%d (via gds_env.cfg)\n",
+         ctx_model_sdl() ? "SDL(Horizon-KMS)" : "raw",
+         present_raw() ? "raw" : "sdl", rtflash_on());
   printf("[egl] window %dx%d context ready (ES%d)\n", g_screen_w, g_screen_h, g_es_major);
 
   /* release from the bootstrap thread; the game binds when it makes current */
@@ -1098,7 +1143,8 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
    * hands back ES1.1 ("OpenGL ES-CM 1.1") no matter what was requested;
    * RAW r_eglCreateContext honors the attrib (proven by the capture probe).
    * Unity on ES1.1 => broken texture-unit state => wild-index SIGSEGV. */
-  if (r_eglCreateContext && r_eglMakeCurrent && g_real_dpy && g_real_cfg) {
+  if (!ctx_model_sdl() && r_eglCreateContext && r_eglMakeCurrent &&
+      g_real_dpy && g_real_cfg) {
     int want = -1;
     if (attrib_list)
       for (int i = 0; attrib_list[i] != 0x3038 && i < 32; i += 2)
@@ -1313,6 +1359,50 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
    * presents that exact surface -- the only working path on this stack. */
   if (current_context && current_context->is_real) {
     if (!current_context->is_pbuffer && g_win_surf) {
+
+      /* 0.75 mid-game probes (GDS_RTFLASH=1).  Frame 60: magenta through
+       * UNITY'S OWN raw context + SDL present.  Frames 120/180: yellow/cyan
+       * through the SDL share root + pixel-alias compare (same address,
+       * both contexts).  Interpreting what hits the panel tells us whether
+       * raw-ctx content ever reaches the GBM bo SDL flips. */
+      static int g_frame_no = 0;
+      g_frame_no++;
+      if (rtflash_on() && egl_window && egl_share_root && S.GL_MakeCurrent &&
+          S.GL_SwapWindow && g_raw_glReadPixels && g_raw_glClearColor &&
+          g_raw_glClear && current_context->real_ctx) {
+        if (g_frame_no == 60) {
+          printf("[rtf] frame 60: MAGENTA via Unity raw ctx + SDL swap\n");
+          g_raw_glClearColor(1.0f, 0.0f, 1.0f, 1.0f);
+          g_raw_glClear(0x4000);
+        } else if (g_frame_no == 120 || g_frame_no == 180) {
+          int yel = g_frame_no == 120;
+          unsigned char pa[4] = { 0, 0, 0, 0 }, pb[4] = { 0, 0, 0, 0 };
+          g_raw_glReadPixels(320, 240, 1, 1, 0x1908, 0x1401, pa);
+          r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
+          int dto = 0;
+          if (S.GL_MakeCurrent(egl_window, egl_share_root) == 0) {
+            g_raw_glReadPixels(320, 240, 1, 1, 0x1908, 0x1401, pb);
+            g_raw_glClearColor(yel ? 1.0f : 0.0f, yel ? 1.0f : 0.0f,
+                               1.0f, 1.0f);
+            g_raw_glClear(0x4000);
+            S.GL_SwapWindow(egl_window);
+            S.GL_MakeCurrent(egl_window, NULL);
+            dto = 1;
+          }
+          printf("[rtf] frame %d %s: raw-ctx px=%02x%02x%02x%02x "
+                 "share-root px=%02x%02x%02x%02x (same:%s sdlswap:%d)\n",
+                 g_frame_no, yel ? "YELLOW" : "CYAN",
+                 pa[0], pa[1], pa[2], pa[3], pb[0], pb[1], pb[2], pb[3],
+                 memcmp(pa, pb, 4) == 0 ? "YES" : "NO", dto);
+          unsigned rb = r_eglMakeCurrent(g_real_dpy, g_win_surf, g_win_surf,
+                                         current_context->real_ctx);
+          if (!rb)
+            printf("[rtf] WARNING: raw ctx rebind failed err=0x%x\n",
+                   r_eglGetError ? r_eglGetError() : 0);
+          return EGL_TRUE;
+        }
+      }
+
       /* 0.71: sample the center pixel of the back buffer about to be
        * presented -- distinguishes "Unity renders but present is broken"
        * from "Unity's frames are genuinely black". */
@@ -1326,7 +1416,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                preswap_n, px[0], px[1], px[2], px[3], ge0, ge1);
       }
       preswap_n++;
-      if (egl_window && S.GL_SwapWindow) {
+      if (!present_raw() && egl_window && S.GL_SwapWindow) {
         S.GL_SwapWindow(egl_window);
         if (g_n_eglSwapBuffers <= 3)
           printf("[egl] SwapBuffers(real, SDL window)\n");

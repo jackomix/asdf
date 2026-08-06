@@ -1306,7 +1306,45 @@ int main(int argc, char **argv)
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.74.0-ref)\n", gds_gamedir);
+    /* 0.75: on-device experiment switches.  KEY=VAL lines in
+     * <gamedir>/gds_env.cfg apply as environment DEFAULTS (launcher env
+     * wins), so display/input theories iterate over ssh without
+     * redeploying the loader.  '#' starts a comment. */
+    {
+        char cfgpath[1200];
+        snprintf(cfgpath, sizeof cfgpath, "%s/gds_env.cfg", gds_gamedir);
+        FILE *cf = fopen(cfgpath, "r");
+        if (!cf) { cf = fopen("gds_env.cfg", "r"); cfgpath[0] = 0; }
+        if (cf) {
+            fprintf(stderr, "[gds] env cfg: %s\n",
+                    cfgpath[0] ? cfgpath : "gds_env.cfg");
+            char line[512];
+            while (fgets(line, sizeof line, cf)) {
+                char *p = line;
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '#' || *p == '\n' || !*p) continue;
+                char *eq = strchr(p, '=');
+                if (!eq) continue;
+                *eq = 0;
+                size_t kn = strlen(p);
+                while (kn && (p[kn-1] == ' ' || p[kn-1] == '\t')) p[--kn] = 0;
+                char *v = eq + 1;
+                size_t n = strlen(v);
+                while (n && (v[n-1] == '\n' || v[n-1] == '\r' ||
+                             v[n-1] == ' ' || v[n-1] == '\t')) v[--n] = 0;
+                if (!kn) continue;
+                if (getenv(p)) {
+                    fprintf(stderr, "[gds]   %s (kept: launcher env)\n", p);
+                    continue;
+                }
+                setenv(p, v, 0);
+                fprintf(stderr, "[gds]   %s=%s\n", p, v);
+            }
+            fclose(cf);
+        }
+    }
+
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.75.0-ref)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
