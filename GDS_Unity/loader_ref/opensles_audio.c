@@ -1033,8 +1033,133 @@ void *gds_opensles_sym(const char *name) {
 
 /* Old audio.c contract kept for main.c: audio is lazy (starts when FMOD
  * creates its first player), so start() is a resolved-OK check only. */
+/* ================================================================= FMOD
+ * AudioTrack output driver ("the missing Java thread").
+ * Device evidence (0.84.x runs): FMOD reads the AudioManager property
+ * chain (44100/256) but NEVER dlopens libOpenSLES, and no slCreateEngine
+ * ever fires -- Unity 2022.3.62's embedded FMOD selects its AudioTrack
+ * output (fmod_output_audiotrack.cpp) here.  In a real app the data pump
+ * is org.fmod.FMODAudioDevice.run() (Java): loop fmodProcess(ByteBuffer)
+ * + AudioTrack.write.  The C++ side registers those natives through JNI
+ * RegisterNatives and drives start/stop/close/isRunning on the object.
+ * This thread IS the Java run(): wait for start, then pull blocks from
+ * the RegisterNatives'd fmodProcess into a synthetic mix player slot, so
+ * the existing SDL callback mixes FMOD's PCM like any OpenSL player. */
+#include "gds.h"
+
+static AudioPlayer *g_fmod_player;
+static int g_fmod_rate, g_fmod_channels, g_fmod_blockframes;
+
+void gds_audio_fmod_config(int rate, int channels, int blockframes)
+{
+    if (rate > 0 && rate <= 192000) g_fmod_rate = rate;
+    if (channels > 0 && channels <= 8) g_fmod_channels = channels;
+    if (blockframes > 0 && blockframes <= 16384) g_fmod_blockframes = blockframes;
+    fprintf(stderr, "[audio] FMOD startAudioDevice rate=%d ch=%d blockframes=%d\n",
+            g_fmod_rate, g_fmod_channels, g_fmod_blockframes);
+}
+
+static void *fmod_java_thread(void *arg)
+{
+    (void)arg;
+    typedef int (*fmod_process_fn)(void *env, void *self, void *bb);
+    fmod_process_fn proc = NULL;
+    int waiting_run = 0, waiting_proc = 0, err_n = 0;
+    unsigned long blocks = 0;
+    fprintf(stderr, "[audio] FMOD AudioTrack java-thread watching\n");
+    for (;;) {
+        if (!gds_jni_fmod_should_run()) {
+            if (!waiting_run) {
+                waiting_run = 1;
+                fprintf(stderr, "[audio] fmod-thread: waiting for FMODAudioDevice.start\n");
+            }
+            usleep(100000);
+            continue;
+        }
+        if (!proc) {
+            proc = (fmod_process_fn)gds_jni_native("org/fmod/FMODAudioDevice",
+                                                   "fmodProcess");
+            if (!proc) {
+                if (!waiting_proc) {
+                    waiting_proc = 1;
+                    fprintf(stderr, "[audio] fmod-thread: start seen, "
+                                    "fmodProcess native not registered yet\n");
+                }
+                usleep(50000);
+                continue;
+            }
+            fprintf(stderr, "[audio] fmodProcess native at %p\n", (void *)proc);
+        }
+        if (!g_fmod_player) {
+            g_fmod_player = alloc_player();
+            if (g_fmod_player) {
+                g_fmod_player->sample_rate     = (SLuint32)(g_fmod_rate > 0 ? g_fmod_rate : 44100);
+                g_fmod_player->num_channels    = (SLuint32)(g_fmod_channels > 0 ? g_fmod_channels : 2);
+                g_fmod_player->bits_per_sample = 16;
+                g_fmod_player->play_state      = SL_PLAYSTATE_PLAYING;
+                g_fmod_player->volume          = 0.8f;
+            }
+            ensure_audio_initialized();
+            fprintf(stderr, "[audio] fmod-thread: pumping (rate=%d ch=%d blockframes=%d)\n",
+                    g_fmod_rate > 0 ? g_fmod_rate : 44100,
+                    g_fmod_channels > 0 ? g_fmod_channels : 2,
+                    g_fmod_blockframes);
+        }
+        /* pace on ring space: one block per fmodProcess call */
+        unsigned rate = g_fmod_rate > 0 ? (unsigned)g_fmod_rate : 44100;
+        unsigned ch = g_fmod_channels > 0 ? (unsigned)g_fmod_channels : 2;
+        unsigned blockbytes = g_fmod_blockframes > 0
+            ? (unsigned)g_fmod_blockframes * ch * 2 : 4096;
+        if (g_fmod_player &&
+            ring_writable(g_fmod_player) < blockbytes * 3) {
+            usleep(2000);
+            continue;
+        }
+        int n = proc(gds_jni_env(), gds_jni_fmod_device(),
+                     gds_jni_fmod_bytebuffer());
+        if (n > 0) {
+            if (g_fmod_player)
+                ring_write(g_fmod_player, gds_jni_fmod_pcm(), (uint32_t)n);
+            blocks++;
+            if (blocks == 1 || blocks % 600 == 0) {
+                fprintf(stderr, "[audio] fmod block #%lu (%d bytes, rate=%u)\n",
+                        blocks, n, rate);
+                fflush(stderr);
+            }
+            /* block cadence throttle: FMOD's java write() normally paces the
+             * loop; without it a fast mixer fills the ring instantly */
+            unsigned us = (unsigned)((unsigned long long)n * 1000000ULL /
+                                     ((unsigned long long)rate * ch * 2));
+            if (us > 2000) usleep(us - 2000);
+        } else {
+            if (err_n < 6) {
+                err_n++;
+                fprintf(stderr, "[audio] fmodProcess -> %d (#%lu)\n", n, blocks);
+                fflush(stderr);
+            }
+            usleep(4000);
+        }
+    }
+    return NULL;
+}
+
+void gds_audio_fmod_thread_start(void)
+{
+    static int started;
+    if (started) return;
+    started = 1;
+    pthread_t pt;
+    if (pthread_create(&pt, NULL, fmod_java_thread, NULL) == 0)
+        pthread_detach(pt);
+}
+
 int gds_audio_start(void *env) {
     (void)env;
+    /* 0.85: the FMOD AudioTrack java-thread runs on its own so FMOD's
+     * start() (which lands AFTER nativeResume, inside nativeRender) is
+     * picked up whenever it fires.  One thread, permanent; it idles at
+     * 100ms cadence until FMODAudioDevice.start actually happens. */
+    gds_audio_fmod_thread_start();
     return 1;
 }
 

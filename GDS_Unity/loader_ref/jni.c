@@ -393,6 +393,13 @@ static void *method_id(const char *cls, const char *name, const char *sig)
     methods[method_n].sig = strdup(sig);
     methods[method_n].handler = NULL;
     JT("new method id %d %s.%s%s", method_n + 1, cls ? cls : "?", name, sig);
+    /* 0.85 audio evidence: FMOD's actual dex/JNI surface, unconditionally */
+    if (cls && (strstr(cls, "fmod") || strstr(cls, "FMOD") ||
+                strstr(cls, "AudioTrack") || strstr(cls, "AudioManager"))) {
+        fprintf(stderr, "[audio] new method id %d %s.%s%s\n",
+                method_n + 1, cls, name, sig);
+        fflush(stderr);
+    }
     return (void *)(uintptr_t)(++method_n);
 }
 
@@ -4003,16 +4010,26 @@ static int64_t j_FMOD_start(jctx *c)
     if (c->self)
         fmod_device_object = c->self;
     __atomic_store_n(&fmod_should_run, 1, __ATOMIC_RELEASE);
-    nx_log("audio: FMODAudioDevice.start -> native AudioTrack requested");
+    static int seen;
+    if (seen < 3) {
+        seen++;
+        fprintf(stderr, "[audio] FMODAudioDevice.start%s -> native pump ON\n",
+                c->m && c->m->sig ? c->m->sig : "");
+        fflush(stderr);
+    }
     return 0;
 }
 
 static int64_t j_FMOD_stop(jctx *c)
 {
-    (void)c;
     __atomic_store_n(&fmod_should_run, 0, __ATOMIC_RELEASE);
-    nx_log("audio: FMODAudioDevice.%s -> native AudioTrack stopped",
-           c->m && c->m->name ? c->m->name : "stop");
+    static int seen;
+    if (seen < 3) {
+        seen++;
+        fprintf(stderr, "[audio] FMODAudioDevice.%s -> native pump OFF\n",
+                c->m && c->m->name ? c->m->name : "stop");
+        fflush(stderr);
+    }
     return 0;
 }
 
@@ -4020,6 +4037,29 @@ static int64_t j_FMOD_isRunning(jctx *c)
 {
     (void)c;
     return gds_jni_fmod_should_run() ? 1 : 0;
+}
+
+static int64_t j_FMOD_startAudioDevice(jctx *c)
+{
+    int rate = jarg_int(c);
+    int channels = jarg_int(c);
+    int blockframes = jarg_int(c);
+    fprintf(stderr, "[audio] FMODAudioDevice.startAudioDevice(%d, %d, %d)\n",
+            rate, channels, blockframes);
+    fflush(stderr);
+    gds_audio_fmod_config(rate, channels, blockframes);
+    gds_audio_fmod_thread_start();
+    __atomic_store_n(&fmod_should_run, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static int64_t j_FMOD_stopAudioDevice(jctx *c)
+{
+    (void)c;
+    fprintf(stderr, "[audio] FMODAudioDevice.stopAudioDevice\n");
+    fflush(stderr);
+    __atomic_store_n(&fmod_should_run, 0, __ATOMIC_RELEASE);
+    return 0;
 }
 
 static int64_t j_HandlerThread_getLooper(jctx *c)
@@ -4545,6 +4585,11 @@ static int32_t j_RegisterNatives(void *e, jobj *c, const void *m, int32_t n)
         snprintf(k->sig, sizeof k->sig, "%s", r[i].sig);
         k->fn = r[i].fn;
         nx_log("RegisterNatives %s.%s%s -> %p", k->cls, k->name, k->sig, k->fn);
+        if (strstr(k->cls, "fmod") || strstr(k->cls, "FMOD")) {
+            fprintf(stderr, "[audio] RegisterNatives %s.%s%s -> %p\n",
+                    k->cls, k->name, k->sig, k->fn);
+            fflush(stderr);
+        }
     }
     return 0;
 }
@@ -4772,6 +4817,14 @@ void gds_jni_init(void)
                  (void *)j_FMOD_stop);
     gds_jni_bind("org/fmod/FMODAudioDevice", "isRunning", "()Z",
                  (void *)j_FMOD_isRunning);
+    gds_jni_bind("org/fmod/FMODAudioDevice", "startAudioDevice", "(III)V",
+                 (void *)j_FMOD_startAudioDevice);
+    gds_jni_bind("org/fmod/FMODAudioDevice", "startAudioDevice", "(IIII)V",
+                 (void *)j_FMOD_startAudioDevice);
+    gds_jni_bind("org/fmod/FMODAudioDevice", "stopAudioDevice", "()V",
+                 (void *)j_FMOD_stopAudioDevice);
+    gds_jni_bind("org/fmod/FMODAudioDevice", "stopAudioDevice", "()Z",
+                 (void *)j_FMOD_stopAudioDevice);
     gds_jni_bind("android/os/HandlerThread", "getLooper",
                  "()Landroid/os/Looper;", (void *)j_HandlerThread_getLooper);
     gds_jni_bind("android/os/Looper", "getMainLooper",

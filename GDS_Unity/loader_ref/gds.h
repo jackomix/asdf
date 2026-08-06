@@ -59,6 +59,9 @@ void gds_jni_fmod_set_buffer_size(int bytes);
 int gds_jni_fmod_should_run(void);
 int gds_audio_start(void *env);
 void gds_audio_stop(void);
+/* 0.85: the missing FMODAudioDevice.run() java thread (opensles_audio.c). */
+void gds_audio_fmod_thread_start(void);
+void gds_audio_fmod_config(int rate, int channels, int blockframes);
 
 /* Linux controller -> Android KeyEvent/MotionEvent bridge.  Events are
  * injected on Unity's render thread, just as UnityPlayer forwards View input
