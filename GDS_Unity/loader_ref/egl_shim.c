@@ -52,9 +52,11 @@ static struct {
   int (*Init)(unsigned);
   const char *(*GetError)(void);
   const char *(*GetCurrentVideoDriver)(void);
+  int (*SetHint)(const char *, const char *);
   SDL_Window *(*CreateWindow)(const char *, int, int, int, int, unsigned);
   void (*DestroyWindow)(SDL_Window *);
   int (*GL_SetAttribute)(int, int);
+  int (*GL_GetAttribute)(int, int *);
   SDL_GLContext (*GL_CreateContext)(SDL_Window *);
   void (*GL_DeleteContext)(SDL_GLContext);
   int (*GL_MakeCurrent)(SDL_Window *, SDL_GLContext);
@@ -86,9 +88,11 @@ static int sdl_load(void) {
   S.Init              = (int (*)(unsigned))sym(h, "SDL_Init");
   S.GetError          = (const char *(*)(void))sym(h, "SDL_GetError");
   S.GetCurrentVideoDriver = (const char *(*)(void))sym(h, "SDL_GetCurrentVideoDriver");
+  S.SetHint           = (int (*)(const char *, const char *))sym(h, "SDL_SetHint");
   S.CreateWindow      = (SDL_Window *(*)(const char *, int, int, int, int, unsigned))sym(h, "SDL_CreateWindow");
   S.DestroyWindow     = (void (*)(SDL_Window *))sym(h, "SDL_DestroyWindow");
   S.GL_SetAttribute   = (int (*)(int, int))sym(h, "SDL_GL_SetAttribute");
+  S.GL_GetAttribute   = (int (*)(int, int *))sym(h, "SDL_GL_GetAttribute");
   S.GL_CreateContext  = (SDL_GLContext (*)(SDL_Window *))sym(h, "SDL_GL_CreateContext");
   S.GL_DeleteContext  = (void (*)(SDL_GLContext))sym(h, "SDL_GL_DeleteContext");
   S.GL_MakeCurrent    = (int (*)(SDL_Window *, SDL_GLContext))sym(h, "SDL_GL_MakeCurrent");
@@ -342,6 +346,13 @@ void egl_shim_create_window(void) {
    * can't set up the video driver / load the EGL/GL library ("Can't load EGL/GL
    * library on window creation").  This is why the first on-device run had
    * "SDL video driver = (null)" and no GL context. */
+  /* Horizon Chase lesson: force the GLES driver BEFORE init, or this SDL+
+   * Mali/KMSDRM pair hands back an "OpenGL ES-CM 1.1" fixed-pipeline context
+   * and Unity can never build an ES2+ device ("Graphics device is null"). */
+  if (S.SetHint) {
+    S.SetHint("SDL_OPENGL_ES_DRIVER", "1");
+    S.SetHint("SDL_VIDEO_X11_FORCE_EGL", "1");
+  }
   if (S.Init && !S.WasInit(SDL_INIT_VIDEO)) {
     int r = S.Init(SDL_INIT_VIDEO);
     printf("[egl] SDL_Init(VIDEO) = %s (%d)\n", r == 0 ? "ok" : "FAILED", r);
@@ -363,31 +374,68 @@ void egl_shim_create_window(void) {
   if (width <= 0) width = 640;
   if (height <= 0) height = 480;
 
-  /* try a few buffer formats, like terraria: {alpha,depth,stencil} */
-  static const int fmts[][3] = { {8,24,8}, {0,24,8}, {8,16,0}, {0,16,0}, {0,0,0} };
+  /* Version x format negotiation, proven on this exact device stack by the
+   * Horizon Chase port: alpha is ALWAYS 8 (that Unity device enumeration does
+   * an exact RGBA8888 compare); try ES 3 then ES 2 per window, and reject any
+   * context that doesn't report an "OpenGL ES" identity. */
+  static const int versions[] = {3, 2};
+  static const int fmts[][2] = { {24,8}, {16,0}, {0,0} };
   for (size_t f = 0; f < sizeof fmts / sizeof fmts[0] && !egl_share_root; f++) {
-    S.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    S.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-    S.GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-    S.GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-    S.GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-    S.GL_SetAttribute(SDL_GL_ALPHA_SIZE, fmts[f][0]);
-    S.GL_SetAttribute(SDL_GL_DEPTH_SIZE, fmts[f][1]);
-    S.GL_SetAttribute(SDL_GL_STENCIL_SIZE, fmts[f][2]);
-    S.GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    egl_window = S.CreateWindow("Game Dev Story", SDL_WINDOWPOS_CENTERED,
-                                SDL_WINDOWPOS_CENTERED, width, height,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
-    if (!egl_window) { printf("[egl] fmt %zu (a%d d%d s%d) failed\n",
-                              f, fmts[f][0], fmts[f][1], fmts[f][2]); continue; }
-    egl_share_root = S.GL_CreateContext(egl_window);
-    if (!egl_share_root) {
-      printf("[egl] ctx fmt %zu (a%d d%d s%d) failed: %s\n",
-             f, fmts[f][0], fmts[f][1], fmts[f][2], S.GetError());
-      S.DestroyWindow(egl_window); egl_window = NULL;
+    for (size_t vv = 0; vv < sizeof versions / sizeof versions[0] && !egl_share_root; vv++) {
+      S.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+      S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, versions[vv]);
+      S.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+      S.GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+      S.GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+      S.GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+      S.GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+      S.GL_SetAttribute(SDL_GL_DEPTH_SIZE, fmts[f][0]);
+      S.GL_SetAttribute(SDL_GL_STENCIL_SIZE, fmts[f][1]);
+      S.GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+      if (!egl_window) {
+        egl_window = S.CreateWindow("Game Dev Story", SDL_WINDOWPOS_CENTERED,
+                                    SDL_WINDOWPOS_CENTERED, width, height,
+                                    SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
+        if (!egl_window) {
+          printf("[egl] fmt %zu (a8 d%d s%d) window failed\n", f, fmts[f][0], fmts[f][1]);
+          break;    /* next format: new window attempt */
+        }
+      }
+      egl_share_root = S.GL_CreateContext(egl_window);
+      if (!egl_share_root) {
+        printf("[egl] ctx ES%d fmt %zu (a8 d%d s%d) failed: %s\n",
+               versions[vv], f, fmts[f][0], fmts[f][1], S.GetError());
+        continue;
+      }
+      /* verify the identity: must be real GLES, not desktop GL or ES 1.x CM */
+      {
+        void *gs = S.GL_GetProcAddress ? S.GL_GetProcAddress("glGetString") : NULL;
+        const char *ver = NULL;
+        if (gs) {
+          const unsigned char *(*g)(unsigned) = (const unsigned char *(*)(unsigned))gs;
+          const unsigned char *s = g(0x1F02);
+          ver = s ? (const char *)s : NULL;
+        }
+        if (!ver || !strstr(ver, "OpenGL ES") || strstr(ver, "ES-CM")) {
+          printf("[egl] ctx ES%d rejected, GL_VERSION='%s'\n",
+                 versions[vv], ver ? ver : "(null)");
+          S.GL_DeleteContext(egl_share_root); egl_share_root = NULL;
+          continue;
+        }
+        printf("[egl] accepted ES%d ctx, GL_VERSION=%s\n", versions[vv], ver);
+      }
+      g_es_major = versions[vv];
+      /* read back the REALLY negotiated buffer configuration */
+      if (S.GL_GetAttribute) {
+        int v;
+        if (S.GL_GetAttribute(SDL_GL_ALPHA_SIZE, &v) == 0)   g_alpha_size = v;
+        if (S.GL_GetAttribute(SDL_GL_DEPTH_SIZE, &v) == 0)   g_depth_size = v;
+        if (S.GL_GetAttribute(SDL_GL_STENCIL_SIZE, &v) == 0) g_stencil_size = v;
+      } else {
+        g_alpha_size = 8; g_depth_size = fmts[f][0]; g_stencil_size = fmts[f][1];
+      }
     }
-    if (egl_share_root) { g_alpha_size = fmts[f][0]; g_depth_size = fmts[f][1]; g_stencil_size = fmts[f][2]; }
+    if (!egl_share_root && egl_window) { S.DestroyWindow(egl_window); egl_window = NULL; }
   }
     if (!egl_share_root) {
       printf("[egl] no GL context created\n");
@@ -396,6 +444,7 @@ void egl_shim_create_window(void) {
     }
     printf("[egl] window=%p context=%p (SDL_CreateWindow may have logged a surface warning)\n",
            (void *)egl_window, (void *)egl_share_root);
+    printf("[egl] negotiated a%d d%d s%d ES%d\n", g_alpha_size, g_depth_size, g_stencil_size, g_es_major);
 
     if (S.GL_GetDrawableSize) S.GL_GetDrawableSize(egl_window, &g_screen_w, &g_screen_h);
   if (g_screen_w <= 0) g_screen_w = width;
@@ -508,8 +557,15 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_c
     free(c); return EGL_NO_CONTEXT;
   }
   pthread_mutex_lock(&egl_ctx_mutex);
+  /* Honor the caller's requested client version (0x3098) when it's a real ES
+   * major; Unity asks for 2, workers may ask for 3 -- don't force the wrong
+   * one.  Buffer sizes mirror the negotiated share-root window. */
+  int want_major = -1;
+  if (attrib_list)
+    for (int i = 0; attrib_list[i] != 0x3038 && i < 32; i += 2)
+      if (attrib_list[i] == 0x3098) want_major = attrib_list[i + 1];
   S.GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-  S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, g_es_major);
+  S.GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, want_major >= 2 && want_major <= 3 ? want_major : g_es_major);
   S.GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
   S.GL_SetAttribute(SDL_GL_ALPHA_SIZE, g_alpha_size);
   S.GL_SetAttribute(SDL_GL_DEPTH_SIZE, g_depth_size);

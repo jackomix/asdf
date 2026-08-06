@@ -336,7 +336,7 @@ static void apply(nx_mod *m, Elf64_Rela *r, size_t n, int *missing)
             else if (name && *name)
                 a = resolve(m, name, missing);
             if (!a) {
-                if (name && *name && ELF64_ST_BIND(sym->st_info) != STB_WEAK)
+                if (name && *name)
                     /* 0.61: always print - "N relocations unresolved" without
                      * names was undiagnosable without GDS_VERBOSE. */
                     fprintf(stderr, "[gamedevstory]   unresolved %s <- %s\n",

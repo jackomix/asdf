@@ -503,6 +503,16 @@ static void arm_traps(uintptr_t il2b)
         {0x1857568, "NM.ctor.ListAdd",         3},
         {0x1857598, "NM.ctor.GetFilter",       3},
         {0x17fdf94, "GetFilter.runner-null-check", 17},
+        /* KairoPlugin::Init chain: does Awake call it, does its store run? */
+        {0x1752c98, "Awake.callInit",          3},
+        {0x17f68d4, "KairoPlugin.Init.entry",  3},
+        {0x17f6a34, "KairoPlugin.Init.storeStatics0", 18},
+        {0xcb0de4, "raiseNRE.stub",            19},
+        {0x186a6c0, "GetNumRecords.files",     20},
+        {0xe76ab8, "AppData.Init.entry",       3},
+        {0x186a868, "RecordStore.Setup.entry", 22},
+        {0xe73e38, "form.FormManager.GetInstance", 23},
+        {0x186a8e4, "RecordStore.Setup.store", 21},
         {0xd952b0, "cxa_throw",               13},
     };
     if (!getenv("GDS_TRAP_AT"))
@@ -520,7 +530,7 @@ static void arm_traps(uintptr_t il2b)
         g_probes[g_nprobes].addr = a;
         g_probes[g_nprobes].orig = *(uint32_t *)a;
         g_probes[g_nprobes].hit = 0;
-        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : 1);
+        g_probes[g_nprobes].cap = T[i].kind == 13 ? 40 : (T[i].kind == 19 ? 4 : ((T[i].kind == 14 || T[i].kind == 15) ? 6 : 1));
         g_probes[g_nprobes].kind = T[i].kind;
         g_probes[g_nprobes].tag = T[i].tag;
         *(uint32_t *)a = 0xd4200000; /* brk #0 */
@@ -533,18 +543,52 @@ static void arm_traps(uintptr_t il2b)
 }
 
 
+static void disarm_throw(void)
+{
+    for (int i = 0; i < g_nprobes; i++) {
+        struct probe *p = &g_probes[i];
+        if (p->kind != 13)
+            continue;
+        uintptr_t pg = p->addr & ~0xfffUL;
+        if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            *(uint32_t *)p->addr = p->orig;
+            __builtin___clear_cache((char *)p->addr, (char *)p->addr + 4);
+            mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+        }
+        p->hit = 1;
+        p->cap = 1;   /* dead */
+        fprintf(stderr, "[trap] window closed: cxa_throw disarmed\n");
+    }
+}
+
 static void arm_late_throw(uintptr_t va)
 {
     if (g_nprobes >= MAX_PROBES)
         return;
     uintptr_t a = g_il2b + va;
+    for (int i = 0; i < g_nprobes; i++)
+        if (g_probes[i].addr == a) {
+            if (g_probes[i].hit >= g_probes[i].cap && g_probes[i].cap) {
+                /* previously disarmed: re-arm */
+                uintptr_t pg = a & ~0xfffUL;
+                if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    g_probes[i].hit = 0;
+                    g_probes[i].cap = 200;
+                    *(uint32_t *)a = 0xd4200000;
+                    __builtin___clear_cache((char *)a, (char *)a + 4);
+                    mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+                    fprintf(stderr, "[trap] cxa_throw re-armed\n");
+                }
+            }
+            return;   /* already armed */
+        }
     uintptr_t pg = a & ~0xfffUL;
     if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC))
         return;
     g_probes[g_nprobes].addr = a;
     g_probes[g_nprobes].orig = *(uint32_t *)a;
     g_probes[g_nprobes].hit = 0;
-    g_probes[g_nprobes].cap = 8;
+    g_probes[g_nprobes].cap = 200;
     g_probes[g_nprobes].kind = 13;
     g_probes[g_nprobes].tag = "cxa_throw(late)";
     *(uint32_t *)a = 0xd4200000;
@@ -700,7 +744,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                     /* runtime AORE spam: log a few, recycle the probe hit */
                     static int g_skip_seen;
                     p->hit--;
-                    if (g_skip_seen < 8) {
+                    if (g_skip_seen < 24) {
                         g_skip_seen++;
                         fprintf(stderr,
                             "[trap]   throw-skip %s.%s ra=il2cpp+%#lx\n",
@@ -762,9 +806,11 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                         fprintf(stderr, "\n");
                     }
                 }
-            } else if (p->kind == 16) {
-                fprintf(stderr, "[trap] arming throw probe now\n");
+            } else if (p->kind == 16 || p->kind == 22) {
+                fprintf(stderr, "[trap] arming throw probe now (kind %d)\n", p->kind);
                 arm_late_throw(0xd952b0);
+            } else if (p->kind == 23) {
+                disarm_throw();
             } else if (p->kind == 15) {
                 /* Substring(this=str, startIndex, length): show inputs */
                 char s2[620];
@@ -778,17 +824,28 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                         slen, (long)u->uc_mcontext.regs[1],
                         (long)u->uc_mcontext.regs[2], s2);
             } else if (p->kind == 17) {
-                /* GetNotificationFilter: who owns statics[0] (UI runner)? */
-                uintptr_t slot = g_il2b + 0x1ecff90;
-                uintptr_t kla = trap_mapped(slot) ? *(uintptr_t *)slot : 0;
-                char b1[96], b2[96];
-                fprintf(stderr, "[trap]   klass@0x1ecff90 = %#lx",
-                        (unsigned long)kla);
-                if (trap_ptr_ok(kla) && trap_mapped(kla)) {
-                    fprintf(stderr, " %s.%s",
-                            trap_cstr(*(uintptr_t *)(kla + 0x18), b2, sizeof b2),
-                            trap_cstr(*(uintptr_t *)(kla + 0x10), b1, sizeof b1));
-                    uintptr_t st = *(uintptr_t *)(kla + 0xb8);
+                /* GetNotificationFilter runner-null site: resolve the chain
+                 * the way the code does it: GOT slot -> rec -> rec[0]=klass
+                 * -> klass+0xb8 statics -> statics[0] runner instance.  Dump
+                 * for both KairoPlugin(0x1ebf660) and IApplication(0x1ebf2d8). */
+                static const struct { uint32_t off; const char *who; } CH[] = {
+                    {0x1ebf660, "KairoPlugin"}, {0x1ebf2d8, "IApplication?"},
+                };
+                for (int c = 0; c < 2; c++) {
+                    uintptr_t slot = g_il2b + CH[c].off;
+                    uintptr_t rec = trap_mapped(slot) ? *(uintptr_t *)slot : 0;
+                    uintptr_t kla = (trap_ptr_ok(rec) && trap_mapped(rec))
+                                    ? *(uintptr_t *)rec : 0;
+                    char b1[96], b2[96];
+                    fprintf(stderr, "[trap]   %s slot[+%x] rec=%#lx klass=%#lx %s.%s",
+                            CH[c].who, CH[c].off,
+                            (unsigned long)rec, (unsigned long)kla,
+                            trap_ptr_ok(kla) && trap_mapped(kla)
+                                ? trap_cstr(*(uintptr_t *)(kla + 0x18), b2, sizeof b2) : "?",
+                            trap_ptr_ok(kla) && trap_mapped(kla)
+                                ? trap_cstr(*(uintptr_t *)(kla + 0x10), b1, sizeof b1) : "?");
+                    uintptr_t st = (trap_ptr_ok(kla) && trap_mapped(kla + 0xb8))
+                                   ? *(uintptr_t *)(kla + 0xb8) : 0;
                     fprintf(stderr, " statics=%#lx", (unsigned long)st);
                     if (trap_ptr_ok(st) && trap_mapped(st)) {
                         uintptr_t inst = *(uintptr_t *)st;
@@ -802,8 +859,83 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                                         trap_cstr(*(uintptr_t *)(ik + 0x10), c1, sizeof c1));
                         }
                     }
+                    fprintf(stderr, "\n");
+                }
+            } else if (p->kind == 18) {
+                /* KairoPlugin::Init+0x160: str x22,[x8] -- the statics[0] store.
+                 * x8 = KairoPlugin statics base, x22 = value copied from
+                 * IApplication.statics[0]. */
+                uintptr_t dst = (uintptr_t)u->uc_mcontext.regs[8];
+                uintptr_t val = (uintptr_t)u->uc_mcontext.regs[22];
+                fprintf(stderr,
+                        "[trap]   Init.store: dst=%#lx val(x22)=%#lx\n",
+                        (unsigned long)dst, (unsigned long)val);
+                if (trap_ptr_ok(val) && trap_mapped(val)) {
+                    uintptr_t ik = *(uintptr_t *)val;
+                    char c1[96], c2[96];
+                    if (trap_ptr_ok(ik) && trap_mapped(ik))
+                        fprintf(stderr, "[trap]   stored obj class=%s.%s\n",
+                                trap_cstr(*(uintptr_t *)(ik + 0x18), c2, sizeof c2),
+                                trap_cstr(*(uintptr_t *)(ik + 0x10), c1, sizeof c1));
+                } else {
+                    fprintf(stderr, "[trap]   stored value is NULL/invalid\n");
+                }
+            } else if (p->kind == 21) {
+                /* RecordStore::Setup store site: str x8, [x9, #0x18] --
+                 * x8 = Storage::Open(4,1,0,0) result parked in X.statics[0x18]. */
+                uintptr_t v8 = (uintptr_t)u->uc_mcontext.regs[8];
+                fprintf(stderr,
+                        "[trap]   Setup.store: X.statics[0x18] <- %#lx",
+                        (unsigned long)v8);
+                if (trap_ptr_ok(v8) && trap_mapped(v8)) {
+                    uintptr_t ik = *(uintptr_t *)v8;
+                    char c1[96], c2[96];
+                    if (trap_ptr_ok(ik) && trap_mapped(ik))
+                        fprintf(stderr, " (%s.%s)",
+                                trap_cstr(*(uintptr_t *)(ik + 0x18), c2, sizeof c2),
+                                trap_cstr(*(uintptr_t *)(ik + 0x10), c1, sizeof c1));
+                } else {
+                    fprintf(stderr, " (NULL!)");
                 }
                 fprintf(stderr, "\n");
+            } else if (p->kind == 20) {
+                /* RecordStore::GetNumRecords: x0 = files array just returned;
+                 * x19 = this RecordStore.  Which storage mode, which path,
+                 * and did the file list come back NULL? */
+                uintptr_t files = (uintptr_t)u->uc_mcontext.regs[0];
+                uintptr_t ths = (uintptr_t)u->uc_mcontext.regs[19];
+                char pth[600];
+                fprintf(stderr,
+                        "[trap]   GetNumRecords: files=%#lx this=%#lx\n",
+                        (unsigned long)files, (unsigned long)ths);
+                if (trap_ptr_ok(files) && trap_mapped(files + 0x18))
+                    fprintf(stderr, "[trap]   files.len=%d\n",
+                            *(volatile int *)(files + 0x18));
+                if (trap_ptr_ok(ths) && trap_mapped(ths + 0x18)) {
+                    fprintf(stderr, "[trap]   this.mode(0x10)=%d\n",
+                            *(volatile int *)(ths + 0x10));
+                    trap_il2str(*(uintptr_t *)(ths + 0x18), pth, sizeof pth);
+                    fprintf(stderr, "[trap]   this.path='%s'\n", pth);
+                }
+                /* Config (slot 0x1ebf338) storage-mode byte statics[0x20] */
+                uintptr_t slot = g_il2b + 0x1ebf338;
+                uintptr_t rec = trap_mapped(slot) ? *(uintptr_t *)slot : 0;
+                uintptr_t kla = (trap_ptr_ok(rec) && trap_mapped(rec))
+                                ? *(uintptr_t *)rec : 0;
+                if (trap_ptr_ok(kla) && trap_mapped(kla + 0xb8)) {
+                    uintptr_t st = *(uintptr_t *)(kla + 0xb8);
+                    if (trap_ptr_ok(st) && trap_mapped(st + 0x20))
+                        fprintf(stderr,
+                                "[trap]   Config.statics[0x20](pref-mode)=%d\n",
+                                *(volatile unsigned char *)(st + 0x20));
+                }
+            } else if (p->kind == 19) {
+                /* NRE-raise stub entry: x30 = codegen raise call site +4.
+                 * That is the instruction right after `bl raiseNRE`, so the
+                 * guarding null check sits a couple of insns earlier. */
+                fprintf(stderr,
+                        "[trap]   NRE-raise site = il2cpp+%#lx\n",
+                        (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
             } else if (p->kind == 14) {
                 /* raise-helper entry: x30 = codegen out-of-range check site */
                 fprintf(stderr, "[trap]   ra=il2cpp+%#lx",
@@ -1083,7 +1215,7 @@ int main(int argc, char **argv)
     setup_paths(argc > 1 ? argv[1] : NULL);
     gds_fs_set_data_dir(gds_datadir);
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.63.0-ref)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.64.0-ref)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
