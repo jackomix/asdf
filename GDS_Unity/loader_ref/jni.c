@@ -2756,16 +2756,22 @@ static int64_t j_AudioManager_getProperty(jctx *c)
 {
     jobj *key = jarg_obj(c);
     const char *k = key && key->str ? key->str : "";
-    const char *v = strstr(k, "FRAMES_PER_BUFFER") ? "256" : "44100";
-    JT("AudioManager.getProperty(\"%s\") -> \"%s\"", k, v);
-    {
-        static int seen;
-        if (!seen) {
-            seen = 1;
-            fprintf(stderr, "[audio] AudioManager.getProperty(key) -> \"%s\" (first query \"%s\")\n",
-                    v, k);
-        }
-    }
+    /* 0.82: the 0.81 device log showed the key string unreadable ("") -- so
+     * FMOD got "44100" for BOTH properties.  fmod_output_opensl.cpp queries
+     * OUTPUT_SAMPLE_RATE first, then OUTPUT_FRAMES_PER_BUFFER; when the key
+     * cannot be read, fall back to the call-order answer.  Log EVERY call
+     * unconditionally: this is the last working breadcrumb before FMOD
+     * should dlopen libOpenSLES.so and dlsym slCreateEngine. */
+    static unsigned prop_calls;
+    const char *v;
+    if (strstr(k, "FRAMES_PER_BUFFER")) v = "256";
+    else if (strstr(k, "SAMPLE_RATE"))   v = "44100";
+    else if (*k)                          v = "44100";
+    else                                  v = (prop_calls % 2 == 0) ? "44100" : "256";
+    prop_calls++;
+    fprintf(stderr, "[audio] AudioManager.getProperty(\"%s\") -> \"%s\" (#%u)\n",
+            k, v, prop_calls);
+    fflush(stderr);
     return (int64_t)(uintptr_t)mk_string(v);
 }
 

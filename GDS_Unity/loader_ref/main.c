@@ -1344,7 +1344,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.81.0-addrpatch)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.82.0-padland)\n", gds_gamedir);
 
     gds_jni_init();
     gds_egl_init();
@@ -1355,6 +1355,13 @@ int main(int argc, char **argv)
 
     int missing = gds_load_modules();
     fprintf(stderr, "[gds] modules loaded, %d relocations unresolved\n", missing);
+
+    /* 0.82: install address-table input/landscape hooks NOW (before any
+     * managed frame).  0.81 installed them on frame ~3; disassembly shows
+     * SurfaceManager::Setup (called from main.AppData::Init during boot)
+     * reads IApplication::IsSide once and latches the layout byte, so the
+     * ret-1 patch landed too late and the game stayed portrait. */
+    gds_input_install_now();
 
     nx_mod *main_mod = nx_find_mod("libmain.so");
     nx_mod *uni = nx_find_mod("libunity.so");

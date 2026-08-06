@@ -154,6 +154,22 @@ int my___system_property_get(const char *key, char *value)
     for (size_t i = 0; i < sizeof props / sizeof *props; i++)
         if (strcmp(props[i].k, key) == 0)
             return (int)strlen(strcpy(value, props[i].v));
+    /* 0.82 audio probe: nx_log is verbose-gated, so unknown property reads
+     * were invisible on device.  FMOD's OpenSL init (fmod_output_opensl.cpp
+     * strings in libunity) reads properties before dlopen'ing libOpenSLES;
+     * report each unique unknown key unconditionally, bounded. */
+    {
+        static char seen[24][64];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++)
+            if (!strcmp(seen[i], key ? key : "")) { known = 1; break; }
+        if (!known && nseen < 24 && key && *key) {
+            snprintf(seen[nseen++], 64, "%s", key);
+            fprintf(stderr, "[audio] __system_property_get(\"%s\") -> \"\" (unset)\n", key);
+            fflush(stderr);
+        }
+    }
     value[0] = 0;
     return 0;
 }
@@ -794,8 +810,30 @@ static void *my_dlopen(const char *name, int flags)
             if (module)
                 nx_run_init(module);
             BIONIC_TRACE("dlopen(\"%s\") -> handle %zu", name, i);
+            /* 0.82 audio probe: did FMOD ever reach the OpenSL dlopen? */
+            if (strstr(b, "OpenSLES")) {
+                static int sl_log;
+                if (!sl_log) {
+                    sl_log = 1;
+                    fprintf(stderr, "[audio] dlopen(\"%s\") -> fake OpenSL handle\n", name);
+                    fflush(stderr);
+                }
+            }
             return FAKE_HANDLE(i);
         }
+    /* 0.82: first unique dlopen names, unconditionally (bounded). */
+    {
+        static char seen[32][80];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++)
+            if (!strcmp(seen[i], name)) { known = 1; break; }
+        if (!known && nseen < 32) {
+            snprintf(seen[nseen++], 80, "%s", name);
+            fprintf(stderr, "[audio] dlopen(\"%s\") -> global scope\n", name);
+            fflush(stderr);
+        }
+    }
     nx_log("dlopen(%s) -> global scope", name);
     return FAKE_HANDLE(0);
 }

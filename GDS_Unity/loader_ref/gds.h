@@ -64,6 +64,7 @@ void gds_audio_stop(void);
  * injected on Unity's render thread, just as UnityPlayer forwards View input
  * on Android. */
 int gds_input_init(void);
+void gds_input_install_now(void);   /* 0.82: patch hooks at module-load time */
 void gds_input_poll(void *env, void *player, unsigned long frame);
 void gds_input_close(void);
 int gds_input_exit_requested(void);

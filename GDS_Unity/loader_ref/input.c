@@ -170,8 +170,32 @@ static int hook_delay(void) {
     static int c = -1;
     if (c < 0) {
         const char *e = getenv("GDS_HOOK_DELAY");
-        c = e ? atoi(e) : 3;
+        c = e ? atoi(e) : 0;   /* 0.82: no delay -- see gds_input_install_now */
         if (c < 0) c = 0;
+    }
+    return c;
+}
+static int swap_ab(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("GDS_SWAPAB");
+        c = (e && atoi(e) == 0) ? 0 : 1;
+    }
+    return c;
+}
+static int swap_xy(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("GDS_SWAPXY");
+        c = (e && atoi(e) == 0) ? 0 : 1;
+    }
+    return c;
+}
+static int padlog_on(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("GDS_PADLOG");
+        c = (e && atoi(e) > 0) ? 1 : 0;
     }
     return c;
 }
@@ -257,10 +281,17 @@ static void pad_poll(void) {
     if (s_GameControllerUpdate) s_GameControllerUpdate();
     memcpy(g_npb_prev, g_npb, sizeof g_npb);
 #define BTN(b) (s_GameControllerGetButton ? s_GameControllerGetButton(g_gc, b) : 0)
-    g_npb[NPB_A]     = BTN(SDL_CONTROLLER_BUTTON_A);
-    g_npb[NPB_B]     = BTN(SDL_CONTROLLER_BUTTON_B);
-    g_npb[NPB_X]     = BTN(SDL_CONTROLLER_BUTTON_X);
-    g_npb[NPB_Y]     = BTN(SDL_CONTROLLER_BUTTON_Y);
+    /* 0.82: Nintendo-face swap, default ON (GDS_SWAPAB=0 / GDS_SWAPXY=0 off).
+     * Device evidence: SDL on ArkOS maps buttons by POSITION (SDL "A" = the
+     * physical bottom button, labeled B on the R36S's SNES-style face).
+     * kairo slot 0 is semantic "A" (Switch layout = east button).  Without
+     * the swap the user confirmed with the button labeled B -- exactly what
+     * the 0.81 device run reported.  Reference ports carry the same toggle
+     * (TER_SWAPAB in terraria/horizonchase native_pad.c). */
+    g_npb[NPB_A]     = BTN(swap_ab() ? SDL_CONTROLLER_BUTTON_B : SDL_CONTROLLER_BUTTON_A);
+    g_npb[NPB_B]     = BTN(swap_ab() ? SDL_CONTROLLER_BUTTON_A : SDL_CONTROLLER_BUTTON_B);
+    g_npb[NPB_X]     = BTN(swap_xy() ? SDL_CONTROLLER_BUTTON_Y : SDL_CONTROLLER_BUTTON_X);
+    g_npb[NPB_Y]     = BTN(swap_xy() ? SDL_CONTROLLER_BUTTON_X : SDL_CONTROLLER_BUTTON_Y);
     g_npb[NPB_LB]    = BTN(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
     g_npb[NPB_RB]    = BTN(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     g_npb[NPB_BACK]  = BTN(SDL_CONTROLLER_BUTTON_BACK);
@@ -279,6 +310,22 @@ static void pad_poll(void) {
     }
     if (g_npa[NPA_LT] < 0.0f) g_npa[NPA_LT] = 0.0f;
     if (g_npa[NPA_RT] < 0.0f) g_npa[NPA_RT] = 0.0f;
+
+    /* GDS_PADLOG=1: every physical button transition, one line.  This is the
+     * "controller test" the user asked for: press a button, read the line. */
+    if (padlog_on()) {
+        static const char *const bn[NPB_COUNT] = {
+            "A/east", "B/south", "X/north", "Y/west", "L1", "R1",
+            "SELECT", "START", "L3", "R3", "D-UP", "D-DOWN", "D-LEFT", "D-RIGHT" };
+        for (int i = 0; i < NPB_COUNT; i++) {
+            if (g_npb[i] != g_npb_prev[i]) {
+                fprintf(stderr, "[padlog] %-8s %s  (LT=%.2f RT=%.2f)\n",
+                        bn[i], g_npb[i] ? "DOWN" : "up",
+                        g_npa[NPA_LT], g_npa[NPA_RT]);
+                fflush(stderr);
+            }
+        }
+    }
 
     /* exit chord: SELECT+START (native_pad.c Bully/Sonic pattern) */
     if (!g_exit_requested && g_npb[NPB_BACK] && g_npb[NPB_START]) {
@@ -375,8 +422,20 @@ static int key_from_pad(int key) {
     return 0;
 }
 
-/* kairo's virtual joystick contract (Canvas disasm): ids 0-3 A/B/X/Y,
- * 6=L1 7=R1, 8/9 = L2/R2 analog, 10=SELECT 11=START, 12-15 dpad dirs. */
+/* kairo's virtual joystick contract -- 0.82 disassembly-verified:
+ *   Canvas::GetJoystickButton @0x171d8d8: id%(24) indexes a KeyCode table;
+ *   zero entries (ids 8/9, 12-15) fall back to GetJoystickAxis(id) > 0.5f.
+ *   Canvas::_decideKeyState @0x17240c8 jump table @0x50cc0c (Unity arrow
+ *   KeyCodes 273-276) defines the dpad semantics DEFINITIVELY:
+ *     keycode 273 (UP)    = axis17 < -0.5 || GetJoystickButton(13)
+ *     keycode 274 (DOWN)  = axis17 > +0.5 || GetJoystickButton(15)
+ *     keycode 275 (RIGHT) = axis16 > +0.5 || GetJoystickButton(14)
+ *     keycode 276 (LEFT)  = axis16 < -0.5 || GetJoystickButton(12)
+ *   => slot order is 12=LEFT 13=UP 14=RIGHT 15=DOWN  (0.81 had 12/13/14/15
+ *   = U/D/L/R -- wrong; user evidence "down was up, up dead" matches this).
+ *   cctor @0x172d9a0 triples {flag,slot}: 0x1001-8->0-3 (A/B/X/Y),
+ *   0x1010/20->6/7 (L1/R1), 0x1040/80->8/9 (L2/R2), 0x1100/200->10/11
+ *   (SELECT/START), 0x10000..0x80000->12-15, 0x2000 group -> 16-23. */
 static int kjoy_button(int id) {
     switch (id & 0xff) {
     case 0:  return g_npb[NPB_A];
@@ -389,10 +448,10 @@ static int kjoy_button(int id) {
     case 9:  return g_npa[NPA_RT] > 0.5f;
     case 10: return g_npb[NPB_BACK];
     case 11: return g_npb[NPB_START];
-    case 12: return g_npb[NPB_DU];
-    case 13: return g_npb[NPB_DD];
-    case 14: return g_npb[NPB_DL];
-    case 15: return g_npb[NPB_DR];
+    case 12: return g_npb[NPB_DL];   /* LEFT  */
+    case 13: return g_npb[NPB_DU];   /* UP    */
+    case 14: return g_npb[NPB_DR];   /* RIGHT */
+    case 15: return g_npb[NPB_DD];   /* DOWN  */
     }
     return 0;
 }
@@ -400,10 +459,18 @@ static float kjoy_axis_value(int id) {
     switch (id & 0xff) {
     case 8:  return g_npa[NPA_LT];
     case 9:  return g_npa[NPA_RT];
-    case 12: return (float)g_npb[NPB_DU];
-    case 13: return (float)g_npb[NPB_DD];
-    case 14: return (float)g_npb[NPB_DL];
-    case 15: return (float)g_npb[NPB_DR];
+    case 12: return (float)g_npb[NPB_DL];
+    case 13: return (float)g_npb[NPB_DU];
+    case 14: return (float)g_npb[NPB_DR];
+    case 15: return (float)g_npb[NPB_DD];
+    case 16: {                              /* dpad horizontal, +1 = RIGHT */
+        float h = (float)(g_npb[NPB_DR] - g_npb[NPB_DL]);
+        return h ? h : g_npa[NPA_LX];
+    }
+    case 17: {                              /* dpad vertical, +1 = DOWN */
+        float v = (float)(g_npb[NPB_DD] - g_npb[NPB_DU]);
+        return v ? v : g_npa[NPA_LY];
+    }
     }
     return 0.0f;
 }
@@ -718,47 +785,66 @@ static int inp_Screen_get_fullScreen(void) { return 1; }
 static void inp_Screen_set_orientation(int o) { (void)o; }
 static void inp_Screen_RequestOrientation(int o) { (void)o; }
 
+/* Per-(family,id) query counters: which kairo slot the game actually asks
+ * for, printed once per pair (the "which button does it poll" evidence the
+ * 0.81 run only gave us one axis id for). */
+static unsigned g_kq[12][24];
+static void kq_note(int fam, const char *fn, int id) {
+    if (fam < 0 || fam >= 12 || id < 0 || id >= 24) return;
+    if (!g_kq[fam][id]++) {
+        fprintf(stderr, "[input] kjoy query: %s(%d)\n", fn, id);
+        fflush(stderr);
+    }
+}
 /* kairo.unity.ui.Canvas virtual joystick layer (2 args: this, id). */
 static int kjoy_GetJoystickButton(void *self, int id) {
     (void)self;
     HITF(16, "Canvas.GetJoystickButton");
+    kq_note(0, "GetJoystickButton", id);
     return kjoy_button(id);
 }
 static float kjoy_GetJoystickAxis(void *self, int id) {
     (void)self;
     HITF(17, "Canvas.GetJoystickAxis(%d)", id);
+    kq_note(1, "GetJoystickAxis", id);
     return kjoy_axis_value(id);
 }
 static int kjoy_GetJoystickDown(void *self, int id) {
     (void)self;
     HITF(18, "Canvas.GetJoystickDown");
+    kq_note(2, "GetJoystickDown", id);
     if (id < 0 || id >= 24) return 0;
     return g_kjoy_now[id] && !g_kjoy_prev[id];
 }
 static int kjoy_GetJoystickUp(void *self, int id) {
     (void)self;
     HITF(19, "Canvas.GetJoystickUp");
+    kq_note(3, "GetJoystickUp", id);
     if (id < 0 || id >= 24) return 0;
     return !g_kjoy_now[id] && g_kjoy_prev[id];
 }
 static int kjoy_GetJoystickPress(void *self, int id) {
     (void)self;
     HITF(20, "Canvas.GetJoystickPress");
+    kq_note(4, "GetJoystickPress", id);
     return kjoy_button(id);
 }
 static float kjoy_GetJoystickAnalog(void *self, int id) {
     (void)self;
     HITF(21, "Canvas.GetJoystickAnalog(%d)", id);
+    kq_note(5, "GetJoystickAnalog", id);
     return kjoy_axis_value(id);
 }
 static float kjoy_GetJoystickAnalogPress(void *self, int id) {
     (void)self;
     HITF(22, "Canvas.GetJoystickAnalogPress(%d)", id);
+    kq_note(6, "GetJoystickAnalogPress", id);
     return kjoy_axis_value(id);
 }
 static int kjoy_GetJoystickHoldDown(void *self, int id) {
     (void)self;
     HITF(23, "Canvas.GetJoystickHoldDown");
+    kq_note(7, "GetJoystickHoldDown", id);
     return kjoy_button(id);
 }
 
@@ -794,7 +880,7 @@ static hook_ent g_hooks[] = {
     { "Input.get_touchSupported", 0x1bf45c4, 0xa9bf4ffe, 0, inp_get_touchSupported },
     { "Input.get_mousePresent", 0x1bf4574, 0xa9bf4ffe, 0, inp_get_mousePresent },
     { "Input.get_multiTouchEnabled", 0x1bf45ec, 0xa9bf4ffe, 0, inp_get_multiTouchEnabled },
-    { "Input.set_multiTouchEnabled", 0x1bf4614, 0xa9be57fe, 0, inp_nop },
+    { "Input.set_multiTouchEnabled", 0x1bf4614, 0xf81e0ffe, 0, inp_nop },   /* sig corrected 0.82 (0.81 SIG MISMATCH evidence) */
     { "Unsafe.GetAxis",        0x1bf3c68, 0xf81e0ffe, 0, inp_GetAxis },
     { "Unsafe.GetAxisRaw",     0x1bf3ce0, 0xf81e0ffe, 0, inp_GetAxis },
     { "Unsafe.GetAxis__Unmanaged", 0x1bf5910, 0xa9be57fe, 0, inp_GetAxis_unmanaged },
@@ -915,6 +1001,16 @@ static int install_hooks(void) {
 /* ------------------------------------------------------- public hooks */
 int gds_input_init(void) { return 0; }
 
+/* 0.82 landscape fix: main.c calls this the moment all modules are mapped
+ * (right after "modules loaded"), NOT on frame N.  The address-table patch
+ * needs zero il2cpp runtime, and SurfaceManager::Setup consults IsSide at
+ * boot (frames 1-3, evidence: main.AppData::Init -> Setup -> IsSide) -- the
+ * 0.81 frame-3 install landed AFTER the consult, so landscape never latched
+ * even though the patch itself was correct. */
+void gds_input_install_now(void) {
+    install_hooks();
+}
+
 void gds_input_poll(void *env, void *player, unsigned long frame) {
     (void)env; (void)player;
     pad_open();
@@ -926,12 +1022,31 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
     memcpy(g_kjoy_prev, g_kjoy_now, sizeof g_kjoy_prev);
     for (size_t i = 0; i < sizeof g_kjoy_now / sizeof *g_kjoy_now; i++)
         g_kjoy_now[i] = (unsigned char)kjoy_button((int)i);
-    /* patch-by-address is safe as soon as libil2cpp.so is mapped; small delay
-     * kept purely so the first frames' boot code runs unmodified. */
+    /* fallback only: normally installed by gds_input_install_now at load */
     if (!g_patched && (long)frame >= hook_delay()) {
         install_hooks();
         if (!g_patched && frame > 0 && frame % 600 == 0)
             fprintf(stderr, "[input] hooks not installed yet (frame %lu)\n", frame);
+    }
+    /* periodic kjoy query histogram (every 1200 frames): what the game asks */
+    if (frame > 0 && frame % 1200 == 0) {
+        static const char *const fam[8] = { "Btn", "Axis", "Down", "Up",
+                                            "Press", "Ana", "AnaP", "Hold" };
+        char line[512]; int p = 0;
+        p += snprintf(line + p, sizeof line - p, "[input] kjoy hit-summary:");
+        for (int f = 0; f < 8; f++) {
+            int first = 1;
+            p += snprintf(line + p, sizeof line - p, " %s[", fam[f]);
+            for (int i = 0; i < 24; i++)
+                if (g_kq[f][i]) {
+                    p += snprintf(line + p, sizeof line - p, "%s%d:%u",
+                                  first ? "" : " ", i, g_kq[f][i]);
+                    first = 0;
+                }
+            p += snprintf(line + p, sizeof line - p, "]");
+        }
+        fprintf(stderr, "%s\n", line);
+        fflush(stderr);
     }
 }
 
