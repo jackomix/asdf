@@ -2752,6 +2752,33 @@ static int64_t j_Context_AUDIO_SERVICE(jctx *c)
     (void)c;
     return (int64_t)(uintptr_t)mk_string("audio");
 }
+/* Static String fields on android/media/AudioManager (libunity rodata holds
+ * the literal Java field NAMES "PROPERTY_OUTPUT_SAMPLE_RATE" (@0xc81f3) and
+ * "PROPERTY_OUTPUT_FRAMES_PER_BUFFER" (@0x10e70a) next to the class string
+ * @0xb6b0f).  FMOD does GetStaticFieldID + GetStaticObjectField to fetch the
+ * PROPERTY KEY before calling getProperty(key).  Unbound, the key reached
+ * getProperty as NULL/"" -- that is exactly what the 0.82 device log showed
+ * (three getProperty("") calls) -- and FMOD bailed before ever calling
+ * dlopen("libOpenSLES.so").  Hand back the real key constants Android
+ * defines. */
+static int64_t j_AudioManager_PROP_SAMPLE_RATE(jctx *c)
+{
+    (void)c;
+    fprintf(stderr, "[audio] static field AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE"
+                    " -> \"android.media.property.OUTPUT_SAMPLE_RATE\"\n");
+    fflush(stderr);
+    return (int64_t)(uintptr_t)mk_string(
+        "android.media.property.OUTPUT_SAMPLE_RATE");
+}
+static int64_t j_AudioManager_PROP_FRAMES_PER_BUFFER(jctx *c)
+{
+    (void)c;
+    fprintf(stderr, "[audio] static field AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER"
+                    " -> \"android.media.property.OUTPUT_FRAMES_PER_BUFFER\"\n");
+    fflush(stderr);
+    return (int64_t)(uintptr_t)mk_string(
+        "android.media.property.OUTPUT_FRAMES_PER_BUFFER");
+}
 static int64_t j_AudioManager_getProperty(jctx *c)
 {
     jobj *key = jarg_obj(c);
@@ -4676,6 +4703,12 @@ void gds_jni_init(void)
     /* FMOD OpenSL audio probe chain (see j_Context_getSystemService) */
     gds_jni_bind("android/content/Context", "AUDIO_SERVICE",
                  "Ljava/lang/String;", (void *)j_Context_AUDIO_SERVICE);
+    gds_jni_bind("android/media/AudioManager", "PROPERTY_OUTPUT_SAMPLE_RATE",
+                 "Ljava/lang/String;",
+                 (void *)j_AudioManager_PROP_SAMPLE_RATE);
+    gds_jni_bind("android/media/AudioManager",
+                 "PROPERTY_OUTPUT_FRAMES_PER_BUFFER", "Ljava/lang/String;",
+                 (void *)j_AudioManager_PROP_FRAMES_PER_BUFFER);
     gds_jni_bind("android/media/AudioManager", "getProperty",
                  "(Ljava/lang/String;)Ljava/lang/String;",
                  (void *)j_AudioManager_getProperty);
