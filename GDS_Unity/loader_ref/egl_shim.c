@@ -240,6 +240,10 @@ static void *g_pbuf = NULL;        /* real 16x16 pbuffer for Unity worker contex
 static int g_best_es_major = 0;    /* highest ES version the RAW driver actually hands out */
 static int g_raw_egl_active = 0;   /* a RAW context was handed to Unity */
 static void *g_raw_glGetString = 0;
+static void (*g_raw_glClearColor)(float, float, float, float);
+static void (*g_raw_glClear)(unsigned);
+static void (*g_raw_glReadPixels)(int, int, int, int, unsigned, unsigned, void *);
+static int (*g_raw_glGetError)(void);
 static void *g_real_egl_hdl = NULL;
 static int g_nullgl;   /* tentative; the NullGL section below owns the init */
 
@@ -369,6 +373,12 @@ static void gds_capture_real_egl(void) {
     }
     if (glh) ggs = (const unsigned char *(*)(unsigned))dlsym(glh, "glGetString");
     g_raw_glGetString = (void *)ggs;
+    if (glh) {
+      g_raw_glClearColor = (void (*)(float, float, float, float))dlsym(glh, "glClearColor");
+      g_raw_glClear = (void (*)(unsigned))dlsym(glh, "glClear");
+      g_raw_glReadPixels = (void (*)(int, int, int, int, unsigned, unsigned, void *))dlsym(glh, "glReadPixels");
+      g_raw_glGetError = (int (*)(void))dlsym(glh, "glGetError");
+    }
     fprintf(stderr, "[egl] raw glGetString=%p (GL lib=%s)\n",
             (void *)ggs, gld ? gld : "(default)");
     for (int want = 3; want >= 1 && !g_best_es_major; want--) {
@@ -392,9 +402,35 @@ static void gds_capture_real_egl(void) {
       fprintf(stderr, "[egl] WARNING: raw driver only hands out ES1.1 contexts\n");
     else
       fprintf(stderr, "[egl] raw driver max: ES%d\n", g_best_es_major);
-    /* restore what SDL believes it owns: share root current on its window */
-    if (egl_window && egl_share_root && S.GL_MakeCurrent)
-      S.GL_MakeCurrent(egl_window, egl_share_root);
+
+    /* 0.71 PRESENT-PATH PROOF: Unity presents ok=1 yet the panel is black.
+     * Before Unity starts, clear/swap the REAL window surface R/G/B with a
+     * raw context.  Visible flashes => raw present reaches the panel and the
+     * issue is content; no flashes => the surface/swap path is broken. */
+    if (g_best_es_major && g_win_surf && g_raw_glClear && g_raw_glClearColor) {
+      int ca[] = { 0x3098, g_best_es_major, 0x3038 };
+      void *fc = r_eglCreateContext(g_real_dpy, g_real_cfg, 0, ca);
+      if (fc && r_eglMakeCurrent(g_real_dpy, g_win_surf, g_win_surf, fc)) {
+        static const float cols[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+        for (int i = 0; i < 3; i++) {
+          g_raw_glClearColor(cols[i][0], cols[i][1], cols[i][2], 1.0f);
+          g_raw_glClear(0x4000 /*GL_COLOR_BUFFER_BIT*/);
+          unsigned ok = r_eglSwapBuffers ? r_eglSwapBuffers(g_real_dpy, g_win_surf) : 0;
+          int ge = g_raw_glGetError ? g_raw_glGetError() : -1;
+          int ee = r_eglGetError ? r_eglGetError() : -1;
+          fprintf(stderr, "[egl] boot flash %d/3 swap=%u glerr=0x%x eglerr=0x%x\n",
+                  i + 1, ok, ge, ee);
+          struct timespec ts = { 0, 300000000 };
+          nanosleep(&ts, NULL);
+        }
+        r_eglMakeCurrent(g_real_dpy, NULL, NULL, NULL);
+      } else {
+        fprintf(stderr, "[egl] boot flash ctx failed fc=%p (present path suspect)\n", fc);
+      }
+      if (fc && r_eglDestroyContext) r_eglDestroyContext(g_real_dpy, fc);
+    }
+    /* NB: no share-root restore here -- capture now runs AFTER the SDL GL
+     * identity snapshot, and create_window finishes with an SDL unbind. */
   }
 }
 
@@ -772,12 +808,6 @@ void egl_shim_create_window(void) {
            (void *)egl_window, (void *)egl_share_root);
     printf("[egl] negotiated a%d d%d s%d ES%d (report d%d s%d)\n", g_alpha_size, g_depth_size, g_stencil_size, g_es_major, g_report_depth, g_report_stencil);
 
-    /* 0.68: capture SDL's real Mali EGL objects NOW (share root still current
-     * on this thread) and pick the real EGLConfig Unity's matcher will accept.
-     * Before this, our fabricated config token let qemu pass (NullGL answers)
-     * but the real driver rejected it -> minimum-spec abort on device. */
-    gds_capture_real_egl();
-
     /* KMSDRM settles the drawable a few frames after the context appears;
      * Horizon polls events and waits for the size to match (30 x 10ms)
      * before letting the game at the window. */
@@ -822,6 +852,14 @@ void egl_shim_create_window(void) {
     }
     g_gl_str_cached = 1;
   }
+
+  /* 0.68: capture SDL's real Mali EGL objects (share root still current on
+   * this thread) and pick the real EGLConfig Unity's matcher will accept.
+   * 0.71: moved AFTER the GL identity snapshot above -- the capture's raw
+   * context probe replaced the current binding and left the identity reads
+   * returning empty strings (SDL believed its share root was still bound). */
+  gds_capture_real_egl();
+
   printf("[egl] window %dx%d context ready (ES%d)\n", g_screen_w, g_screen_h, g_es_major);
 
   /* release from the bootstrap thread; the game binds when it makes current */
@@ -1110,6 +1148,19 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
    * surface (the actual KMSDRM front-buffer owner). */
   if (current_context && current_context->is_real && r_eglSwapBuffers) {
     if (!current_context->is_pbuffer && g_win_surf) {
+      /* 0.71: sample the center pixel of the back buffer about to be
+       * presented -- distinguishes "Unity renders but present is broken"
+       * from "Unity's frames are genuinely black". */
+      static int preswap_n = 0;
+      if (g_raw_glReadPixels && (preswap_n < 5 || (preswap_n % 300) == 0)) {
+        unsigned char px[4] = { 0, 0, 0, 0 };
+        int ge0 = g_raw_glGetError ? g_raw_glGetError() : -1;
+        g_raw_glReadPixels(320, 240, 1, 1, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, px);
+        int ge1 = g_raw_glGetError ? g_raw_glGetError() : -1;
+        printf("[egl] preswap pixel #%d rgba=%02x%02x%02x%02x glerr=%x/%x\n",
+               preswap_n, px[0], px[1], px[2], px[3], ge0, ge1);
+      }
+      preswap_n++;
       unsigned ok = r_eglSwapBuffers(g_real_dpy, g_win_surf);
       if (g_n_eglSwapBuffers <= 3)
         printf("[egl] SwapBuffers(real, raw) ok=%u\n", ok);
