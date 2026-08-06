@@ -247,6 +247,18 @@ static int (*g_raw_glGetError)(void);
 static void *g_real_egl_hdl = NULL;
 static int g_nullgl;   /* tentative; the NullGL section below owns the init */
 
+/* GDS_FLASH=1 enables the R/G/B (raw) + C/M/Y (SDL) boot-flash diagnostics. */
+static int gds_flash_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *e = getenv("GDS_FLASH");
+    cached = (e && atoi(e) > 0) ? 1 : 0;
+    if (cached)
+      fprintf(stderr, "[egl] GDS_FLASH=1: boot flash diagnostics enabled\n");
+  }
+  return cached;
+}
+
 static void gds_capture_real_egl(void) {
   if (g_nullgl) return;
   const char *drv = getenv("SDL_VIDEO_EGL_DRIVER");
@@ -403,6 +415,16 @@ static void gds_capture_real_egl(void) {
     else
       fprintf(stderr, "[egl] raw driver max: ES%d\n", g_best_es_major);
 
+    /* 0.73: boot flashes are now GDS_FLASH=1-only diagnostics.  0.72 device
+     * evidence: Phase A (raw eglSwapBuffers) displays NOTHING, Phase B
+     * (SDL_GL_SwapWindow) displays magenta+yellow -> raw swap never triggers
+     * the KMS page-flip on this SDL/GBM stack; the SDL route is the ONLY
+     * working present path and Unity's frames now use it (eglSwapBuffers
+     * below).  Worse, Phase B's SDL swaps invalidated SDL's own window
+     * surface afterwards: Unity's first raw eglMakeCurrent on the captured
+     * handle failed EGL_BAD_SURFACE and GL ran contextless -> SIGSEGV.
+     * Keep the pipeline pristine here; revisit flashes only via env. */
+    if (gds_flash_enabled()) {
     /* 0.71 PRESENT-PATH PROOF: Unity presents ok=1 yet the panel is black.
      * Before Unity starts, clear/swap the REAL window surface R/G/B with a
      * raw context.  Visible flashes => raw present reaches the panel and the
@@ -462,6 +484,7 @@ static void gds_capture_real_egl(void) {
       }
       S.GL_MakeCurrent(egl_window, NULL);
     }
+    } /* GDS_FLASH */
     /* NB: capture runs AFTER the SDL GL identity snapshot; create_window
      * finishes its own bookkeeping below (final state: nothing current). */
   }
@@ -1132,7 +1155,38 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
    * surfaces captured from SDL's EGL (Horizon surface identity). */
   if (context->is_real) {
     void *rsurf = ((char *)draw)[0] == 'w' ? g_win_surf : g_pbuf;
-    if (r_eglMakeCurrent(g_real_dpy, rsurf, rsurf, context->real_ctx)) {
+    unsigned ok = rsurf ? r_eglMakeCurrent(g_real_dpy, rsurf, rsurf,
+                                           context->real_ctx)
+                        : 0;
+    if (!ok && rsurf == g_win_surf && egl_window && S.GL_MakeCurrent &&
+        egl_share_root && r_eglGetCurrentSurface) {
+      /* 0.73: 0.72 died here -- SDL's own swap activity had invalidated the
+       * captured window surface (EGL_BAD_SURFACE) and we used to lie
+       * EGL_TRUE, so Unity ran GL with no context and null-deref'd inside
+       * libMali.  SDL KMSDRM recreates its EGL surface under some window
+       * transitions; if the driver no longer recognizes our handle, briefly
+       * bind SDL's share root, re-capture the CURRENT surface, retry. */
+      int err0 = r_eglGetError ? r_eglGetError() : 0;
+      printf("[egl] r_eglMakeCurrent FAILED err=0x%x draw=%p tid=%lx -- "
+             "refreshing window surface\n",
+             err0, (void *)draw, (unsigned long)pthread_self());
+      if (S.GL_MakeCurrent(egl_window, egl_share_root) == 0) {
+        void *fresh = r_eglGetCurrentSurface(0x3059 /*EGL_DRAW*/);
+        S.GL_MakeCurrent(egl_window, NULL);
+        if (fresh && fresh != g_win_surf) {
+          printf("[egl] g_win_surf refreshed %p -> %p\n", g_win_surf, fresh);
+          g_win_surf = fresh;
+          rsurf = fresh;
+          ok = r_eglMakeCurrent(g_real_dpy, rsurf, rsurf, context->real_ctx);
+        } else {
+          printf("[egl] surface refresh: driver still reports %p\n", fresh);
+        }
+      } else {
+        printf("[egl] surface refresh: SDL rebind failed: %s\n",
+               S.GetError ? S.GetError() : "?");
+      }
+    }
+    if (ok) {
       has_real_gl = 1;
       static int rvn = 0;
       const unsigned char *(*g)(unsigned) =
@@ -1148,6 +1202,8 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLC
       has_real_gl = 0;
       printf("[egl] r_eglMakeCurrent FAILED err=0x%x draw=%p tid=%lx\n",
              err, (void *)draw, (unsigned long)pthread_self());
+      if (g_n_eglMakeCurrent <= 4) egl_show_counts("MakeCurrent");
+      return EGL_FALSE;   /* honest failure: no blind contextless GL */
     }
     if (g_n_eglMakeCurrent <= 4) egl_show_counts("MakeCurrent");
     return EGL_TRUE;
@@ -1180,9 +1236,14 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
   (void)dpy; (void)surface;
   g_n_eglSwapBuffers++;
   static int swn = 0;
-  /* 0.70: real context presents through the REAL swap on SDL's window
-   * surface (the actual KMSDRM front-buffer owner). */
-  if (current_context && current_context->is_real && r_eglSwapBuffers) {
+  /* 0.73: real context presents through SDL's OWN present route.
+   * Device 0.72 proof: raw r_eglSwapBuffers returns ok=1 with real rendered
+   * pixels in the backbuffer yet NEVER reaches the panel (raw eglSwapBuffers
+   * on SDL's GBM/KMSDRM surface does not trigger the KMS page-flip), while
+   * SDL_GL_SwapWindow displays immediately (magenta/yellow boot flashes).
+   * Unity renders into g_win_surf through its raw context; SDL's swap
+   * presents that exact surface -- the only working path on this stack. */
+  if (current_context && current_context->is_real) {
     if (!current_context->is_pbuffer && g_win_surf) {
       /* 0.71: sample the center pixel of the back buffer about to be
        * presented -- distinguishes "Unity renders but present is broken"
@@ -1197,12 +1258,18 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                preswap_n, px[0], px[1], px[2], px[3], ge0, ge1);
       }
       preswap_n++;
-      unsigned ok = r_eglSwapBuffers(g_real_dpy, g_win_surf);
-      if (g_n_eglSwapBuffers <= 3)
-        printf("[egl] SwapBuffers(real, raw) ok=%u\n", ok);
-      else if (!ok && ++swn <= 8) {
-        int e = r_eglGetError ? r_eglGetError() : 0;
-        printf("[egl] raw swap err=0x%x\n", e);
+      if (egl_window && S.GL_SwapWindow) {
+        S.GL_SwapWindow(egl_window);
+        if (g_n_eglSwapBuffers <= 3)
+          printf("[egl] SwapBuffers(real, SDL window)\n");
+      } else if (r_eglSwapBuffers) {
+        unsigned ok = r_eglSwapBuffers(g_real_dpy, g_win_surf);
+        if (g_n_eglSwapBuffers <= 3)
+          printf("[egl] SwapBuffers(real, raw) ok=%u\n", ok);
+        else if (!ok && ++swn <= 8) {
+          int e = r_eglGetError ? r_eglGetError() : 0;
+          printf("[egl] raw swap err=0x%x\n", e);
+        }
       }
     }
     return EGL_TRUE;
