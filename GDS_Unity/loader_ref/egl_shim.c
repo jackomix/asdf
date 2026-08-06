@@ -113,6 +113,11 @@ static int sdl_load(void) {
 /* ---- state ---- */
 static int g_screen_w = 640, g_screen_h = 480;
 static int g_es_major = 2, g_alpha_size = 8, g_depth_size = 24, g_stencil_size = 8;
+/* REPORTED depth/stencil (eglGetConfigAttrib answers) stay at the unity
+ * minimum-spec floor even when the device only negotiated a shallower real
+ * window: Unity just records the framebuffer expectation, and qemu proves
+ * d24/s8 answers pass its minimum-spec test while real d0 does not. */
+static int g_report_depth = 24, g_report_stencil = 8;
 static SDL_Window *egl_window = NULL;
 static SDL_GLContext egl_share_root = NULL;
 static pthread_mutex_t egl_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -392,8 +397,11 @@ void egl_shim_create_window(void) {
   /* Version x format negotiation, proven on this exact device stack by the
    * Horizon Chase port: alpha is ALWAYS 8 (that Unity device enumeration does
    * an exact RGBA8888 compare); try ES 3 then ES 2 per window, and reject any
-   * context that doesn't report an "OpenGL ES" identity. */
-  static const int fmts[][2] = { {24,8}, {16,0}, {0,0} };
+   * context that doesn't report an "OpenGL ES" identity.
+   * Depth variants before the d0 fallback: the R36S KMSDRM accepted ONLY a
+   * d0 SDL window for us (device 0.66 log), so try depth-without-stencil
+   * permutations before giving up on real depth. */
+  static const int fmts[][2] = { {24,8}, {24,0}, {16,0}, {16,8}, {0,0} };
   int versions[2] = {3, 2};
   { const char *force = getenv("GDS_GLES_MAJOR");   /* HC_GLES_MAJOR analog */
     if (force && (force[0] == '2' || force[0] == '3')) {
@@ -462,6 +470,16 @@ void egl_shim_create_window(void) {
       } else {
         g_alpha_size = 8; g_depth_size = fmts[f][0]; g_stencil_size = fmts[f][1];
       }
+      /* Unity 2022's config minimum-spec test rejects depth-poor configs;
+       * a d0-negotiated window still renders a 2D game, so report the
+       * floor upward and log the gap loudly. */
+      g_report_depth = g_depth_size; g_report_stencil = g_stencil_size;
+      if (g_report_depth < 16) {
+        printf("[egl] real window is d%d/s%d -- REPORTING d24 to Unity (minimum-spec floor)\n",
+               g_depth_size, g_stencil_size);
+        g_report_depth = 24;
+      }
+      if (g_report_stencil < 8) g_report_stencil = 8;
     }
     if (!egl_share_root && egl_window) { S.DestroyWindow(egl_window); egl_window = NULL; }
   }
@@ -472,7 +490,7 @@ void egl_shim_create_window(void) {
     }
     printf("[egl] window=%p context=%p (SDL_CreateWindow may have logged a surface warning)\n",
            (void *)egl_window, (void *)egl_share_root);
-    printf("[egl] negotiated a%d d%d s%d ES%d\n", g_alpha_size, g_depth_size, g_stencil_size, g_es_major);
+    printf("[egl] negotiated a%d d%d s%d ES%d (report d%d s%d)\n", g_alpha_size, g_depth_size, g_stencil_size, g_es_major, g_report_depth, g_report_stencil);
 
     /* KMSDRM settles the drawable a few frames after the context appears;
      * Horizon polls events and waits for the size to match (30 x 10ms)
@@ -717,8 +735,8 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute
   case 0x3022: *value = 8; break;                   /* EGL_BLUE_SIZE */
   case 0x3023: *value = 8; break;                   /* EGL_GREEN_SIZE */
   case 0x3024: *value = 8; break;                   /* EGL_RED_SIZE */
-  case 0x3025: *value = g_depth_size; break;
-  case 0x3026: *value = g_stencil_size; break;
+  case 0x3025: *value = g_report_depth; break;
+  case 0x3026: *value = g_report_stencil; break;
   case 0x3027: *value = 0x3038; break;              /* EGL_CONFIG_CAVEAT = EGL_NONE */
   case 0x3028: *value = 1; break;                   /* EGL_CONFIG_ID */
   case 0x3033: *value = 0x0005; break;              /* EGL_SURFACE_TYPE = WINDOW|PBUFFER */
