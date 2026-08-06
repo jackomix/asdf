@@ -22,6 +22,83 @@ Two approaches were started:
 The web target was explicitly **deprioritised**: a browser would need a WASM ARM
 emulator (the slow, hard half) and does not reuse the native win.
 
+## SESSION DELTA (builds 0.65.0-ref / 0.66.0-ref) — READ THIS FIRST
+
+**Everything below this section about "the frame-3 dialog / keep=0 kill chain"
+is HISTORICAL (fixed + root-caused).** Current state:
+
+- qemu musl run: 200 frames, `keep=1` throughout, save records `0000`-`0005`
+  created and `0000` rewritten with a real 2324-byte blob, zero error dialogs,
+  clean EXIT=0.
+- Frame-3 "An error has occurred." kill chain — TWO root causes, both
+  probe-proven (brk#0 SIGTRAP probes inside libil2cpp on qemu, trampolined
+  step-overs so the game keeps executing past each probe):
+  1. `kairo.unity.io.Storage::GetFolder` (0x186cf58), folder ∈ {1,4}, Android
+     branch: takes the files-dir path `IApplication.statics[0]->+0xf0` and cuts
+     the package name out of it with
+     `LastIndexOf("data/")+5 .. LastIndexOf("/files")`, then `Substring(start,len)`
+     at 0x186d0ec.  Our `Context.getFilesDir()/getExternalFilesDir()` answered
+     the bare `<gamedir>/home` → both indices −1 → `Substring(4,−5)` →
+     `ArgumentOutOfRangeException` → `Storage::Open(4,1,0,0)` never returned →
+     `RecordStore::Setup` (0x186a868) never executed its
+     `X.statics[0x18] = Storage::Open(...)` store at 0x186a8e4 →
+     `RecordStore.path == null` → `GetNumRecords` (0x186a5ac) NRE at its
+     shared raise block 0x186a7b4 → caught by `main.Main::OnUpdate` path-B
+     (0xe81260) → dialog → RemoveAllForms + TerminateCheck → keep=0 @frame6.
+     FIX (jni.c): files dirs now answer the Android-shaped
+     `<gds_home>/Android/data/net.kairosoft.android.gamedev3en/files`
+     (pre-created, since their `File.mkdirs()` is a single mkdir).  GetFolder
+     then yields `data/data/net.kairosoft.android.gamedev3en/{rs,files}`.
+  2. The whole `kairo.android.plugin.Utility` preference family was unbound:
+     `Utility.getPreferenceKeys()` answered NULL → the managed reader
+     (StringUtil.Unescape maps ""→null) → `KairoPlugin.GetPreferenceKeys(null)`
+     NRE at 0x17fc300 → `main.AppData::LoadSystem` rethrow at 0xe78210 → same
+     dialog.  This family IS the game's save store (`RecordStore` keeps every
+     save slot as a preference entry).  FIX (jni.c): implemented 1:1 with
+     classes.dex, semantics cross-checked against the kairovm reference model
+     (`kairovm/androidjni.py`): `put/setPreference(String,byte[])`,
+     `getPreference` (byte[]/null), `existPreference`, `removePreference`,
+     `getPreferenceKeys()` = `join(',', StringUtil.escape(key))` where
+     escape = `"` + key with `\` before [,&@\\] + `"`, keys sorted, never null;
+     `set/getNotificationFilter` and `set/getNotificationBackground` REALLY
+     write/read `_plugin_*` prefs (their boot-time writes are why the store is
+     never empty on a device — an empty keys string NREs inside the engine by
+     design).  The HGOPREF1 store gained `PREF_BYTES` + removal (load/save
+     compatible with old files).
+- GL (0.66): adopted Horizon Chase's KMSDRM EGL model verbatim (their shipped
+  R36S port).  The decisive diff vs <=0.64: `ctx_is_gles()` is merely
+  `strstr(GL_VERSION, "OpenGL ES")` — it ACCEPTS the `OpenGL ES-CM 1.1`
+  string the R36S Mali returns for the SDL share-root.  The share root is only
+  SDL's bond; the game renders through its own SDL-created worker contexts
+  (SDL_GL_CreateContext + SHARE_WITH_CURRENT_CONTEXT=1, SDL_GL_MakeCurrent /
+  SDL_GL_SwapWindow for everything — same as our structure already).
+  Also adopted: drawable-settle loop (30×10ms PollEvent+GetDrawableSize),
+  full RGBA8888 attr reset per context create, RENDERABLE_TYPE answers the
+  negotiated ES level, `GDS_GLES_MAJOR=2/3` override (their HC_GLES_MAJOR).
+  New diagnostic: first 4 worker-context binds print their real GL_VERSION —
+  the next device log proves what Unity's own contexts get.
+- UNVERIFIED on device at push time: whether worker contexts come back real
+  ES2/ES3 (pixels) or also ES-CM 1.1 (would need the SDL/LEGACY client_version
+  analysis below).
+- STILL OPEN (next, in order):
+  1. Real GLES pixels on device (see worker GL_VERSION diagnostic).
+  2. If workers are also ES-CM 1.1: SDL2's KMSDRM EGL fallback passes
+     client_version=1 when KHR_create_context handling fails — then look at
+     forcing MAJOR=2 only (GDS_GLES_MAJOR=2) or owning EGL like Horizon's
+     mali/fbdev raw path.
+  3. Input: `getSystemService("input") -> null` ×3 on device; wire
+     InputManager/devices like the reference ports' input.c.
+  4. `KairoService::OnStart` (0xdb1b74) chain gaps (billing/friend/lineup JNI)
+     expected once the main loop runs free.
+- Probe engine notes (main.c arm_traps TABLE, MAX_PROBES=192): kind 13 =
+  `__cxa_throw` (0xd952b0) window-armed by kind 16/22; kind 19 = raise-stub
+  (0xcb0ddc=AORE, 0xcb0de4=NRE) printing x30=callsite; kinds 24–29 = the
+  Storage/Open/GetFolder instrument cluster.  Stubs: 0xcb0bbc=class-init(force
+  cctor), 0xcb0cc0=class-init-if-needed, 0xcb0dd4=object-new; klass+0xe0=init
+  flag, klass+0xb8=static_fields; GOT slot→rec→rec[0]=resolved (klass/literal).
+- The older "null UI-runner" theory and the "AppData statics bootstrap"
+  hypotheses in the sections below are DEAD — do not revive them.
+
 ## THE TWO REFERENCE PORTS — READ BEFORE ANY DEEP WORK
 
 Both are by the SAME author (NextOs-Ports), run Unity IL2CPP games on THIS R36S,
