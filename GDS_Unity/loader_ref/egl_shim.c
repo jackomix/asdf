@@ -989,6 +989,8 @@ const char *gds_gl_string_for_jni(unsigned name) {
   return (const char *)nullgl_GetString(name);
 }
 
+static void splash_early_show(void);
+
 /* ---- window + share-root context creation (must run on the main thread) ---- */
 void egl_shim_create_window(void) {
   if (g_did_init) return;
@@ -1181,6 +1183,12 @@ void egl_shim_create_window(void) {
     }
     g_gl_str_cached = 1;
   }
+
+  /* 0.95.5: hand the boot-black gap to the harvested Kairosoft splash NOW.
+   * The next several seconds (module load, JNI, Unity boot) keep it on the
+   * panel; the first real Unity swap replaces it with the game's own
+   * loading screen -- Android's splash -> loading -> title order. */
+  splash_early_show();
 
   /* 0.68: capture SDL's real Mali EGL objects (share root still current on
    * this thread) and pick the real EGLConfig Unity's matcher will accept.
@@ -1728,12 +1736,15 @@ static void draw_cursor_overlay(void) {
   }
 }
 
-/* ---- boot splash (0.95.4, user wish) -------------------------------------
+/* ---- boot splash (0.95.4, user wish; 0.95.5 moved it EARLIER) -------------
  * The REAL Kairosoft boot splash, harvested from the APK at package time
  * (tools/harvest_splash.py: res/iF.png 1024x2048 portrait -> navy fill +
- * centered wordmark band -> gamedir/splash.bmp 640x480 24-bit).  This is a
- * PRESENT-GATE: at swap time we draw it over Unity's backbuffer for the
- * first GDS_SPLASH_MS (default 2200, 0=off) after the first real present.
+ * centered wordmark band -> gamedir/splash.bmp 640x480 24-bit).
+ * 0.95.5: shown across the boot gap by splash_early_show() below; this
+ * PRESENT-GATE is only the FALLBACK for devices where the early draw can't
+ * run.  Gate semantics (when it does fire): draw over Unity's backbuffer
+ * for the first GDS_SPLASH_MS (default 2200, 0=off) after the first real
+ * present.
  * The boot path is never touched and nothing is timed out on -- 0.93.0's
  * SDL-software-surface blit forced the window down a nil-display path and
  * earned a same-day hotfix; that class of risk is designed out here.
@@ -1770,6 +1781,46 @@ static long spl_mono_ms(void) {
 }
 
 /* 24-bit uncompressed BMP -> RGB rows bottom-first (GL upload order). */
+/* ---- early boot splash (0.95.5, user wish) --------------------------------
+ * 0.95.4's present-gate could only start once Unity had its first frame
+ * ready, so it sat ON TOP of the game's own loading screen (user: "the
+ * Kairosoft logo just covers up that loading screen ... I don't want to
+ * replace the loading screen") while the black launch gap in front of it
+ * stayed black.  On Android the order is splash -> loading -> title, and
+ * the splash's whole job is that gap.  The gap exists HERE: window + share
+ * root come up long before libil2cpp/Unity finish booting.  So draw the
+ * harvested splash on the share root and present it through the only
+ * proven-visible route on this stack (SDL_GL_SwapWindow; raw eglSwapBuffers
+ * never reaches the panel -- 0.72).  The frame sits on the KMSDRM panel
+ * through module load + Unity boot until the first real swap replaces it,
+ * and the present-gate below is suppressed so the loading screen stays
+ * 100% the game's own.  If anything here is unavailable the gate falls
+ * back to 0.95.4 behaviour (late overlay), so the splash never just dies.
+ *
+ * Fixed-function on purpose: the SDL share root on this device really IS
+ * an "OpenGL ES-CM 1.1" context (our own identity print says so), where
+ * the shader path cannot run; an ES1 textured quad is definitionally
+ * supported.  NPOT: direct upload when GL_OES_texture_npot, else a POT
+ * canvas + glTexSubImage2D with adjusted UVs (other Kairosoft splashes may
+ * have other sizes -- the harvester + this path are size-agnostic). */
+
+#define SPL1_GL_TEXTURE_2D          0x0DE1u
+#define SPL1_GL_RGB                 0x1907u
+#define SPL1_GL_UNSIGNED_BYTE       0x1401u
+#define SPL1_GL_FLOAT               0x1406u
+#define SPL1_GL_TRIANGLES           0x0004u
+#define SPL1_GL_TEXTURE_MIN_FILTER  0x2801u
+#define SPL1_GL_TEXTURE_MAG_FILTER  0x2800u
+#define SPL1_GL_TEXTURE_WRAP_S      0x2802u
+#define SPL1_GL_TEXTURE_WRAP_T      0x2803u
+#define SPL1_GL_LINEAR              0x2601u
+#define SPL1_GL_CLAMP_TO_EDGE       0x812Fu
+#define SPL1_GL_VERTEX_ARRAY        0x8074u
+#define SPL1_GL_TEXTURE_COORD_ARRAY 0x8078u
+#define SPL1_GL_EXTENSIONS          0x1F03u
+
+static int g_splash_early_ok = 0;   /* set: present-gate stays silent */
+
 static int splash_bmp_load(const char *path, int *ow, int *oh,
                            unsigned char **orp) {
   FILE *f = fopen(path, "rb");
@@ -1806,6 +1857,123 @@ static int splash_bmp_load(const char *path, int *ow, int *oh,
   free(raw);
   *ow = iw; *oh = ih; *orp = px;
   return 1;
+}
+
+static void splash_early_show(void) {
+  static int tried = 0;
+  if (tried) return;
+  tried = 1;
+  const char *e = getenv("GDS_SPLASH_MS");
+  long ms = e ? atol(e) : 2200;     /* 0 disables the splash entirely */
+  if (ms == 0 || !egl_window || !egl_share_root || !S.GL_SwapWindow) return;
+  char path[1200];
+  snprintf(path, sizeof path, "%s/splash.bmp", gds_gamedir);
+  int iw = 0, ih = 0;
+  unsigned char *rgb = NULL;
+  if (!splash_bmp_load(path, &iw, &ih, &rgb)) return;   /* gate reports it */
+  const char *gld = getenv("SDL_VIDEO_GL_DRIVER");
+  const char *names[] = { (gld && *gld) ? gld : "libGLESv1_CM.so",
+                          "libGLESv1_CM.so", "libGLESv1_CM.so.1", 0 };
+  void *h = NULL;
+  for (int i = 0; names[i] && !h; i++) {
+    h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+  }
+  if (!h) {
+    free(rgb);
+    printf("[egl] splash: no libGLESv1_CM -- leaving it to the late gate\n");
+    return;
+  }
+  void (*glEnableV)(unsigned) = (void *)dlsym(h, "glEnable");
+  void (*glDisableV)(unsigned) = (void *)dlsym(h, "glDisable");
+  void (*glEnableClientStateV)(unsigned) = (void *)dlsym(h, "glEnableClientState");
+  void (*glDisableClientStateV)(unsigned) = (void *)dlsym(h, "glDisableClientState");
+  void (*glVertexPointerV)(int, unsigned, int, const void *) =
+      (void *)dlsym(h, "glVertexPointer");
+  void (*glTexCoordPointerV)(int, unsigned, int, const void *) =
+      (void *)dlsym(h, "glTexCoordPointer");
+  void (*glDrawArraysV)(unsigned, int, int) = (void *)dlsym(h, "glDrawArrays");
+  void (*glViewportV)(int, int, int, int) = (void *)dlsym(h, "glViewport");
+  const unsigned char *(*glGetStringV)(unsigned) = (void *)dlsym(h, "glGetString");
+  void (*glGenTexturesV)(int, unsigned *) = (void *)dlsym(h, "glGenTextures");
+  void (*glBindTextureV)(unsigned, unsigned) = (void *)dlsym(h, "glBindTexture");
+  void (*glTexImage2DV)(unsigned, int, int, int, int, int,
+                        unsigned, unsigned, const void *) =
+      (void *)dlsym(h, "glTexImage2D");
+  void (*glTexSubImage2DV)(unsigned, int, int, int, int, int, unsigned,
+                           unsigned, const void *) =
+      (void *)dlsym(h, "glTexSubImage2D");
+  void (*glTexParameteriV)(unsigned, unsigned, int) =
+      (void *)dlsym(h, "glTexParameteri");
+  if (!glEnableV || !glDisableV || !glEnableClientStateV ||
+      !glDisableClientStateV || !glVertexPointerV || !glTexCoordPointerV ||
+      !glDrawArraysV || !glViewportV || !glGenTexturesV || !glBindTextureV ||
+      !glTexImage2DV || !glTexParameteriV) {
+    free(rgb);
+    printf("[egl] splash: ES1 entry points missing -- leaving it to the late gate\n");
+    return;
+  }
+  if (S.GL_MakeCurrent)
+    S.GL_MakeCurrent(egl_window, egl_share_root);   /* usually already current */
+  int npot = 0;
+  if (glGetStringV) {
+    const unsigned char *x = glGetStringV(SPL1_GL_EXTENSIONS);
+    if (x && strstr((const char *)x, "GL_OES_texture_npot")) npot = 1;
+  }
+  unsigned tex = 0;
+  float um = 1.0f, vm = 1.0f;    /* uv far edge (<1 only on the POT canvas) */
+  glGenTexturesV(1, &tex);
+  glBindTextureV(SPL1_GL_TEXTURE_2D, tex);
+  if (npot) {
+    glTexImage2DV(SPL1_GL_TEXTURE_2D, 0, (int)SPL1_GL_RGB, iw, ih, 0,
+                  SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, rgb);
+  } else if (glTexSubImage2DV) {
+    int pw = 1, ph = 1;
+    while (pw < iw) pw <<= 1;
+    while (ph < ih) ph <<= 1;
+    glTexImage2DV(SPL1_GL_TEXTURE_2D, 0, (int)SPL1_GL_RGB, pw, ph, 0,
+                  SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, NULL);
+    glTexSubImage2DV(SPL1_GL_TEXTURE_2D, 0, 0, 0, iw, ih,
+                     SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, rgb);
+    um = (float)iw / (float)pw;
+    vm = (float)ih / (float)ph;
+  } else {
+    free(rgb);
+    printf("[egl] splash: NPOT unsupported, no glTexSubImage2D -- late gate\n");
+    return;
+  }
+  free(rgb);
+  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_MIN_FILTER,
+                   (int)SPL1_GL_LINEAR);
+  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_MAG_FILTER,
+                   (int)SPL1_GL_LINEAR);
+  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_WRAP_S,
+                   (int)SPL1_GL_CLAMP_TO_EDGE);
+  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_WRAP_T,
+                   (int)SPL1_GL_CLAMP_TO_EDGE);
+  /* identity matrices are the ES1 reset state: a +/-1 quad IS fullscreen */
+  glViewportV(0, 0, g_screen_w > 0 ? g_screen_w : 640,
+              g_screen_h > 0 ? g_screen_h : 480);
+  glEnableV(SPL1_GL_TEXTURE_2D);
+  glEnableClientStateV(SPL1_GL_VERTEX_ARRAY);
+  glEnableClientStateV(SPL1_GL_TEXTURE_COORD_ARRAY);
+  float verts[12] = { -1.f,-1.f,  1.f,-1.f,  1.f,1.f,
+                      -1.f,-1.f,  1.f,1.f,  -1.f,1.f };
+  float uvs[12]   = { 0.f,0.f,    um,0.f,    um,vm,
+                      0.f,0.f,    um,vm,     0.f,vm };
+  glVertexPointerV(2, SPL1_GL_FLOAT, 0, verts);
+  glTexCoordPointerV(2, SPL1_GL_FLOAT, 0, uvs);
+  glDrawArraysV(SPL1_GL_TRIANGLES, 0, 6);
+  glDisableClientStateV(SPL1_GL_TEXTURE_COORD_ARRAY);
+  glDisableClientStateV(SPL1_GL_VERTEX_ARRAY);
+  glDisableV(SPL1_GL_TEXTURE_2D);
+  glBindTextureV(SPL1_GL_TEXTURE_2D, 0);
+  S.GL_SwapWindow(egl_window);
+  /* texture object intentionally left alive: the share root never renders
+   * anything else, and deleting under a queued flip is an avoidable risk. */
+  g_splash_early_ok = 1;
+  printf("[egl] splash: showing APK-harvested KAIROSOFT across the boot gap "
+         "(%s tex, until first Unity frame)\n", npot ? "npot" : "pot-canvas");
 }
 
 static int splash_gl_load(void) {
@@ -1940,6 +2108,9 @@ static void splash_draw(void) {
 }
 
 static void splash_present_gate(void) {
+  /* 0.95.5: when the early splash already ran across the boot gap, NEVER
+   * overlay -- the loading screen belongs to the game (user wish). */
+  if (g_splash_early_ok) return;
   static long t0 = -1, ms = -1;
   static int armed = 0;
   if (ms == -1) {

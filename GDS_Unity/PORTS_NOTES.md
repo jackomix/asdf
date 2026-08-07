@@ -4,6 +4,42 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.5-earlysplash (splash in the boot gap; real chord hold; music crackle SOLVED)
+Device-verified 0.95.5 must still confirm on hardware; the three items and
+their mechanisms:
+
+- **Music "tiny clicks/pops like distortion" — SOLVED BY MECHANISM + SIM:**
+  the SDL mixer callback resampled 24k→44.1k with a FRESH phase every 46.4ms
+  chunk (`pos=0`) and discarded the tail source frames it had pulled.
+  Simulation on the user's own `echo_prod.pcm` device capture: **exactly 2
+  source frames (83µs of music) skipped every callback = a discontinuity at
+  21.6Hz**, 4× larger than the music's own sample movement (boundary jump
+  p95 2547 vs inner p95 668; new code: boundary p95 1009 ≈ inner). Volume-
+  independent, echo-unrelated — exactly the reported symptom. Fix: per-player
+  continuous-phase resampler (`rs_frac` 16.16 phase + 2-frame `rs_carry`
+  across callbacks, rounded step; resync on underrun/track-change where the
+  fade already masks the seam). One-time log: `[audio] resample 24000->44100
+  continuous-phase`.
+- **Splash moved INTO the boot gap (Android order):** 0.95.4's present-gate
+  could only start at Unity's first frame, so it covered ~2s of the game's
+  OWN loading screen ("I don't want to replace the loading screen") while
+  the A-press→loading black gap stayed black. 0.95.5 draws the harvested
+  BMP right after window/GL identity setup in `egl_shim_create_window`,
+  presenting via the proven route (`SDL_GL_SwapWindow`; raw swap never
+  reaches the panel) and leaves the frame on the KMSDRM panel through
+  module-load/Unity-boot until the first real swap replaces it; the
+  present-gate is suppressed afterwards (fallback only if early fails).
+  Fixed-function ES1 draw because the SDL share root really is an
+  "OpenGL ES-CM 1.1" context (identity print proves it; shaders can't run
+  there); NPOT checked, POT-canvas + glTexSubImage2D fallback, size-agnostic
+  for other Kairosoft splashes.
+- **Quit chord is now a REAL hold:** 0.95.4 requested graceful exit at the
+  2nd poll (~100ms; only the _exit fallback waited 2s) → user: "quits as
+  soon as I hold them". Now nothing happens until SELECT+START are held
+  continuously for `GDS_QUITCHORD_MS` (default 2000; both the evdev watcher
+  and the SDL-side fallback); early release resets and logs one line;
+  holding 4s MORE after the graceful request still `_exit(0)`s a wedged loop.
+
 ## 0.95.4-splash (real APK splash; quit-chord named; adaptive audio cap)
 User-verified on 0.95.3: **echo gone, OSK trailing blank gone, naming
 round-trips clean** (DONE "Sunny Studios" / wire "Sunny Studios").

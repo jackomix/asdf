@@ -269,6 +269,11 @@ static void keylog_start(void) {
     static int started = 0;
     if (started) return;
     started = 1;
+    /* 0.95.5: opt-in (GDS_KEYLOG=1).  It served its purpose on the R36S --
+     * SELECT/START are provably 0x2c0/0x2c1 and baked into g_known_pads --
+     * and it flooded the user's log with an [input] evkey line per press. */
+    const char *e = getenv("GDS_KEYLOG");
+    if (!e || atoi(e) == 0) return;
     pthread_t pt;
     if (pthread_create(&pt, NULL, keylog_thread, NULL) == 0)
         pthread_detach(pt);
@@ -441,30 +446,39 @@ static void *pad_watch_thread(void *arg) {
             if (chord_frames == 0)
                 chord_down_ms = watch_mono_ms();
             chord_frames++;
-            if (chord_frames >= 2 && !g_exit_requested) {
-                g_exit_requested = 1;
-                fprintf(stderr,
-                        "[input] SELECT+START chord -> graceful exit requested "
-                        "(hold to force-quit)\n");
+            /* 0.95.5: the user asked for a REAL hold -- 0.95.4 requested the
+             * graceful exit at the second poll (~100ms) and only the hard
+             * _exit waited 2s, so the game quit "as soon as I hold them".
+             * Now NOTHING happens until the chord has been held continuously
+             * for GDS_QUITCHORD_MS (default 2000); releasing early resets the
+             * timer.  After the graceful request, keeping the chord held 4s
+             * more _exit()s a still-wedged loop (crash escape hatch). */
+            static long hold_ms = -1;
+            if (hold_ms < 0) {
+                const char *v = getenv("GDS_QUITCHORD_MS");
+                hold_ms = v ? atol(v) : 2000;
             }
             long held = watch_mono_ms() - chord_down_ms;
-            /* 2s: long enough that a HEALTHY game exits via the graceful
-             * path first (flag -> loop break -> Unity pause/destroy, which
-             * includes the managed save flush); short enough that a wedged
-             * frame doesn't trap the user.  GDS_QUITCHORD_MS overrides. */
-            static long hard_ms = -1;
-            if (hard_ms < 0) {
-                const char *v = getenv("GDS_QUITCHORD_MS");
-                hard_ms = v ? atol(v) : 2000;
-            }
-            if (held >= hard_ms) {
+            if (held >= hold_ms && !g_exit_requested) {
+                g_exit_requested = 1;
                 fprintf(stderr,
-                        "[input] chord held %ldms -- force-quitting NOW (_exit)\n",
+                        "[input] SELECT+START held %ldms -> graceful exit "
+                        "requested (keep holding 4s to force-quit)\n", held);
+            }
+            if (g_exit_requested && held >= hold_ms + 4000) {
+                fprintf(stderr,
+                        "[input] chord held %ldms total -- force-quitting NOW (_exit)\n",
                         held);
                 fflush(stderr);
                 _exit(0);
             }
         } else {
+            if (chord_frames > 0 && !g_exit_requested) {
+                long held = watch_mono_ms() - chord_down_ms;
+                if (held >= 300)
+                    fprintf(stderr, "[input] chord released after ~%ldms -- "
+                                    "no quit (needs a full hold)\n", held);
+            }
             chord_frames = 0;
             chord_down_ms = 0;
         }
@@ -691,10 +705,26 @@ static void pad_poll(void) {
     }
     (void)g_npb_names;
 
-    /* exit chord: SELECT+START (native_pad.c Bully/Sonic pattern) */
+    /* exit chord: SELECT+START (native_pad.c Bully/Sonic pattern).
+     * 0.95.5: same real-hold rule as the evdev watcher -- the chord must be
+     * held continuously for GDS_QUITCHORD_MS (default 2000) before anything
+     * happens; releasing early resets the timer. */
+    static long npb_chord_ms = 0;
     if (!g_exit_requested && g_npb[NPB_BACK] && g_npb[NPB_START]) {
-        g_exit_requested = 1;
-        fprintf(stderr, "[input] SELECT+START -> exit\n");
+        if (!npb_chord_ms)
+            npb_chord_ms = watch_mono_ms();
+        static long hold_ms = -1;
+        if (hold_ms < 0) {
+            const char *v = getenv("GDS_QUITCHORD_MS");
+            hold_ms = v ? atol(v) : 2000;
+        }
+        long held = watch_mono_ms() - npb_chord_ms;
+        if (held >= hold_ms) {
+            g_exit_requested = 1;
+            fprintf(stderr, "[input] SELECT+START held %ldms -> exit\n", held);
+        }
+    } else {
+        npb_chord_ms = 0;
     }
 }
 

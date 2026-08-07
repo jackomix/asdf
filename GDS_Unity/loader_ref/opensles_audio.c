@@ -194,6 +194,19 @@ typedef struct {
     uint32_t preroll_bytes;
     uint32_t preroll_ticks;
 
+    /* 0.95.5 continuous-phase resampler state: the SDL callback used to
+     * restart its resample phase every 46.4ms chunk (pos=0) and DISCARD the
+     * 2 unconsumed tail source frames it had already pulled -- simulation on
+     * the user's own echo_prod.pcm capture: exactly 2 frames (83us of music)
+     * skipped every callback = a discontinuity at 21.6Hz whose jumps are ~4x
+     * the music's own sample movement -> the "tiny clicks/pops like
+     * distortion" heard at ANY volume.  Now the 16.16 sub-frame position and
+     * the 2 frames straddling each callback boundary carry across callbacks
+     * so the source stream is walked exactly (AudioFlinger behaviour). */
+    uint32_t rs_frac;          /* 16.16 sub-frame position at rs_carry[0] */
+    int16_t  rs_carry[4];      /* up to 2 source frames (stereo = 4 s16)   */
+    uint32_t rs_ncarry;        /* valid source frames in rs_carry (0..2)   */
+
     volatile SLuint32 play_state;
     float volume;
     int active;
@@ -281,6 +294,8 @@ static void queue_reset(AudioPlayer *p) {
     p->queued_count = 0;
     p->queued_front_offset = 0;
     p->played_bytes = 0;
+    p->rs_frac = 0;
+    p->rs_ncarry = 0;
 }
 
 static void queue_push(AudioPlayer *p, uint32_t size) {
@@ -397,24 +412,49 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
         if (!(vol >= 0.0f && vol <= 2.0f)) vol = 0.0f;   /* corrupt: mute */
         vol *= (src_channels == 1) ? 0.35f : 0.8f;
 
-        uint32_t src_frames_needed = (src_rate == SDL_OUTPUT_RATE)
-            ? out_frames
-            : (uint32_t)((uint64_t)out_frames * src_rate / SDL_OUTPUT_RATE) + 2;
-        uint32_t src_bytes = src_frames_needed * frame_size;
-        if (src_bytes > sizeof tmp) src_bytes = sizeof tmp;
-        src_bytes = (src_bytes / frame_size) * frame_size;
-
-        uint32_t got = ring_read(p, tmp, src_bytes);
-        got = (got / frame_size) * frame_size;
-        uint32_t src_frames = got / frame_size;
-        if (got && p == g_fmod_player)
-            echo_capture(g_echo_play, &g_echo_play_n, tmp, got);
+        /* 0.95.5 continuous-phase consumption (see AudioPlayer comment):
+         * walk the source stream EXACTLY across callbacks instead of
+         * restarting the phase each 46.4ms chunk.  The 2 frames straddling
+         * the callback boundary live in rs_carry; rs_frac is the 16.16
+         * sub-frame position there.  adv = source frames this callback
+         * fully consumes. */
+        int direct = (src_rate == SDL_OUTPUT_RATE && src_channels == 2);
+        uint32_t step = 0;             /* 16.16 src frames per out frame */
+        uint32_t adv = 0;              /* src frames this callback consumes */
+        uint32_t got = 0;              /* fresh bytes pulled from the ring */
+        uint32_t src_frames = 0;       /* frames now in the window (tmp) */
+        uint32_t src_bytes;            /* bytes we intend to pull */
+        if (direct) {
+            src_bytes = out_frames * frame_size;
+            if (src_bytes > sizeof tmp) src_bytes = sizeof tmp;
+            got = ring_read(p, tmp, src_bytes);
+            got = (got / frame_size) * frame_size;
+            src_frames = got / frame_size;
+            if (got && p == g_fmod_player)
+                echo_capture(g_echo_play, &g_echo_play_n, tmp, got);
+        } else {
+            step = (uint32_t)(((uint64_t)src_rate * 65536 + SDL_OUTPUT_RATE / 2)
+                              / SDL_OUTPUT_RATE);    /* rounded, not floored */
+            memcpy(tmp, p->rs_carry, p->rs_ncarry * frame_size);
+            adv = (uint32_t)(((uint64_t)out_frames * step + p->rs_frac) >> 16);
+            uint32_t want = adv + 2;               /* lerp needs idx adv+1 */
+            uint32_t fresh_need = want > p->rs_ncarry ? want - p->rs_ncarry : 0;
+            src_bytes = fresh_need * frame_size;
+            uint32_t room = (uint32_t)sizeof tmp - p->rs_ncarry * frame_size;
+            if (src_bytes > room) src_bytes = room;
+            got = ring_read(p, tmp + p->rs_ncarry * src_channels, src_bytes);
+            got = (got / frame_size) * frame_size;
+            src_frames = p->rs_ncarry + got / frame_size;
+            if (got && p == g_fmod_player)
+                echo_capture(g_echo_play, &g_echo_play_n,
+                             tmp + p->rs_ncarry * src_channels, got);
+        }
         if (!src_frames) continue;
         queue_consume(p, got);
         p->played_bytes += got;
 
         /* underrun: fade the tail so the hole doesn't click */
-        int underrun = (got < src_bytes);
+        int underrun = (got < src_bytes) || (!direct && src_frames < adv + 2);
         uint32_t fade_len = 64, fade_start = 0;
         if (underrun) {
             if (src_frames > fade_len) fade_start = src_frames - fade_len;
@@ -424,7 +464,7 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
         uint32_t fadein_left = (p->frames_played < 32)
                                ? (32 - p->frames_played) : 0;
 
-        if (src_rate == SDL_OUTPUT_RATE && src_channels == 2) {
+        if (direct) {
             uint32_t n = src_frames > out_frames ? out_frames : src_frames;
             for (uint32_t f = 0; f < n; f++) {
                 float env = 1.0f;
@@ -441,8 +481,15 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
             }
             p->frames_played += n;
         } else {
-            uint32_t step = (uint32_t)((uint64_t)src_rate * 65536 / SDL_OUTPUT_RATE);
-            uint32_t pos = 0;
+            static int rs_logged = 0;
+            if (!rs_logged && p == g_fmod_player) {
+                rs_logged = 1;
+                fprintf(stderr, "[audio] resample %u->%u continuous-phase"
+                                " (16.16 carry, step=%u)\n",
+                        (unsigned)src_rate, (unsigned)SDL_OUTPUT_RATE,
+                        (unsigned)step);
+            }
+            uint32_t pos = p->rs_frac;
             uint32_t fade_start_out = underrun
                 ? (uint32_t)((uint64_t)fade_start * SDL_OUTPUT_RATE / src_rate)
                 : out_frames + 1;
@@ -485,6 +532,25 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
                 mixed++;
             }
             p->frames_played += mixed;
+            if (underrun) {
+                /* hole (starve / track change): the fade masks the seam, so
+                 * resync the walker -- stale carry must not smear the next
+                 * fill. */
+                p->rs_frac = 0;
+                p->rs_ncarry = 0;
+            } else {
+                /* carry the 2 frames straddling the next callback's start:
+                 * its first lerped samples are exactly these. */
+                uint32_t nf = 0;
+                for (uint32_t cf = adv; cf < adv + 2 && cf < src_frames; cf++) {
+                    memcpy(p->rs_carry + nf * src_channels,
+                           tmp + cf * src_channels, frame_size);
+                    nf++;
+                }
+                p->rs_ncarry = nf;
+                p->rs_frac = (p->rs_frac +
+                    (uint32_t)((uint64_t)out_frames * step)) & 0xFFFFu;
+            }
         }
     }
 
