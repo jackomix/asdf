@@ -29,6 +29,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <time.h>
+#include <dirent.h>
 #include <pthread.h>
 
 typedef uint32_t SLresult;
@@ -220,6 +221,8 @@ static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_audio_dev = 0;
 static int g_audio_initialized = 0;
 static volatile int g_pump_thread_on = 0;
+static sdl_spec_t g_audio_want;          /* kept for late-open retries (0.93.2) */
+static volatile int g_audio_open_total = 0;   /* open attempts so far           */
 
 /* ------------------------------------------------------ ring helpers */
 static void queue_reset(AudioPlayer *p) {
@@ -470,10 +473,134 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
 /* ------------------------------------------------ pump (own thread!) */
 static void pump_callbacks_impl(void);
 
+static long audio_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* 0.93.2 evidence-gathering for "Device or resource busy": count other
+ * loader2 processes and dump each ALSA playback substream's status, so a
+ * busy failure in the log identifies the holder instead of a bare errno. */
+static void audio_diag_busy(void) {
+    int loaders = 0;
+    DIR *d = opendir("/proc");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            char path[80];
+            snprintf(path, sizeof path, "/proc/%s/comm", de->d_name);
+            FILE *f = fopen(path, "r");
+            if (!f) continue;
+            char comm[64] = { 0 };
+            if (fgets(comm, sizeof comm, f) && strncmp(comm, "loader2", 7) == 0)
+                loaders++;
+            fclose(f);
+        }
+        closedir(d);
+    }
+    fprintf(stderr, "[SL] audio diag: %d loader2 process(es) alive (incl. self)\n",
+            loaders);
+    d = opendir("/proc/asound");
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (strncmp(de->d_name, "card", 4) != 0) continue;
+            char cpath[128];
+            snprintf(cpath, sizeof cpath, "/proc/asound/%s", de->d_name);
+            DIR *c = opendir(cpath);
+            if (!c) continue;
+            struct dirent *pe;
+            while ((pe = readdir(c))) {
+                size_t nl = strlen(pe->d_name);
+                if (strncmp(pe->d_name, "pcm", 3) != 0 ||
+                    nl == 0 || pe->d_name[nl - 1] != 'p') continue;
+                char spath[200];
+                snprintf(spath, sizeof spath, "%s/%s/sub0/status", cpath, pe->d_name);
+                FILE *f = fopen(spath, "r");
+                if (!f) continue;
+                char line[160];
+                if (fgets(line, sizeof line, f)) {
+                    line[strcspn(line, "\n")] = 0;
+                    fprintf(stderr, "[SL] audio diag: %s: %s\n", spath, line);
+                }
+                fclose(f);
+            }
+            closedir(c);
+        }
+        closedir(d);
+    }
+}
+
+/* drop all queued PCM so a late audio open does not blast many seconds of
+ * stale buffered music; playback resumes from the live edge (the preroll
+ * gate rearms naturally on the next ring starve). */
+static void flush_all_players(void) {
+    pthread_mutex_lock(&g_players_lock);
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        AudioPlayer *p = &g_players[i];
+        if (!p->active) continue;
+        p->ring_tail = p->ring_head;
+        p->preroll_bytes = 0;
+        p->preroll_ticks = 0;
+        queue_reset(p);
+    }
+    __sync_synchronize();
+    pthread_mutex_unlock(&g_players_lock);
+}
+
+/* one open attempt; logs failures (throttled) and the success line;
+ * returns nonzero when the device is open (NOT yet unpaused). */
+static int try_open_audio(void) {
+    sdl_spec_t have;
+    memset(&have, 0, sizeof have);
+    int n = ++g_audio_open_total;
+    uint32_t dev = p_SDL_OpenAudioDevice(NULL, 0, &g_audio_want, &have,
+                                         SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
+    if (!dev) {
+        if (n <= 6 || n % 30 == 0) {
+            fprintf(stderr, "[SL] SDL_OpenAudioDevice attempt %d FAILED: %s (driver=%s)\n",
+                    n, p_SDL_GetError ? p_SDL_GetError() : "?",
+                    (p_SDL_GetCurrentAudioDriver && p_SDL_GetCurrentAudioDriver())
+                        ? p_SDL_GetCurrentAudioDriver() : "?");
+            if (n <= 6) audio_diag_busy();
+        }
+        return 0;
+    }
+    fprintf(stderr, "[SL] SDL audio open: %dHz %dch %d samples (driver=%s, attempt %d)\n",
+            have.freq, have.channels, have.samples,
+            (p_SDL_GetCurrentAudioDriver && p_SDL_GetCurrentAudioDriver())
+                ? p_SDL_GetCurrentAudioDriver() : "?", n);
+    g_audio_dev = dev;
+    return 1;
+}
+
+/* 0.93.2: the pump thread ALWAYS runs (services bq callbacks so the game
+ * never wedges on audio) and, while the device is closed, retries the open
+ * every ~2s FOREVER.  0.93.1 evidence: boot-time ALSA busy outlived the
+ * old 4x250ms burst and the session stayed completely silent; whatever the
+ * holder is, we outlast it and pick the device up the moment it frees. */
 static void *sl_pump_thread(void *arg) {
     (void)arg;
-    fprintf(stderr, "[SL] pump thread up (4ms)\n");
-    for (;;) { pump_callbacks_impl(); usleep(4000); }
+    fprintf(stderr, "[SL] pump thread up (4ms; open retry active=%d)\n",
+            !g_audio_dev);
+    long last_try = 0;
+    for (;;) {
+        if (!g_audio_dev) {
+            long now = audio_mono_ms();
+            if (now - last_try >= 2000) {
+                last_try = now;
+                if (try_open_audio()) {
+                    flush_all_players();
+                    p_SDL_PauseAudioDevice(g_audio_dev, 0);
+                    fprintf(stderr, "[SL] late audio open succeeded -- sound is live\n");
+                }
+            }
+        }
+        pump_callbacks_impl();
+        usleep(4000);
+    }
     return NULL;
 }
 
@@ -482,40 +609,29 @@ static void ensure_audio_initialized(void) {
     g_audio_initialized = 1;    /* one-shot even on failure */
     if (!sdl_audio_resolve()) return;
 
-    sdl_spec_t want, have;
-    memset(&want, 0, sizeof want);
-    want.freq = SDL_OUTPUT_RATE;
-    want.format = CUR_AUDIO_S16SYS;
-    want.channels = 2;
-    want.samples = SDL_AUDIO_SAMPLES;
-    want.callback = sdl_audio_callback;
+    memset(&g_audio_want, 0, sizeof g_audio_want);
+    g_audio_want.freq = SDL_OUTPUT_RATE;
+    g_audio_want.format = CUR_AUDIO_S16SYS;
+    g_audio_want.channels = 2;
+    g_audio_want.samples = SDL_AUDIO_SAMPLES;
+    g_audio_want.callback = sdl_audio_callback;
 
     if (p_SDL_WasInit && !p_SDL_WasInit(SDL_INIT_AUDIO) && p_SDL_InitSubSystem)
         if (p_SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
             fprintf(stderr, "[SL] SDL_InitSubSystem(AUDIO): %s\n",
                     p_SDL_GetError ? p_SDL_GetError() : "?");
-    /* 0.86: a just-killed stale loader can hold ALSA for a few hundred ms;
-     * retry briefly instead of going permanently silent (0.85.1 second-boot
-     * "Device or resource busy"). */
-    for (int attempt = 1; attempt <= 4; attempt++) {
-        g_audio_dev = p_SDL_OpenAudioDevice(NULL, 0, &want, &have,
-                                            SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
-        if (g_audio_dev)
-            break;
-        fprintf(stderr, "[SL] SDL_OpenAudioDevice attempt %d FAILED: %s (driver=%s)\n",
-                attempt, p_SDL_GetError ? p_SDL_GetError() : "?",
-                (p_SDL_GetCurrentAudioDriver && p_SDL_GetCurrentAudioDriver())
-                    ? p_SDL_GetCurrentAudioDriver() : "?");
-        if (attempt < 4)
+    /* fast burst first: a just-killed stale loader holds ALSA for a few
+     * hundred ms (0.85.1 second-boot "Device or resource busy").  If it is
+     * still busy after the burst, we no longer give up (0.93.1: whole
+     * silent session) -- the pump thread below inherits the retries. */
+    for (int i = 0; i < 4 && !g_audio_dev; i++) {
+        if (try_open_audio())
+            p_SDL_PauseAudioDevice(g_audio_dev, 0);
+        else
             usleep(250000);
     }
     if (!g_audio_dev)
-        return;
-    fprintf(stderr, "[SL] SDL audio open: %dHz %dch %d samples (driver=%s)\n",
-            have.freq, have.channels, have.samples,
-            (p_SDL_GetCurrentAudioDriver && p_SDL_GetCurrentAudioDriver())
-                ? p_SDL_GetCurrentAudioDriver() : "?");
-    p_SDL_PauseAudioDevice(g_audio_dev, 0);
+        fprintf(stderr, "[SL] audio open failed 4x at boot -- pump thread will keep retrying every 2s\n");
     if (!g_pump_thread_on) {
         g_pump_thread_on = 1;
         pthread_t pt;

@@ -44,9 +44,14 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <dlfcn.h>
 #include <errno.h>
-#include <sys/mman.h>
+#include <linux/input.h>
 
 #include "gds.h"
 #include "nx_elf.h"
@@ -140,6 +145,141 @@ static int g_sdl_inited, g_open_retry;
 static volatile int g_exit_requested;
 void gds_input_request_exit(void) { g_exit_requested = 1; }
 int  gds_input_exit_requested(void) { return g_exit_requested; }
+
+/* ---------------------------------------------------- force-quit watcher --
+ * 0.93.2 (user request: "it'd be nice if Start+Select force quit the game.
+ * Otherwise if the game crashes I'm stuck").  The in-frame pad_poll chord
+ * only sets a flag the RENDER loop consumes; a wedged frame (managed
+ * deadlock -> the 0.92 NRE-storm class) means the loop never iterates and
+ * the user is stuck on a dead game.  So this thread reads the gamepad
+ * DIRECTLY from evdev (EVIOCGKEY: current state, no event stream needed,
+ * no SDL threading constraints), and:
+ *   - on SELECT+START down: request the graceful exit (flag), and
+ *   - if the chord stays held through a short grace period (the graceful
+ *     path couldn't run: frame wedged), _exit(0) on the spot.
+ * Node discovery: any event node exposing BOTH BTN_SELECT and BTN_START as
+ * keys.  Retries until found (the node may appear after gamepad hotplug). */
+#ifndef BTN_SELECT
+#define BTN_SELECT 0x129
+#endif
+#ifndef BTN_START
+#define BTN_START  0x12b
+#endif
+
+static long watch_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static int evdev_find_gamepad(void) {
+    char path[40];
+    for (int i = 0; i < 32; i++) {
+        snprintf(path, sizeof path, "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        unsigned long keybits[(KEY_MAX + 8 * sizeof(long)) / (8 * sizeof(long))];
+        memset(keybits, 0, sizeof keybits);
+        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keybits), keybits) < 0) {
+            close(fd);
+            continue;
+        }
+        int have_sel = (keybits[BTN_SELECT / (8 * sizeof(long))] >>
+                        (BTN_SELECT % (8 * sizeof(long)))) & 1;
+        int have_sta = (keybits[BTN_START / (8 * sizeof(long))] >>
+                        (BTN_START % (8 * sizeof(long)))) & 1;
+        if (have_sel && have_sta) {
+            char name[128] = { 0 };
+            if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0)
+                snprintf(name, sizeof name, "?");
+            fprintf(stderr, "[input] force-quit watcher on %s (%s)\n", path, name);
+            return fd;   /* kept open */
+        }
+        close(fd);
+    }
+    return -1;
+}
+
+static int evdev_chord_down(int fd) {
+    unsigned char keys[(KEY_MAX + 8) / 8];
+    memset(keys, 0, sizeof keys);
+    if (ioctl(fd, EVIOCGKEY(sizeof keys), keys) < 0)
+        return -1;
+    int sel = keys[BTN_SELECT / 8] & (1 << (BTN_SELECT % 8));
+    int sta = keys[BTN_START  / 8] & (1 << (BTN_START  % 8));
+    return (sel && sta) ? 1 : 0;
+}
+
+static void *pad_watch_thread(void *arg) {
+    (void)arg;
+    int fd = -1;
+    int chord_frames = 0;
+    long chord_down_ms = 0;
+    for (;;) {
+        if (fd < 0) {
+            fd = evdev_find_gamepad();
+            usleep(2000000);   /* node scan is cheap but don't spin on it */
+            continue;
+        }
+        int down = evdev_chord_down(fd);
+        if (down < 0) {        /* node vanished: rescan */
+            close(fd);
+            fd = -1;
+            chord_frames = 0;
+            chord_down_ms = 0;
+            continue;
+        }
+        if (down) {
+            if (chord_frames == 0)
+                chord_down_ms = watch_mono_ms();
+            chord_frames++;
+            if (chord_frames >= 2 && !g_exit_requested) {
+                g_exit_requested = 1;
+                fprintf(stderr,
+                        "[input] SELECT+START chord -> graceful exit requested "
+                        "(hold to force-quit)\n");
+            }
+            long held = watch_mono_ms() - chord_down_ms;
+            /* 2s: long enough that a HEALTHY game exits via the graceful
+             * path first (flag -> loop break -> Unity pause/destroy, which
+             * includes the managed save flush); short enough that a wedged
+             * frame doesn't trap the user.  GDS_QUITCHORD_MS overrides. */
+            static long hard_ms = -1;
+            if (hard_ms < 0) {
+                const char *v = getenv("GDS_QUITCHORD_MS");
+                hard_ms = v ? atol(v) : 2000;
+            }
+            if (held >= hard_ms) {
+                fprintf(stderr,
+                        "[input] chord held %ldms -- force-quitting NOW (_exit)\n",
+                        held);
+                fflush(stderr);
+                _exit(0);
+            }
+        } else {
+            chord_frames = 0;
+            chord_down_ms = 0;
+        }
+        /* graceful path stalled (wedged frame): the flag was requested but
+         * the loop is inside a dead render() call and can't consume it. */
+        usleep(50000);
+    }
+    return NULL;
+}
+
+static void pad_watch_start(void) {
+    static int started = 0;
+    if (started) return;
+    started = 1;
+    const char *e = getenv("GDS_QUITCHORD");
+    if (e && atoi(e) == 0) {   /* GDS_QUITCHORD=0 disables the watcher */
+        fprintf(stderr, "[input] force-quit watcher DISABLED (GDS_QUITCHORD=0)\n");
+        return;
+    }
+    pthread_t pt;
+    if (pthread_create(&pt, NULL, pad_watch_thread, NULL) == 0)
+        pthread_detach(pt);
+}
 
 static int input_on(void) {
     static int c = -1;
@@ -1012,7 +1152,7 @@ static int install_hooks(void) {
 }
 
 /* ------------------------------------------------------- public hooks */
-int gds_input_init(void) { return 0; }
+int gds_input_init(void) { pad_watch_start(); return 0; }
 
 /* 0.82 landscape fix: main.c calls this the moment all modules are mapped
  * (right after "modules loaded"), NOT on frame N.  The address-table patch

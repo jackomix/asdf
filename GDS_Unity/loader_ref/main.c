@@ -604,6 +604,8 @@ static void arm_traps(uintptr_t il2b)
          * probe fires and names the delivered array. */
         {0x17f4a40, "FepPanel.result",        31},
         {0x17f4aac, "FepPanel.aoresite",      31},
+        {0x17f4d08, "GetFep.dlgVA",           32},
+        {0x16e3724, "storm.raise",             33},
         /* Storage::GetFolder folder in {1,4}, Android branch: the path is
          * cut out of the base path via LastIndexOf(strA)+5..LastIndexOf(strB)
          * then Substring(start,len) -- AORE if either index is -1. */
@@ -1160,6 +1162,67 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                                 *(volatile int *)(maino + 0x1f8));
                     }
                 }
+            } else if (p->kind == 33) {
+                /* 0.93.2: NRE-storm forensics.  The ~2s post-naming storm
+                 * (raiseNRE callers il2cpp+0x16e3724/8, twice observed, ends
+                 * in IApplication.Terminate = game suicide) roots in storm
+                 * fn 0x16e3468: the guard at 0x16e3658 jumps HERE (the raise
+                 * call at 0x16e3724) when 0xf04490(...) returns NULL.  The
+                 * success path never runs, so x9/x10 are stale -- read the
+                 * two interned-literal cells (0x1ec9248/0x1ec9228, used by
+                 * the success path as query names) straight from globals;
+                 * they are double-indirect (cell -> slot -> Il2CppString).
+                 * Owner object is x20 (loaded 0x16e360c): dump its class. */
+                char sA[300], sB[300], n1[96], n2[96];
+                for (int which = 0; which < 2; which++) {
+                    uintptr_t c = g_il2b + (which ? 0x1ec9228 : 0x1ec9248);
+                    uintptr_t slot = trap_mapped(c) ? *(uintptr_t *)c : 0;
+                    int ok = trap_ptr_ok(slot) && trap_mapped(slot);
+                    trap_il2str(ok ? *(uintptr_t *)slot : 0,
+                                which ? sB : sA, 300);
+                }
+                fprintf(stderr, "[trap]   storm-fn literals: [1ec9248]='%s' [1ec9228]='%s'\n",
+                        sA, sB);
+                uintptr_t o = (uintptr_t)u->uc_mcontext.regs[20];
+                if (trap_ptr_ok(o) && trap_mapped(o)) {
+                    uintptr_t k = *(uintptr_t *)o;
+                    if (trap_ptr_ok(k) && trap_mapped(k))
+                        fprintf(stderr, "[trap]   owner(x20) class=%s.%s\n",
+                                trap_cstr(*(uintptr_t *)(k + 0x18), n2, sizeof n2),
+                                trap_cstr(*(uintptr_t *)(k + 0x10), n1, sizeof n1));
+                }
+            } else if (p->kind == 32) {
+                /* 0.93.2: name-mangling pinpoint.  At GetFepPanelResult
+                 * 0x17f4d08 the RESULT-PRODUCING delegate is live in x20
+                 * (the one the KairoPlugin pump invokes to turn the raw
+                 * getInputPanelResult jstring into String[]; disasm:
+                 * 0x174f29c stores it at state+0x10, pump 0x1756b80 invokes
+                 * it and its return becomes the cast result).  Offline the
+                 * target VA is behind a runtime MethodInfo cell, so dump
+                 * the delegate's slots once and let one device run name the
+                 * parse function for offline disasm. */
+                uintptr_t del = (uintptr_t)u->uc_mcontext.regs[20];
+                uintptr_t tobj = (uintptr_t)u->uc_mcontext.regs[21];
+                fprintf(stderr, "[trap]   fep-delegate x20=%#lx target-obj x21=%#lx\n",
+                        (unsigned long)del, (unsigned long)tobj);
+                if (trap_ptr_ok(del) && trap_mapped(del)) {
+                    for (int s = 1; s <= 8; s++) {
+                        uintptr_t v = *(uintptr_t *)(del + s * 8);
+                        const char *ann = (v >= g_il2b && v < g_il2b + 0x2000000)
+                                          ? " [il2cpp code!]" : "";
+                        fprintf(stderr, "[trap]     [del+0x%02x]=%#lx%s\n",
+                                s * 8, (unsigned long)v, ann);
+                    }
+                }
+                if (trap_ptr_ok(tobj) && trap_mapped(tobj)) {
+                    uintptr_t k = *(uintptr_t *)tobj;
+                    if (trap_ptr_ok(k) && trap_mapped(k)) {
+                        char b1[96], b2[96];
+                        fprintf(stderr, "[trap]     target class=%s.%s\n",
+                                trap_cstr(*(uintptr_t *)(k + 0x18), b2, sizeof b2),
+                                trap_cstr(*(uintptr_t *)(k + 0x10), b1, sizeof b1));
+                    }
+                }
             } else if (p->kind == 14) {
                 /* raise-helper entry: x30 = codegen out-of-range check site */
                 fprintf(stderr, "[trap]   ra=il2cpp+%#lx",
@@ -1537,7 +1600,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.93.1-hotfix)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.93.2-audioquit)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */

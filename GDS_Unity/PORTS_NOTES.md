@@ -50,13 +50,34 @@ and the next call wrote out-of-bounds with a wrapped (huge) size into a
 512-byte stack buffer -> canary trip.  Fixed: clamp p per call, buffer 1024
 (a full 8-family x 24-slot summary is ~700B).
 
-## OPEN: company name loses its first char ("unny Studios")
-getInputPanelResult logs "Sunny Studios" correctly, but FepPanel result [0]
-AND the on-disk save both show the S dropped.  mk_string/getInputPanelResult
-jstrings are freshly strdup'd and clean.  0.93 ships a capped probe on
-GetStringLength/GetStringChars/GetStringUTFChars/GetStringUTFRegion logging
-every short printable string -> next naming run shows exactly which shim
-sees the mangled form (or proves it never transits JNI = inside C#).
+## OPEN: company name loses its first char(s) ("wertyuio" from "Qwertyuiop")
+getInputPanelResult logs the text correctly, but FepPanel result [0] shows
+chars dropped (0.91: "Sunny Studios"->"unny Studios"; 0.93.1: "Qwertyuiop"->
+"wertyuio").  0.93.2 full-pipeline reversal (all disasm-pinned):
+  FepPanel::Update -> GetFepPanelResult(0x17f4c08) ->
+    KairoPlugin.fire(0x174f29c): makes state object {+0x10 delegate, +0x20
+      exception, +0x28 done, +0x30 result}, queues it on [plugin+0x40],
+      Thread.Sleep(1)-spins on +0x28 (param w2=1 = block).
+    KairoPlugin.pump(0x1756b80): per frame, dequeues state[0], invokes
+      delegate (+0x10), stores its return at state+0x30, sets done.
+    GetFepPanelResult wakes, throws state+0x20 if set, casts state+0x30 to
+      String[] (klass cell 0x1ebf2f8), returns it.
+  => The DELEGATE does the JNI call AND the String->String[] parse; IT is
+     the mangling site.  Delegate ctor-wire: GetFep caches it at compat
+     statics+0xc0, target = manager singleton (klass cell 0x1ecff90
+     statics[0]), MethodInfo = cell 0x1ecff98 -- runtime-only value, NOT
+     resolvable from the file (0xcb0bbc resolver walks registration tables).
+  Device data fits "text parsed as PREFIX+body+SUFFIX": Substring(1, L-2)
+  explains 10->"wertyuio"(8); real kairo Android likely returns a packed
+  form (status char + text + terminator) that the delegate unpacks, and our
+  bare-text reply gets clipped on both sides.  NOTE: no Substring(int,int)
+  caller and no '\n' literal exists in the manager region 0x174b000-
+  0x1756c00, so the parse lives elsewhere (delegate target's class region).
+0.93.2 ships the pinning probe: kind-32 at 0x17f4d08 dumps x20 (delegate)
+slots [+0x08..+0x40] once -- [del+0x10] = parse fn VA (ctor 0x174d2f0
+stores [MethodInfo+8] there).  One run -> disasm that VA -> exact algorithm
+-> exact answer over any guessed packing.  strprobe re-arms at fetch too
+(cap spent on boot strings in 0.93, conversion after fetch now captured).
 
 ## Music intro echo -- 0.92 preroll gate did NOT fix it on device
 Ring is append-only/monotonic: it cannot repeat PCM, so the ~1s repeat must
@@ -65,12 +86,18 @@ pushed 512-frame quantum for the first 128 after a >=2s silence and reports
 if the opening 8-quantum pattern recurs (+ offset in ms).  Plus preroll
 arm/open/flush transition logs (cap 10).  Await next run's verdict.
 
-## Boot splash -- shipped 0.93 (bid)
-`gds_splash_show(egl_window)` right after SDL window creation: software-blit
-`gamedir/splash.bmp` (640x480 24-bit, committed) onto the window surface;
-stays on scanout through module load + Unity warmup until first real frame.
-Note KMSDRM GL windows may refuse SDL_GetWindowSurface -- logged if so
-(`[egl] splash:` line tells which branch ran).
+## Boot splash -- REVERTED in 0.93.1 (0.93.0's blit broke boot)
+0.93.0 software-blitted a BMP onto the KMSDRM GL window: SDL_GetWindowSurface
+returned NULL and the touch left SDL state where the NEXT eglGetCurrentDisplay
+returned nil -> Unity "no configuration matching minimum spec" -> abort.
+Rule learned: NEVER touch the GL window with SDL software APIs.
+User wants the real launch screen anyway: the KAIROSOFT logo Android shows
+at app start (windowBackground/windowSplashScreen theme drawable in the
+APK's res/, NOT in Unity data).  Deferred with user's blessing; plan:
+harvest the drawable from the APK (build script or user drops the APK) and
+present it in a SEPARATE temporary NON-GL SDL window during module load,
+destroyed before the GL window is created.  Reference ports draw nothing
+(their Unity splashes are native libunity) -- do not copy them here.
 `System.IndexOutOfRangeException` from `FepPanel::Update` @0x17f4aac:
 `GetFepPanelResult` delivered `String[1] {text}` but the consumer requires
 Length ≥ 2 (`[0]` = button marker, non-null→positive listener; `[1]` = text).
@@ -108,6 +135,38 @@ dialog; game proceeds past company naming.
 Screen.dpi 160/240/320 (`GDS_DPI`) — no change. `GDS_TABLET=0/1` — no change.
 Next: kairo.unity.ui scale path in il2cpp (not density-driven); possibly form
 layout fixed to window dims. Uninvestigated.
+
+## 0.93.2: audio retry (silent-session fix) + force-quit chord
+- DEVICE REGRESSION (0.93.1 20:18 run): `SDL_OpenAudioDevice` failed 4x
+  `ALSA: ... Device or resource busy` from attempt 1 -> whole session
+  silent (old code gave up after 4x250ms FOREVER).  Fix: fast burst kept,
+  then the (now always-running) pump thread retries every 2s with no cap;
+  success line tags the attempt number.  On a late open all players' rings
+  are flushed first (no 24s stale-audio blast; preroll rearms naturally).
+  Each early failure also logs a /proc diag: live loader2 process count +
+  every ALSA playback substream status -> names the busy-holder next time.
+- FORCE-QUIT (user request): SELECT+START now also watched by a dedicated
+  thread reading evdev DIRECTLY (EVIOCGKEY current-state ioctl, node found
+  by capability bits BTN_SELECT+BTN_START; no SDL threading issues, immune
+  to a wedged render loop).  Chord -> graceful flag as before; chord held
+  >=2s (GDS_QUITCHORD_MS) -> `_exit(0)` on the spot.  GDS_QUITCHORD=0
+  disables the watcher.  Debounce = 2 consecutive 50ms reads.
+
+## OPEN: post-naming NRE storm -> game self-Terminate
+Reproducible 2x (0.92 and 0.93.1): after naming, ~2s storm of
+System.NullReferenceException, raise site `bl 0xcb0de4 @ il2cpp+0x16e3724`,
+then `IApplication.Terminate` (caller il2cpp+0xe90394), render-loop stop at
+frame ~580, exit 0.  Storm fn pinned (0.93.2 disasm): body 0x16e3468..0x16e37e0,
+guard `cbz x19 @0x16e3658` -> raise when `0xf04490(...)` returns NULL.  The
+success path queries with two interned literal cells 0x1ec9248/0x1ec9228
+(double-indirect: cell -> slot -> Il2CppString; values are runtime
+singletons, unreadable offline) on an owner object x20 = [x21], then a
+vtable call at klass+0x138.  Catch at 0x16e372c swallows it (w22=1, returns
+null) -> caller retries each frame -> ~50 NREs -> Main gives up.
+0.93.2 ships kind-33 probe at the raise call 0x16e3724: dumps BOTH literal
+strings + owner class name.  One run names exactly what lookup fails.
+Hypothesis to test when named: a UI object whose creation depends on the
+broken tab/layout path (same root as small-tabs?) or a shop/name entry.
 
 ## il2cpp stub family (disasm-verified, earlier labels were wrong)
 - 0xcb0ddc = raise(exception obj) — EH rethrow helper (NOT a bounds stub!)

@@ -780,9 +780,13 @@ static void j_GetStringUTFRegion(void *e, jobj *s, int32_t off, int32_t len, cha
 {
     (void)e;
     if (s && s->str) {
-        { static int n; if (n++ < 24 && s->len >= 2 && s->len <= 64)
+        /* off/len are direct evidence of any prefix/suffix strip, so this
+         * one logs even mid-window (uses the same shared budget). */
+        if (s->len >= 2 && s->len <= 64 && g_strprobe_n < 24) {
+            g_strprobe_n++;
             fprintf(stderr, "[jni] GetStringUTFRegion: off=%d len=%d (strlen=%d) '%s'\n",
-                    off, len, s->len, s->str); }
+                    (int)off, (int)len, s->len, s->str);
+        }
         if (off < 0) off = 0;
         if (off > s->len) off = s->len;
         if (len > s->len - off) len = s->len - off;
@@ -2844,6 +2848,13 @@ static int64_t j_kairo_InputPanel(jctx *c)
         return done;
     }
     if (is_fetch) {
+        /* Re-arm the string-conversion probe NOW (0.93.2): the 0.93 window
+         * exhausted its cap on boot strings, so the naming conversion was
+         * never captured.  From this fetch onward the next 24 string reads
+         * ARE the getInputPanelResult conversion -- which entry point, with
+         * what content, answering where the first char goes. */
+        g_strprobe_n = 0;
+        fprintf(stderr, "[jni] strprobe window re-armed at %s (cap=24)\n", name);
         /* Return the shape the CALLER asked for.  The device-proven dex
          * surface (0.85.0) requests getInputPanelResult()Ljava/lang/String;
          * -- a single string (null = canceled).  0.84.x answered with a

@@ -24,7 +24,7 @@ BRANCH="${GDS_BRANCH:-arena/019fd2ed-asdf}"
 # a stale one).  That closes the old failure mode where a cached copy of THIS
 # script validated a stale zip against a stale baked version and everything
 # looked "fine".  Set GDS_EXPECT_VER env to force a value manually.
-GDS_EXPECT_VER_BAKED="0.93.1-hotfix"
+GDS_EXPECT_VER_BAKED="0.93.2-audioquit"
 GDS_EXPECT_VER_ENV="${GDS_EXPECT_VER:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LOGDIR="$HERE/gds_logs"
