@@ -2854,10 +2854,26 @@ static int64_t j_kairo_InputPanel(jctx *c)
         for (int i = 0; i < ni; i++)
             if (nums[i] > 0 && nums[i] <= 64)
                 maxlen = (int)nums[i];
-        fprintf(stderr, "[osk] Utility.%s%s title=\"%s\" text=\"%s\""
-                        " nstr=%d nnum=%d max=%d\n",
-                name, sig, title, text, no, ni, maxlen);
+        /* 0.95.1: length + raw tail bytes, flockfile'd (the 0.95.0 line
+         * interleaved with the osk-side print and its garble couldn't say
+         * whether the trailing blank ARRIVED here or appeared later). */
+        size_t tl = strlen(text);
+        char tailhex[3 * 8 + 1];
+        {
+            const unsigned char *p = (const unsigned char *)text;
+            size_t tn = tl < 8 ? tl : 8, ho = 0;
+            for (size_t i = tl - tn; i < tl; i++)
+                ho += (size_t)snprintf(tailhex + ho, sizeof tailhex - ho,
+                                       "%02x ", p[i]);
+            if (ho) tailhex[ho - 1] = 0;
+            else tailhex[0] = 0;
+        }
+        flockfile(stderr);
+        fprintf(stderr, "[osk] Utility.%s%s title=\"%s\" text(%zu)=\"%s\" "
+                        "tail=[%s] nstr=%d nnum=%d max=%d\n",
+                name, sig, title, tl, text, tailhex, no, ni, maxlen);
         fflush(stderr);
+        funlockfile(stderr);
         gds_osk_open(title, text, maxlen);
         return 1;
     }

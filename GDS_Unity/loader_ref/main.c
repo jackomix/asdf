@@ -659,11 +659,24 @@ static int trap_quiet(const struct probe *pr)
         "Setup.postOpen", "RecordStore.Setup.store",
         "storm.raise", "raiseNRE.stub", "rethrow-exobj.stub",
         "raiseAOREchk.stub", "raiseAOREmsg.stub", "raiseInvalidCast.stub",
-        "Substring.entry", "step-over", "GetNumRecords.files",
+        "Substring.entry", "GetNumRecords.files",
+        /* 0.95.0 miss: the NRE-detail dump (NRE[2..40] + sp-slot lines) is
+         * keyed on the cxa_throw probe (late-armed tag), whose tag was never
+         * in this list -- it printed the whole storm anyway. */
+        "cxa_throw", "cxa_throw(late)",
         NULL
     };
     extern int nx_verbose;
     if (nx_verbose) return 0;
+    /* 0.95.0 miss: step-over probes are one-shot and freshly minted per
+     * hit, so hit==1 forever and the per-probe "hit > 2" rule never
+     * engaged -- EVERY step-over line printed.  Cap the boot total instead.
+     * (trap_quiet is consulted exactly once per step-over hit: kind 98 has
+     * no detail branch, only the hit-line site.) */
+    if (!strcmp(pr->tag, "step-over")) {
+        static unsigned step_hits;
+        return ++step_hits > 6;
+    }
     for (int i = 0; noisy[i]; i++)
         if (!strcmp(pr->tag, noisy[i]))
             return pr->hit > 2;
@@ -1637,7 +1650,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.0-quietlog)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.1-evidence)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */

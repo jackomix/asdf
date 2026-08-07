@@ -24,6 +24,10 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+/* 0.95.1: boot config tables (symbol capture + per-config dumps) move behind
+ * GDS_VERBOSE -- declared once up here so the early capture paths see it. */
+extern int nx_verbose;
+
 /* ---- SDL2 constants (SDL2/SDL_video.h + SDL_events.h values) ---- */
 #define SDL_INIT_VIDEO 0x00000020u
 #define SDL_INIT_AUDIO 0x00000010u
@@ -440,7 +444,7 @@ static void gds_capture_real_egl(void) {
   if (!g_real_egl_hdl) return;
 #define CAP(field, sym) \
   field = (void *)dlsym(g_real_egl_hdl, sym); \
-  fprintf(stderr, "[egl]   %s = %p\n", sym, (void *)field)
+  if (nx_verbose) fprintf(stderr, "[egl]   %s = %p\n", sym, (void *)field)
   CAP(r_eglGetCurrentDisplay, "eglGetCurrentDisplay");
   CAP(r_eglChooseConfig, "eglChooseConfig");
   CAP(r_eglGetConfigAttrib, "eglGetConfigAttrib");
@@ -704,14 +708,17 @@ static void gds_capture_real_egl(void) {
         r_eglGetConfigAttrib(g_real_dpy, cfgs[i], 0x302e, &nvid);
         int is_win = (cid == want_cid);
         if (is_win && !g_win_cfg) g_win_cfg = cfgs[i];
-        fprintf(stderr,
-                "[egl]   cfg[%02d] id=%3d buf=%d rgba=%d/%d/%d/%d d=%d s=%d "
-                "smp=%d rb=0x%x surf=0x%x nvt=0x%x nvid=0x%x%s\n",
-                i, cid, buf, r, g, b, a, d, s, smp, rb, st, nvt, nvid,
-                is_win ? "  == WINDOW" : "");
+        /* 0.95.1: full per-config table is verbose-only now (boot forensics
+         * long done; ~30 lines per boot).  The parity line below stays. */
+        if (nx_verbose)
+          fprintf(stderr,
+                  "[egl]   cfg[%02d] id=%3d buf=%d rgba=%d/%d/%d/%d d=%d s=%d "
+                  "smp=%d rb=0x%x surf=0x%x nvt=0x%x nvid=0x%x%s\n",
+                  i, cid, buf, r, g, b, a, d, s, smp, rb, st, nvt, nvid,
+                  is_win ? "  == WINDOW" : "");
       }
-      fprintf(stderr, "[egl] surface-config parity g_win_cfg=%p (of %d)\n",
-              g_win_cfg, n);
+      fprintf(stderr, "[egl] surface-config parity g_win_cfg=%p (of %d)%s\n",
+              g_win_cfg, n, nx_verbose ? "" : " (GDS_VERBOSE=1 for table)");
     } else {
       fprintf(stderr, "[egl] full config dump failed n=%d\n", n);
     }

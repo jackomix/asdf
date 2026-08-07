@@ -166,6 +166,34 @@ int  gds_input_exit_requested(void) { return g_exit_requested; }
 #define BTN_START  0x12b
 #endif
 
+/* 0.95.1: the chord pair is now CONFIGURABLE.  The 0.95.0 boot scan proved
+ * the R36S 'GO-Super Gamepad' evdev node does NOT advertise BTN_SELECT /
+ * BTN_START (every node: sel=0 start=0) -- the physical SELECT/START keys
+ * report as other codes entirely.  The boot key-dump below names each
+ * node's real codes; GDS_QUITCHORD_KEYS="0x129,0x12b" (hex or decimal)
+ * then pins the pair from gds_env.cfg with NO rebuild needed. */
+static unsigned g_code_sel = BTN_SELECT, g_code_start = BTN_START;
+static void chord_codes_init(void) {
+    const char *e = getenv("GDS_QUITCHORD_KEYS");
+    if (e) {
+        char *end = NULL;
+        unsigned long a = strtoul(e, &end, 0);
+        unsigned long b = (end && *end) ? strtoul(end + 1, NULL, 0) : 0;
+        if (a && b && a <= KEY_MAX && b <= KEY_MAX) {
+            g_code_sel = (unsigned)a;
+            g_code_start = (unsigned)b;
+        }
+    }
+    fprintf(stderr, "[input] force-quit chord: sel key=0x%x start key=0x%x%s\n",
+            g_code_sel, g_code_start,
+            e ? " (GDS_QUITCHORD_KEYS)" : "");
+}
+
+/* shared SDL slot names (padlog + first-seen roll below) */
+static const char *const g_npb_names[] = {
+    "A/east", "B/south", "X/north", "Y/west", "L1", "R1",
+    "SELECT", "START", "L3", "R3", "D-UP", "D-DOWN", "D-LEFT", "D-RIGHT" };
+
 static long watch_mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -190,16 +218,39 @@ static int evdev_find_gamepad(void) {
             close(fd);
             continue;
         }
-        int have_sel = (keybits[BTN_SELECT / (8 * sizeof(long))] >>
-                        (BTN_SELECT % (8 * sizeof(long)))) & 1;
-        int have_sta = (keybits[BTN_START / (8 * sizeof(long))] >>
-                        (BTN_START % (8 * sizeof(long)))) & 1;
+        int have_sel = (keybits[g_code_sel / (8 * sizeof(long))] >>
+                        (g_code_sel % (8 * sizeof(long)))) & 1;
+        int have_sta = (keybits[g_code_start / (8 * sizeof(long))] >>
+                        (g_code_start % (8 * sizeof(long)))) & 1;
         if (log_this) {
             char name[128] = { 0 };
             if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0)
                 snprintf(name, sizeof name, "?");
-            fprintf(stderr, "[input] evdev %s '%s' sel=%d start=%d\n",
-                    path, name, have_sel, have_sta);
+            fprintf(stderr, "[input] evdev %s '%s' sel(0x%x)=%d start(0x%x)=%d\n",
+                    path, name, g_code_sel, have_sel, g_code_start, have_sta);
+            /* 0.95.1: dump EVERY set EV_KEY code per node (one boot pass).
+             * The 0.95.0 scan showed no node exposing 0x129/0x12b, so the
+             * physical SELECT/START must wear other codes -- this list
+             * names them, then GDS_QUITCHORD_KEYS pins the pair.  Capped so
+             * a keyboard-class node can't flood the log. */
+            char kb[384];
+            size_t ko = 0;
+            int overflow = 0;
+            for (int kc = 0; kc <= KEY_MAX; kc++) {
+                if (!((keybits[kc / (8 * sizeof(long))] >>
+                       (kc % (8 * sizeof(long)))) & 1))
+                    continue;
+                int w = snprintf(kb + ko, sizeof kb - ko, "%s0x%x",
+                                 ko ? " " : "", kc);
+                if (w < 0 || ko + (size_t)w >= sizeof kb - 1) {
+                    overflow = 1;
+                    break;
+                }
+                ko += (size_t)w;
+            }
+            kb[ko] = 0;
+            fprintf(stderr, "[input]   keys: %s%s\n",
+                    ko ? kb : "(no EV_KEY codes)", overflow ? " ...(more)" : "");
         }
         if (have_sel && have_sta) {
             char name[128] = { 0 };
@@ -221,13 +272,14 @@ static int evdev_chord_down(int fd) {
     memset(keys, 0, sizeof keys);
     if (ioctl(fd, EVIOCGKEY(sizeof keys), keys) < 0)
         return -1;
-    int sel = keys[BTN_SELECT / 8] & (1 << (BTN_SELECT % 8));
-    int sta = keys[BTN_START  / 8] & (1 << (BTN_START  % 8));
+    int sel = keys[g_code_sel / 8] & (1 << (g_code_sel % 8));
+    int sta = keys[g_code_start / 8] & (1 << (g_code_start % 8));
     return (sel && sta) ? 1 : 0;
 }
 
 static void *pad_watch_thread(void *arg) {
     (void)arg;
+    chord_codes_init();
     int fd = -1;
     int chord_frames = 0;
     long chord_down_ms = 0;
@@ -481,21 +533,37 @@ static void pad_poll(void) {
     if (g_npa[NPA_LT] < 0.0f) g_npa[NPA_LT] = 0.0f;
     if (g_npa[NPA_RT] < 0.0f) g_npa[NPA_RT] = 0.0f;
 
+    /* 0.95.1: first-seen button roll (no knob, bounded by NPB_COUNT).
+     * The 0.95.0 run proved the SDL-side chord never fired: whatever the
+     * physical SELECT key reports as, it is not SDL BACK.  This names what
+     * each pad slot DOES first arrive as when the user reaches for buttons
+     * -- the chord pair (and its GDS_QUITCHORD_KEYS evdev twin) can then be
+     * pinned from evidence instead of guesswork. */
+    {
+        static unsigned long long g_btn_seen;
+        for (int i = 0; i < NPB_COUNT; i++) {
+            if (g_npb[i] && !(g_btn_seen & (1ull << i))) {
+                g_btn_seen |= 1ull << i;
+                fprintf(stderr, "[input] first physical press arrived as SDL %s\n",
+                        g_npb_names[i]);
+                fflush(stderr);
+            }
+        }
+    }
+
     /* GDS_PADLOG=1: every physical button transition, one line.  This is the
      * "controller test" the user asked for: press a button, read the line. */
     if (padlog_on()) {
-        static const char *const bn[NPB_COUNT] = {
-            "A/east", "B/south", "X/north", "Y/west", "L1", "R1",
-            "SELECT", "START", "L3", "R3", "D-UP", "D-DOWN", "D-LEFT", "D-RIGHT" };
         for (int i = 0; i < NPB_COUNT; i++) {
             if (g_npb[i] != g_npb_prev[i]) {
                 fprintf(stderr, "[padlog] %-8s %s  (LT=%.2f RT=%.2f)\n",
-                        bn[i], g_npb[i] ? "DOWN" : "up",
+                        g_npb_names[i], g_npb[i] ? "DOWN" : "up",
                         g_npa[NPA_LT], g_npa[NPA_RT]);
                 fflush(stderr);
             }
         }
     }
+    (void)g_npb_names;
 
     /* exit chord: SELECT+START (native_pad.c Bully/Sonic pattern) */
     if (!g_exit_requested && g_npb[NPB_BACK] && g_npb[NPB_START]) {

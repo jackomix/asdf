@@ -76,6 +76,16 @@ int my___android_log_write(int prio, const char *tag, const char *msg)
 {
     if (!gds_log_level)
         return 0;
+    /* 0.95.1 quiet mode: Unity's boot GL_EXTENSIONS / GL_VERSION spam
+     * arrives at low priority (prints as "[?/Unity]" / "[D/Unity]") and was
+     * the biggest remaining block after the 0.95.0 trap diet.  Quiet mode
+     * keeps INFO and up (the lvl table maps those to I/W/E/F); GDS_VERBOSE=1
+     * restores everything. */
+    {
+        extern int nx_verbose;
+        if (!nx_verbose && prio < 7)
+            return 0;
+    }
     /* 0.92: the [V/Unity] "AndroidJNIHelper: ... obsolete" warning + managed
      * stack trace fires per LateUpdate-ish JNI call (hundreds per boot) and
      * dominates the log even after 1-in-8 dedupe.  Show the first, then one

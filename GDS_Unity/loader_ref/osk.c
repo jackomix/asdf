@@ -159,22 +159,58 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
         text_copy(g_text, sizeof g_text, initial);
     size_t n = strlen(g_text);
     if (n > (size_t)g_maxlen) g_text[g_maxlen] = 0;
-    /* The prefill arrives with a trailing space glued on (user-verified
-     * 0.94.0: "Sunny Studios" + one literal space they must backspace out;
-     * the dex plugin copies text_ verbatim into the EditText, so the space
-     * comes from the game data itself).  Nobody wants to delete a space
-     * every naming -- trim trailing spaces from the PREFILL ONLY (never
-     * from typed text). */
+    /* 0.95.0 user report: a trailing blank at the end of the prefill was
+     * STILL there after the ASCII-space trim shipped, and the interleaved
+     * boot log (two threads racing stderr) couldn't prove what byte it is.
+     * 0.95.1 (a) dumps the raw tail BYTES so the char is named outright,
+     * and (b) extends the trim past ASCII space to the usual Unicode
+     * blanks a Japanese game font would use -- the OSK bitmap font draws
+     * every one of them as an empty gap + caret, exactly matching the
+     * report.  PREFILL ONLY, never typed text. */
     n = strlen(g_text);
+    const size_t rawlen = n;
+    char tailhex[3 * 8 + 1];
+    {
+        const unsigned char *p = (const unsigned char *)g_text;
+        size_t tn = n < 8 ? n : 8, ho = 0;
+        for (size_t i = n - tn; i < n; i++)
+            ho += (size_t)snprintf(tailhex + ho, sizeof tailhex - ho,
+                                   "%02x ", p[i]);
+        if (ho) tailhex[ho - 1] = 0;
+        else tailhex[0] = 0;
+    }
     size_t trimmed = 0;
-    while (n > 0 && g_text[n - 1] == ' ') { g_text[--n] = 0; trimmed++; }
+    for (;;) {
+        n = strlen(g_text);
+        if (n == 0) break;
+        unsigned char *u = (unsigned char *)g_text;
+        if (u[n - 1] == ' ' || u[n - 1] == '\t') {          /* ASCII */
+            u[--n] = 0; trimmed++; continue;
+        }
+        if (n >= 2 && u[n - 2] == 0xC2 && u[n - 1] == 0xA0) /* U+00A0 NBSP */
+            { u[n -= 2] = 0; trimmed += 2; continue; }
+        if (n >= 3 && u[n - 3] == 0xE3 && u[n - 2] == 0x80 &&
+            u[n - 1] == 0x80)                                /* U+3000 ideo. */
+            { u[n -= 3] = 0; trimmed += 3; continue; }
+        if (n >= 3 && u[n - 3] == 0xE2 && u[n - 2] == 0x80 &&
+            (u[n - 1] == 0x87 || u[n - 1] == 0xAF ||
+             u[n - 1] == 0x8B))       /* figure / narrow-NBSP / zero-width */
+            { u[n -= 3] = 0; trimmed += 3; continue; }
+        break;
+    }
+    n = strlen(g_text);
     g_upper = n == 0 || g_text[n - 1] == ' ';
     g_done = 0;
     g_ok = 0;
-    fprintf(stderr, "[osk] open title=\"%s\" initial(%zu)=\"%s\" maxlen=%d%s\n",
-            g_title, n, g_text, g_maxlen,
-            trimmed ? " (trailing space(s) trimmed)" : "");
+    /* ONE flockfile'd line: 0.95.0's two-part print interleaved with the
+     * jni-side arrival line ("maxlen=144)=...") and proved nothing. */
+    flockfile(stderr);
+    fprintf(stderr, "[osk] open title=\"%s\" rawlen=%zu rawtail=[%s] -> "
+                    "text(%zu)=\"%s\" maxlen=%d%s\n",
+            g_title, rawlen, tailhex, n, g_text, g_maxlen,
+            trimmed ? " (trailing blank(s) trimmed)" : "");
     fflush(stderr);
+    funlockfile(stderr);
 }
 
 void gds_osk_set_text(const char *text)

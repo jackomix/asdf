@@ -4,6 +4,40 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.1-evidence (unambiguous OSK/key evidence; log diet round 2)
+Shipped in response to the 0.95.0 device logs (Aug 7): three open items all
+get *yes/no evidence* in the next boot log instead of more guesswork.
+
+- **OSK trailing blank:** the 0.95.0 trim was ASCII-space-only; user still
+  saw a blank before the caret and the garbled log (two threads racing
+  stderr, e.g. `maxlen=144)=...`) couldn't prove which byte it is. Now:
+  `gds_osk_open` prints ONE flockfile'd line with `rawlen=` + `rawtail=[hex]`
+  + post-trim text; the jni-side arrival print got the same treatment. The
+  trim also strips Unicode blanks now (NBSP `C2 A0`, U+3000 `E3 80 80`,
+  figure/narrow-NBSP/zero-width `E2 80 87/AF/8B`) — the OSK bitmap font
+  renders all of these as a gap, matching the user's report. If the byte is
+  something else entirely, the hex tail names it.
+- **Start+Select force-quit:** 0.95.0 scan showed NO evdev node advertises
+  BTN_SELECT/BTN_START (all `sel=0 start=0`), and the SDL-side chord never
+  fired either. New diagnostics: (a) each evdev node dumps EVERY set EV_KEY
+  code once per boot, (b) a bounded "first physical press arrived as SDL X"
+  roll names each pad slot as it's first pressed (no GDS_PADLOG needed),
+  and (c) the chord pair is configurable: `GDS_QUITCHORD_KEYS="0x129,0x12b"`
+  (hex/dec) in gds_env.cfg — no rebuild needed once the dump names the
+  real codes.
+- **Log diet round 2:** fixed the two 0.95.0 misses — the NRE[2..40] detail
+  + sp-slot dumps were keyed on the `cxa_throw`/`cxa_throw(late)` probe tag
+  (never in the quiet list), and `step-over` probes are one-shot/fresh so
+  the "first 2 hits" rule never engaged (now a global cap of 6/boot).
+  Also verbose-gated: EGL symbol table + per-config dumps, and ALL logcat
+  below INFO (`[?/Unity] GL_EXTENSIONS` wall etc.).
+- **Music echo:** PCM captures from the Aug 7 run are ON THE DEVICE at
+  `/roms/ports/gamedevstory/echo_{prod,play}.pcm` — pull with
+  `scp ark@<dev>:/roms/ports/gamedevstory/echo_prod.pcm .` (and `_play.pcm`,
+  password `ark`), then cross-correlate offline: prod==play ⇒ repeat is
+  upstream (FMOD/game), prod!=play ⇒ consumer-side (our ring). Analysis
+  pending on those files.
+
 ## 0.95.0-quietlog (user-verified name fix on device; log diet; echo capture)
 **Device-verified in 0.94.0:** the wire-packed name arrives whole
 (`DONE "Sunny Stud"` → parser `[0]='Sunny Stud'`). Name bug CLOSED.
