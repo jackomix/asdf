@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+const char *gds_vis(const char *s, char *buf, size_t cap);
 
 /* Where the game data lives at runtime (argv[1], or the launcher's cwd). */
 extern char gds_gamedir[1024];

@@ -4,6 +4,45 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.3-backpress (echo killed by mechanism, not detection; OSK CR; key hunt)
+**Echo fix done right this time (user called out the matcher as inelegant —
+they were right).** The 0.95.2 content-fingerprint never fired on-device
+anyway: FMOD's re-mixed restart audio is 99.9% identical, NOT bit-exact, so
+the exact-hash pattern could never match, and a fuzzy matcher carried
+false-positive risk. Replaced with plain **AudioTrack-style backpressure**:
+the fmod pump may now queue at most **8192B (~85ms)** of mixed audio ahead
+of the speaker (was ~40960B/232ms). The game double-starts the title BGM on
+real Android too (see 0.95.2 analysis) — inaudible there only because
+Android's write call blocks the mixer thread at ~1-2 buffers. With a small
+queue the restart seam is as short as a phone's, for EVERY game, no
+sniffing. The 0.95.2 mechanism analysis remains correct and stays below;
+only the fix changed. Removed: `echo_restart_check` entirely.
+
+- **"Extra space" in naming — SOLVED BY NAME:** the 0.95.2 boot log's
+  rawtail hex shows `53 74 75 64 69 6f 73 0d` = `"Studios" + CR (0x0d)`. It
+  was never a space: the bitmap font draws the control byte as an empty
+  cell ("blank, then cursor"), and printing it raw made the log line
+  overwrite itself — the real source of every "interleave garble" all
+  along. Trim now strips `<0x20` from the prefill; all OSK/DONE/wire log
+  prints escape control bytes (`gds_vis`). The game re-saves whatever DONE
+  returns, so one clean naming removes the CR from the save permanently.
+- **SELECT/START hunt, final chapter:** 0.95.2 boot dump proves the
+  GO-Super Gamepad node does NOT expose 0x13a/0x13b (keys: `0x130 0x131
+  0x133 0x134 0x136-0x139 0x220-0x223 0x2c0-0x2c4`), odroidgo3-keys has
+  `0x72 0x73`, and the SDL layer never surfaces SELECT/START either
+  (first-press roll: only A, D-pad, R1 arrived). New: a raw evdev
+  **transition logger** (`[input] evkey … 0xNNN DOWN`) watches every
+  advertised code on every node — one press of the physical buttons names
+  the codes, then `GDS_QUITCHORD_KEYS` binds them (no rebuild).
+- **Loudness/clipping report — measured, not guessed:** user PCM captures
+  show the music itself peaks at **-7dBFS (14655/32767), RMS -22dBFS, zero
+  clipped samples**; our chain adds 0.64 gain (now 0.56) and a soft-limiter
+  whose knee (28000) is never reached — digital clipping in our chain is
+  mathematically excluded for the music. Trimmed default music volume
+  0.8 → 0.70 and added `GDS_MUSIC_VOL` (0.05..1.5) so the user can A/B on
+  device; music START/STOP lines now carry `peak=N/32767` as a witness.
+  If it still distorts at these levels it's the codec/speaker, not us.
+
 ## 0.95.2-echofix (music intro echo SOLVED from user PCM captures + fixed)
 **The echo mystery is closed with hard data.** The user uploaded the 0.95.0
 captures (`echo_prod.pcm` = what FMOD's mixer pushed, `echo_play.pcm` = what

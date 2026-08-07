@@ -130,6 +130,21 @@ static char g_title[96];
 static int  g_maxlen = 16;
 static int  g_sel, g_upper, g_latch;
 
+/* 0.95.3: control bytes in user/game text can redraw a printed log line
+ * over itself -- that is exactly how "Sunny Studios\r" kept turning our
+ * own diagnostics into scrambled fragments.  Escape control bytes in any
+ * string we print ("\x0d"). */
+const char *gds_vis(const char *s, char *buf, size_t cap)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && o + 6 < cap; p++) {
+        if (*p >= 0x20) { buf[o++] = (char)*p; }
+        else o += (size_t)snprintf(buf + o, cap - o, "\\x%02x", *p);
+    }
+    buf[o] = 0;
+    return buf;
+}
+
 static void text_copy(char *dst, size_t cap, const char *src)
 {
     if (!src)
@@ -184,7 +199,13 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
         n = strlen(g_text);
         if (n == 0) break;
         unsigned char *u = (unsigned char *)g_text;
-        if (u[n - 1] == ' ' || u[n - 1] == '\t') {          /* ASCII */
+        /* 0.95.3: DEVICE-NAMED the "extra space" -- the rawtail bytes in
+         * the 0.95.2 boot log were 53 74 75 64 69 6f 73 0d = "Studios" +
+         * CR (0x0d).  Not a space: no amount of "space trim" could remove
+         * it, the bitmap font drew it as an empty cell ("blank, then
+         * cursor"), and printing it raw made the log line overwrite itself
+         * (the real cause of every "interleave garble"). */
+        if (u[n - 1] == ' ' || u[n - 1] < 0x20) {          /* blank/ctrl */
             u[--n] = 0; trimmed++; continue;
         }
         if (n >= 2 && u[n - 2] == 0xC2 && u[n - 1] == 0xA0) /* U+00A0 NBSP */
@@ -202,13 +223,16 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
     g_upper = n == 0 || g_text[n - 1] == ' ';
     g_done = 0;
     g_ok = 0;
-    /* ONE flockfile'd line: 0.95.0's two-part print interleaved with the
-     * jni-side arrival line ("maxlen=144)=...") and proved nothing. */
+    /* ONE flockfile'd line, text escaped so a control byte can no longer
+     * redraw the log over itself (see the CR note above). */
+    char vis_title[128], vis_text[160];
     flockfile(stderr);
     fprintf(stderr, "[osk] open title=\"%s\" rawlen=%zu rawtail=[%s] -> "
                     "text(%zu)=\"%s\" maxlen=%d%s\n",
-            g_title, rawlen, tailhex, n, g_text, g_maxlen,
-            trimmed ? " (trailing blank(s) trimmed)" : "");
+            gds_vis(g_title, vis_title, sizeof vis_title),
+            rawlen, tailhex, n,
+            gds_vis(g_text, vis_text, sizeof vis_text), g_maxlen,
+            trimmed ? " (trailing junk trimmed)" : "");
     fflush(stderr);
     funlockfile(stderr);
 }
@@ -265,8 +289,12 @@ static void vk_commit(void)
     g_open = 0;
     g_done = 1;
     g_ok = 1;
-    fprintf(stderr, "[osk] DONE text=\"%s\"\n", g_text);
+    char vis[160];
+    flockfile(stderr);
+    fprintf(stderr, "[osk] DONE text=\"%s\"\n",
+            gds_vis(g_text, vis, sizeof vis));
     fflush(stderr);
+    funlockfile(stderr);
 }
 
 static void vk_cancel(void)

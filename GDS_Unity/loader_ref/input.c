@@ -194,6 +194,74 @@ static const char *const g_npb_names[] = {
     "A/east", "B/south", "X/north", "Y/west", "L1", "R1",
     "SELECT", "START", "L3", "R3", "D-UP", "D-DOWN", "D-LEFT", "D-RIGHT" };
 
+/* 0.95.3 raw evdev transition logger: once per boot the scan (below) saves
+ * each node + its advertised EV_KEY codes here; the logger thread then
+ * polls EVIOCGKEY on every node and prints every transition.  One press
+ * of the physical SELECT / START names their true codes outright (SDL
+ * never surfaces either on this unit, per the 0.95.2 first-press roll). */
+static void keylog_start(void);
+#define KEYLOG_NODES 6
+struct keylog_node {
+    char path[40];
+    char name[128];
+    unsigned short codes[24];
+    int ncodes;
+    int fd;
+    uint32_t state[24];
+};
+static struct keylog_node g_keylog[KEYLOG_NODES];
+static int g_keylog_n;
+
+static void *keylog_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        for (int n = 0; n < g_keylog_n; n++) {
+            struct keylog_node *kn = &g_keylog[n];
+            if (kn->fd < 0) {
+                if (!kn->ncodes) continue;
+                kn->fd = open(kn->path, O_RDONLY | O_NONBLOCK);
+                if (kn->fd < 0) { kn->ncodes = 0; continue; }
+                unsigned char keys[(KEY_MAX + 8) / 8];
+                memset(keys, 0, sizeof keys);
+                if (ioctl(kn->fd, EVIOCGKEY(sizeof keys), keys) == 0)
+                    for (int i = 0; i < kn->ncodes; i++)
+                        kn->state[i] =
+                            !!(keys[kn->codes[i] / 8] &
+                               (1 << (kn->codes[i] % 8)));
+            }
+            unsigned char keys[(KEY_MAX + 8) / 8];
+            memset(keys, 0, sizeof keys);
+            if (ioctl(kn->fd, EVIOCGKEY(sizeof keys), keys) < 0) {
+                close(kn->fd);
+                kn->fd = -1;
+                continue;
+            }
+            for (int i = 0; i < kn->ncodes; i++) {
+                unsigned now =
+                    !!(keys[kn->codes[i] / 8] & (1 << (kn->codes[i] % 8)));
+                if (now != kn->state[i]) {
+                    kn->state[i] = now;
+                    fprintf(stderr, "[input] evkey %s '%s' 0x%03x %s\n",
+                            kn->path, kn->name, kn->codes[i],
+                            now ? "DOWN" : "up");
+                    fflush(stderr);
+                }
+            }
+        }
+        usleep(30000);
+    }
+    return NULL;
+}
+
+static void keylog_start(void) {
+    static int started = 0;
+    if (started) return;
+    started = 1;
+    pthread_t pt;
+    if (pthread_create(&pt, NULL, keylog_thread, NULL) == 0)
+        pthread_detach(pt);
+}
+
 static long watch_mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -251,6 +319,26 @@ static int evdev_find_gamepad(void) {
             kb[ko] = 0;
             fprintf(stderr, "[input]   keys: %s%s\n",
                     ko ? kb : "(no EV_KEY codes)", overflow ? " ...(more)" : "");
+            /* 0.95.3: remember the node + its advertised codes for the raw
+             * transition logger (below).  The 0.95.2 boot dump proved this
+             * handheld's SELECT/START are NOT on any advertised-SDL path:
+             * the GO-Super node lacks 0x13a/0x13b, so the real codes are
+             * among the unlabeled ones (0x220..0x223 / 0x2c0..0x2c4) or on
+             * the odroidgo3-keys node -- only watching live transitions
+             * tells them apart. */
+            if (g_keylog_n < KEYLOG_NODES) {
+                struct keylog_node *kn = &g_keylog[g_keylog_n++];
+                snprintf(kn->path, sizeof kn->path, "%s", path);
+                snprintf(kn->name, sizeof kn->name, "%s", name);
+                int nb = 0;
+                for (int kc = 0; kc <= KEY_MAX && nb < (int)(sizeof kn->codes); kc++) {
+                    if ((keybits[kc / (8 * sizeof(long))] >>
+                         (kc % (8 * sizeof(long)))) & 1)
+                        kn->codes[nb++] = kc;
+                }
+                kn->ncodes = nb;
+                kn->fd = -1;
+            }
         }
         if (have_sel && have_sta) {
             char name[128] = { 0 };
@@ -362,6 +450,7 @@ static void pad_watch_start(void) {
     pthread_t pt;
     if (pthread_create(&pt, NULL, pad_watch_thread, NULL) == 0)
         pthread_detach(pt);
+    keylog_start();   /* 0.95.3: raw SELECT/START code hunt (transitions) */
 }
 
 static int input_on(void) {

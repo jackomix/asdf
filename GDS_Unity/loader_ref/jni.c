@@ -2868,10 +2868,16 @@ static int64_t j_kairo_InputPanel(jctx *c)
             if (ho) tailhex[ho - 1] = 0;
             else tailhex[0] = 0;
         }
+        /* 0.95.3: escape control bytes (the CR in the stored name kept
+         * redrawing this log line over itself). */
+        char vis_title[128], vis_text[160];
         flockfile(stderr);
         fprintf(stderr, "[osk] Utility.%s%s title=\"%s\" text(%zu)=\"%s\" "
                         "tail=[%s] nstr=%d nnum=%d max=%d\n",
-                name, sig, title, tl, text, tailhex, no, ni, maxlen);
+                name, sig,
+                gds_vis(title, vis_title, sizeof vis_title), tl,
+                gds_vis(text, vis_text, sizeof vis_text),
+                tailhex, no, ni, maxlen);
         fflush(stderr);
         funlockfile(stderr);
         gds_osk_open(title, text, maxlen);
@@ -2916,9 +2922,10 @@ static int64_t j_kairo_InputPanel(jctx *c)
                 }
                 arr->elems[1] = mk_string(gds_osk_text());
             }
+            char vis_r[160];
             fprintf(stderr, "[osk] Utility.%s%s -> { %s, \"%s\" }\n",
                     name, sig, gds_osk_result_ok() ? "\"positive\"" : "null",
-                    gds_osk_text());
+                    gds_vis(gds_osk_text(), vis_r, sizeof vis_r));
             fflush(stderr);
             return (int64_t)(uintptr_t)arr;
         }
@@ -2926,12 +2933,17 @@ static int64_t j_kairo_InputPanel(jctx *c)
          * parser strips first+last char, so a bare reply would lose them.
          * NULL stays NULL: the cancel path never reaches the parser. */
         jobj *s = gds_osk_result_ok() ? mk_kairo_packed1(gds_osk_text()) : NULL;
+        char vis_t[160], vis_w[192];
+        flockfile(stderr);
         fprintf(stderr, "[osk] Utility.%s%s -> %s\"%s\"%s%s\n", name, sig,
                 gds_osk_result_ok() ? "" : "(null) ",
-                gds_osk_result_ok() ? gds_osk_text() : "canceled",
+                gds_osk_result_ok()
+                    ? gds_vis(gds_osk_text(), vis_t, sizeof vis_t) : "canceled",
                 gds_osk_result_ok() ? " wire=" : "",
-                gds_osk_result_ok() && s ? (const char *)s->str : "");
+                gds_osk_result_ok() && s
+                    ? gds_vis((const char *)s->str, vis_w, sizeof vis_w) : "");
         fflush(stderr);
+        funlockfile(stderr);
         return (int64_t)(uintptr_t)s;
     }
     /* One log per unknown member name (the isInputPanelFinish-per-frame

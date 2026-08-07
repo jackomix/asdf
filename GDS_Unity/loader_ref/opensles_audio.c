@@ -343,115 +343,6 @@ static uint32_t ring_read(AudioPlayer *p, void *data, uint32_t len) {
     return len;
 }
 
-/* ------------------------------------------------ intro echo (restart seam)
- * 0.95.2 -- VERIFIED MECHANISM (user-supplied echo_prod/play.pcm from the
- * 0.95.0 build, offline xcorr):
- *   - prod == play BYTE-EXACT in the 5.07s overlap => the ring repeats
- *     nothing; the echoed PCM is emitted by fmodProcess itself.
- *   - play/self-match: play[0:0.2s] repeats at 0.3628s (ncc=0.999) and the
- *     same 8708-sample lag holds through 0.6s => the speaker heard
- *     stream[0:0.3628s] then the SAME STREAM FROM OFFSET 0: the game
- *     double-starts the title BGM (~16 content blocks, one silent block,
- *     restart), like it does on real Android.  There the restart is
- *     inaudible because the mixer backlog is tiny and drains in real time;
- *     here the first run had stacked ~33800B (0.35s) of unread backlog, all
- *     of which played before the restarted stream began = the audible echo.
- *   - "first piece length varies per boot": it is exactly however much of
- *     run #1 piled up before the game's second start -- race-dependent.
- *
- * Fix (content-verified, acts only on THE repeat): the quantum-hash session
- * probe (hashes of the first 128 pushed quanta after >=2s of content
- * silence) already detects the opening pattern reappearing; on the hit we
- * now RE-ALIGN the ring: drop the unread stale run-1 bytes pushed before
- * the restart (ring pos qw[j-1]) AND skip the restart stream forward by the
- * amount the listener already heard since session start -- so what plays is
- * a seamless stream[heard:...] with zero repeated audio.
- */
-static int echo_restart_check(AudioPlayer *p,
-                              const unsigned char *pcm, uint32_t written)
-{
-    static uint32_t qh[128], qw[128];
-    static int qn, acted;
-    static uint32_t sess_tail0;
-    static struct timespec lastp;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long gap = lastp.tv_sec
-        ? (now.tv_sec - lastp.tv_sec) * 1000 +
-          (now.tv_nsec - lastp.tv_nsec) / 1000000 : 9999;
-    if (gap >= 2000) {          /* content-silence boundary: new session */
-        qn = 0;
-        acted = 0;
-        sess_tail0 = p->ring_tail;
-        fprintf(stderr,
-                "[audio] echo-probe: stream session start (gap %ldms)\n", gap);
-        fflush(stderr);
-    }
-    lastp = now;
-    uint32_t h = 5381;
-    for (unsigned i = 0; i + 4 <= written; i += 4)
-        h = (h * 33u) ^ *(const uint32_t *)(const void *)(pcm + i);
-    if (qn >= 128) return 0;
-    qh[qn] = h;
-    qw[qn] = p->ring_head;      /* absolute ring pos AFTER this push */
-    qn++;
-    if (qn < 17 || acted) return 0;
-    /* find the opening 8-quantum pattern (~170ms) reappearing at j >= 8 */
-    int k = -1;
-    int jmax = qn - 8 < 120 ? qn - 8 : 120;
-    for (int j = 8; j <= jmax; j++) {
-        int ok = 1;
-        for (int m = 0; m < 8; m++)
-            if (qh[j + m] != qh[m]) { ok = 0; break; }
-        if (ok) { k = j; break; }
-    }
-    if (k < 0) {
-        if (qn == 128)
-            fprintf(stderr, "[audio] echo-probe: no repeat in first 2.7s"
-                            " of this session (clean)\n");
-        return 0;
-    }
-    acted = 1;
-    /* restart began with quantum k; run-1 content = everything before
-     * qw[k-1].  Heard-so-far = consumed since session start. */
-    uint32_t restart0 = qw[k - 1];
-    for (int tries = 0; tries < 4; tries++) {
-        uint32_t tail_obs = p->ring_tail;
-        uint32_t head_obs = p->ring_head;
-        uint32_t heard = tail_obs - sess_tail0;          /* wrap-safe */
-        uint32_t avail_restart = head_obs - restart0;
-        uint32_t skip = heard < avail_restart ? heard : avail_restart;
-        uint32_t target = restart0 + skip;
-        if (target <= tail_obs) {
-            /* listener already at/past the aligned seam (or the ring had
-             * nothing stale): nothing to drop. */
-            fprintf(stderr,
-                    "[audio] intro-echo: game restarted the music (quantum "
-                    "%d, ~%ums in) -- listener already at the seam, no "
-                    "backlog dropped\n", k, k * 21);
-            fflush(stderr);
-            return 0;
-        }
-        if (__sync_bool_compare_and_swap(&p->ring_tail, tail_obs, target)) {
-            fprintf(stderr,
-                    "[audio] intro-echo fix: game double-started the music "
-                    "(repeat at quantum %d, ~%ums in) -- dropped %uB stale "
-                    "run-1 backlog, skipped %uB already-heard (seam was at "
-                    "%.0fms of the track)\n",
-                    k, k * 21, restart0 - tail_obs, target - restart0,
-                    heard * 1000.0 / 96000.0);
-            fflush(stderr);
-            return 1;
-        }
-    }
-    fprintf(stderr,
-            "[audio] intro-echo: restart detected (quantum %d) but the "
-            "consumer kept racing the realign -- nothing dropped\n", k);
-    fflush(stderr);
-    return 0;
-}
-
-
 static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
     (void)userdata;
     memset(stream, 0, (size_t)len);
@@ -1551,7 +1442,20 @@ static void *fmod_java_thread(void *arg)
                 g_fmod_player->num_channels    = (SLuint32)eff_ch;
                 g_fmod_player->bits_per_sample = 16;
                 g_fmod_player->play_state      = SL_PLAYSTATE_PLAYING;
-                g_fmod_player->volume          = 0.8f;
+                /* 0.95.3 (user: music now sounds too loud/clip-ish): the
+                 * source itself peaks at -7dBFS and our soft-limiter knee
+                 * (28000) is never reached, so digital clipping in our chain
+                 * can't happen for the music; most likely the device
+                 * speaker/amp is distorting at loud levels.  Trim default
+                 * 0.8 -> 0.70 (-1.2dB) and make it knob-able so the user
+                 * can A/B it WITHOUT a rebuild: GDS_MUSIC_VOL=0.6 etc. */
+                float mv = 0.70f;
+                const char *emv = getenv("GDS_MUSIC_VOL");
+                if (emv) {
+                    float v = (float)atof(emv);
+                    if (v >= 0.05f && v <= 1.5f) mv = v;
+                }
+                g_fmod_player->volume          = mv;
             }
             ensure_audio_initialized();
             fprintf(stderr, "[audio] fmod-thread: pumping (rate=%u ch=%u blockframes=%d bufsize=%d%s)\n",
@@ -1566,12 +1470,24 @@ static void *fmod_java_thread(void *arg)
          * treated 0 as "no data" and never wrote a byte. */
         unsigned bufsz = (unsigned)gds_jni_fmod_buffer_size();
         if (!bufsz) bufsz = 8192;
-        /* pace like AudioTrack.write(): it blocks while the track is full.
-         * Keep ~5 blocks queued (~232ms worst-case click latency) instead
-         * of the old 'grow until 4MB ring is nearly full' throttle, which
-         * would have stacked up ~24s of audio lag. */
+        /* 0.95.3 echo fix, the mechanical way (replaces 0.95.2's content
+         * matching, which never fired on-device: FMOD's re-emitted audio is
+         * 99.9% same, not bit-exact).  VERIFIED mechanism from the user's
+         * PCM captures: the game DOUBLE-STARTS the title BGM ~17 blocks in
+         * (normal; real Android does it too -- but there AudioTrack.write()
+         * blocks the mixer thread once ~1-2 buffers are queued, so at the
+         * restart only a few ms of run #1 is still unplayed = inaudible).
+         * Here the first run stacked 33800B (~0.35s) of unread backlog
+         * BECAUSE this pacing let it: that backlog, played before the
+         * restarted stream, WAS the echo (length varies per boot = however
+         * much pile-up the race allowed, exactly the user's report).
+         * So: hard backpressure like AudioTrack -- never let more than
+         * 8192B (~85ms) of mixed audio sit unplayed.  The game can restart
+         * the music all it wants; the seam can never be longer than the
+         * queue.  No content sniffing, no prediction, and it holds for
+         * every future Kairosoft game, not just this song. */
         while (g_fmod_player &&
-               ring_readable(g_fmod_player) >= bufsz * 5) {
+               ring_readable(g_fmod_player) >= 8192) {
             if (!gds_jni_fmod_should_run()) break;
             usleep(4000);
         }
@@ -1625,11 +1541,6 @@ static void *fmod_java_thread(void *arg)
                 ring_write(g_fmod_player, pcm, written);
                 echo_capture(g_echo_prod, &g_echo_prod_n, pcm, written);
                 echo_flush_if_full();
-                /* 0.95.2 game double-start realignment (see
-                 * echo_restart_check): detects the verified session-opening
-                 * repeat pattern and cuts the ring seam so nothing repeats
-                 * audibly.  Replaces 0.93's log-only fingerprint probe. */
-                echo_restart_check(g_fmod_player, pcm, written);
             }
             blocks++;
             /* music start/stop transitions are always interesting; the
@@ -1639,9 +1550,13 @@ static void *fmod_java_thread(void *arg)
                 static int wr_on = 0;
                 int now_on = written != 0;
                 if (now_on != wr_on) {
-                    fprintf(stderr, "[audio] music %s at block #%lu (wr=%uB, fill=%u)\n",
+                    /* peak= ... 0.95.3 loudness witness: the per-block peak
+                     * of what FMOD mixed, so the next 'clip-ish' report can
+                     * be checked against the actual digital level. */
+                    fprintf(stderr, "[audio] music %s at block #%lu (wr=%uB, fill=%u, peak=%d/32767)\n",
                             now_on ? "START" : "STOP ", blocks, written,
-                            g_fmod_player ? ring_readable(g_fmod_player) : 0);
+                            g_fmod_player ? ring_readable(g_fmod_player) : 0,
+                            peak);
                     fflush(stderr);
                     wr_on = now_on;
                 }
