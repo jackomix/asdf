@@ -221,6 +221,11 @@ static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_audio_dev = 0;
 static int g_audio_initialized = 0;
 static volatile int g_pump_thread_on = 0;
+/* set when the audio device is deliberately torn down (engine destroy /
+ * gds_audio_stop at shutdown): the pump-thread open retry must NOT
+ * resurrect audio afterwards -- 0.93.2 logged a fresh "late audio open
+ * succeeded" while the process was already exiting. */
+static volatile int g_audio_quit = 0;
 static sdl_spec_t g_audio_want;          /* kept for late-open retries (0.93.2) */
 static volatile int g_audio_open_total = 0;   /* open attempts so far           */
 
@@ -587,7 +592,7 @@ static void *sl_pump_thread(void *arg) {
             !g_audio_dev);
     long last_try = 0;
     for (;;) {
-        if (!g_audio_dev) {
+        if (!g_audio_dev && !g_audio_quit) {
             long now = audio_mono_ms();
             if (now - last_try >= 2000) {
                 last_try = now;
@@ -1082,6 +1087,7 @@ static SLresult engine_obj_GetInterface(void *self, SLInterfaceID iid,
 
 static void engine_obj_Destroy(void *self) {
     (void)self;
+    g_audio_quit = 1;
     if (g_audio_dev && p_SDL_CloseAudioDevice) {
         p_SDL_CloseAudioDevice(g_audio_dev);
         g_audio_dev = 0;
@@ -1557,6 +1563,7 @@ int gds_audio_start(void *env) {
 }
 
 void gds_audio_stop(void) {
+    g_audio_quit = 1;
     if (g_audio_dev && p_SDL_CloseAudioDevice)
         p_SDL_CloseAudioDevice(g_audio_dev);
     g_audio_dev = 0;

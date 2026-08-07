@@ -4,6 +4,46 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.94.0-wirepack (name fix, proven from the original dex — no guessing)
+**Symptom fixed:** typed name lost its first and last character
+(`qwsaderdf` → game stored `wsaderd`).
+
+**Root cause (fully decoded 2026-08-07):** the game's managed parser
+(libil2cpp `0x1810a7c` split by `,` + `0x18102b0` per-field unescape) strips
+exactly the first and last character of every field — it expects the reply
+PRE-WRAPPED. The wrapping is done by the Java plugin, read straight from
+`classes.dex` (extracted from `APKs/Game Dev Story_2.6.9.apk`,
+`kairo/android/plugin/util/StringUtil`):
+- `escape(s)` = `"` + *s with every `,` `&` `@` `\` prefixed by a backslash* + `"`
+  (special set = static field `ESCAPES = ",&@\\"`).
+- `getString(String[])` = fields joined by `,`. (2D joins rows by `&`,
+  3D blocks by `@`.)
+- `unescape(s)` = strips first+last char; on any ESCAPES char takes the
+  following char literally. **Byte-for-byte the same algorithm as the
+  managed `0x18102b0`** — the format is a cross-side contract.
+- `Utility.getInputPanelResult()` returns `StringUtil.getString(fepPanel.result_)`
+  (or `getString(new String[]{null, ""})` = `"",""` when the panel is gone).
+
+**Fix:** `mk_kairo_packed1()` in jni.c packs the OSK result like the real
+`escape()`. NULL (cancel) stays NULL. The dispatch-ring forensics from 0.86
+stay; the string-conversion probes stay armed via `GDS_TRAP_AT`.
+
+**Retraction (user-confirmed 2026-08-07):** "game self-Terminates ~15s after
+naming" was a misread — the user quit normally through the in-game menu.
+`IApplication.Terminate` + `Unity requested render-loop stop` + exit 0 IS the
+signature of a normal quit, not a crash. The ~40-NRE storm before it is the
+background GCM lookup: `Utility.getGCMRegistrationId()` reads preference
+`_registration_id` and returns null when absent — real phones without Play
+Services behave the same and the managed side catches+retries. Cosmetic
+noise; if wanted later, serve a synthetic stable id from that preference key.
+
+**Also in 0.94.0:**
+- OSK: removed the appended `_` caret from the drawn text — the user reads
+  it as a stray trailing space ("extra space at the end by default").
+- Audio: `g_audio_quit` flag gates the pump-thread open-retry; teardown
+  (`engine_obj_Destroy`, `gds_audio_stop`) sets it so audio no longer
+  resurrects during shutdown ("late audio open succeeded" while exiting).
+
 ## Works
 - Display + ES3 context, landscape-forced, gamepad (no cursor; native pad).
 - Audio: FMOD AudioTrack path reverse-engineered. Mix clock 24000Hz stereo s16;
@@ -16,7 +56,14 @@ Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 - Save system (RecordStore across `home/Android/data/...`); deploy preserves
   `gds_env.cfg` between redeploys (knobs now sticky).
 
-## Music intro echo — FIXED in 0.92 (preroll gate, verify on device)
+## Music intro echo — still heard on device (0.93.2): NOT an exact-prefix repeat
+The 0.93.2 fingerprint probe logged `no repeat in first 2.7s -- repeat must be
+earlier than 8 quanta or consumer-side`, yet the user still hears the intro
+restart. Next experiment: dump the first ~400 KB of the fmod stream session
+to `echo_session.pcm` in the game dir (24000Hz stereo s16), ship it, and
+cross-correlate offline — catches restarts whose mixing offset is not
+21ms-aligned (the strict fingerprint can't see those).
+### 0.92 preroll gate (partial mitigation, kept)
 Mechanism: ring empty when a song starts; first replenishing quantum was
 consumed while still underrun → opening ~1s audibly restarted.
 Fix shipped: `sdl_audio_callback` rearms a 2-quantum gate (4096B) on every

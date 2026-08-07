@@ -88,6 +88,29 @@ static jobj *mk_string(const char *s)
     return o;
 }
 
+/* kairo plugin wire format, verbatim from the 2.6.9 classes.dex
+ * (kairo/android/plugin/util/StringUtil): a reply is comma-joined fields,
+ * each produced by escape(s) = '"' + s + '"' with every , & @ \ prefixed
+ * by a backslash (ESCAPES = ",&@\\").  The game's managed parser is the
+ * exact mirror (libil2cpp 0x1810a7c split(',') + 0x18102b0 unescape:
+ * strip first+last char, skip-next on ESCAPES), so a BARE reply loses its
+ * first and last character -- 0.93.2 device run: typed "qwsaderdf", game
+ * got "wsaderd".  Pack any string result that flows through that parser. */
+static jobj *mk_kairo_packed1(const char *text)
+{
+    char buf[1024];
+    size_t n = 0;
+    buf[n++] = '"';
+    for (const char *p = text ? text : ""; *p && n + 3 < sizeof buf; p++) {
+        if (*p == ',' || *p == '&' || *p == '@' || *p == '\\')
+            buf[n++] = '\\';
+        buf[n++] = *p;
+    }
+    buf[n++] = '"';
+    buf[n] = 0;
+    return mk_string(buf);
+}
+
 static jobj *mk_object(const char *cls)
 {
     return new_obj(O_OBJECT, cls);
@@ -2881,10 +2904,15 @@ static int64_t j_kairo_InputPanel(jctx *c)
             fflush(stderr);
             return (int64_t)(uintptr_t)arr;
         }
-        jobj *s = gds_osk_result_ok() ? mk_string(gds_osk_text()) : NULL;
-        fprintf(stderr, "[osk] Utility.%s%s -> %s\"%s\"\n", name, sig,
+        /* Pack in the plugin wire format (mk_kairo_packed1) -- the managed
+         * parser strips first+last char, so a bare reply would lose them.
+         * NULL stays NULL: the cancel path never reaches the parser. */
+        jobj *s = gds_osk_result_ok() ? mk_kairo_packed1(gds_osk_text()) : NULL;
+        fprintf(stderr, "[osk] Utility.%s%s -> %s\"%s\"%s%s\n", name, sig,
                 gds_osk_result_ok() ? "" : "(null) ",
-                gds_osk_result_ok() ? gds_osk_text() : "canceled");
+                gds_osk_result_ok() ? gds_osk_text() : "canceled",
+                gds_osk_result_ok() ? " wire=" : "",
+                gds_osk_result_ok() && s ? (const char *)s->str : "");
         fflush(stderr);
         return (int64_t)(uintptr_t)s;
     }

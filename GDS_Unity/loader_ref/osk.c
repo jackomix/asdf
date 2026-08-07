@@ -377,7 +377,9 @@ void gds_osk_draw(void)
     size_t tl = strlen(t);
     if ((int)tl * 24 > 900)
         t += tl - (900 / 24);
-    snprintf(shown, sizeof shown, "%s_", t);
+    /* no caret: the user reads the appended "_" as a stray space
+     * ("extra space at the end by default" / "I don't want a cursor"). */
+    snprintf(shown, sizeof shown, "%s", t);
     vk_text(sw, sh, 190, 323, shown, 4, 0.98f, 0.91f, 0.58f);
     for (int i = 0; i < VK_NKEYS; i++) {
         const struct vk_key *key = &vk_keys[i];
