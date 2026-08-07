@@ -227,6 +227,50 @@ static volatile int g_pump_thread_on = 0;
  * succeeded" while the process was already exiting. */
 static volatile int g_audio_quit = 0;
 static sdl_spec_t g_audio_want;          /* kept for late-open retries (0.93.2) */
+
+/* 0.95.0 boot-music repeat forensics: the user hears the first piece of the
+ * theme replay, with the piece length VARYING per boot (= timing race, not
+ * game data).  Capture what FMOD produces AND what SDL actually plays of
+ * the first stream session into RAM, then dump both to files once the
+ * producer has 512KB (~10.9s) -- offline byte-exact comparison tells us
+ * whether the repeat happens in our ring/consumer or upstream in FMOD.
+ * 24000Hz stereo s16, no header.  No SD writes on the SDL audio thread. */
+#define ECHO_CAP_BYTES (512 * 1024)
+static uint8_t g_echo_prod[ECHO_CAP_BYTES];
+static uint8_t g_echo_play[ECHO_CAP_BYTES];
+static volatile unsigned g_echo_prod_n = 0;   /* bytes captured so far */
+static volatile unsigned g_echo_play_n = 0;
+static int g_echo_flushed = 0;                /* one session per boot */
+
+static void echo_capture(uint8_t *dst, volatile unsigned *cnt,
+                         const void *src, unsigned n)
+{
+    if (g_echo_flushed) return;
+    unsigned c = *cnt;
+    if (c >= ECHO_CAP_BYTES) return;
+    if (n > ECHO_CAP_BYTES - c) n = ECHO_CAP_BYTES - c;
+    if (n) memcpy(dst + c, src, n);
+    *cnt = c + n;
+}
+
+extern char gds_gamedir[1024];
+
+static void echo_flush_if_full(void)
+{
+    if (g_echo_flushed || g_echo_prod_n < ECHO_CAP_BYTES) return;
+    g_echo_flushed = 1;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/echo_prod.pcm", gds_gamedir);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(g_echo_prod, 1, ECHO_CAP_BYTES, f); fclose(f); }
+    snprintf(path, sizeof path, "%s/echo_play.pcm", gds_gamedir);
+    f = fopen(path, "wb");
+    if (f) { fwrite(g_echo_play, 1, g_echo_play_n, f); fclose(f); }
+    fprintf(stderr, "[audio] echo-capture: dumped prod=%uB play=%uB to %s/echo_{prod,play}.pcm"
+                    " (24000Hz stereo s16) -- ship this file for intro-echo analysis\n",
+            g_echo_prod_n, (unsigned)g_echo_play_n, gds_gamedir);
+    fflush(stderr);
+}
 static volatile int g_audio_open_total = 0;   /* open attempts so far           */
 
 /* ------------------------------------------------------ ring helpers */
@@ -364,6 +408,8 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
         uint32_t got = ring_read(p, tmp, src_bytes);
         got = (got / frame_size) * frame_size;
         uint32_t src_frames = got / frame_size;
+        if (got && p == g_fmod_player)
+            echo_capture(g_echo_play, &g_echo_play_n, tmp, got);
         if (!src_frames) continue;
         queue_consume(p, got);
         p->played_bytes += got;
@@ -1469,6 +1515,8 @@ static void *fmod_java_thread(void *arg)
             if (g_fmod_player && written) {
                 if (written > bufsz) written = bufsz;
                 ring_write(g_fmod_player, pcm, written);
+                echo_capture(g_echo_prod, &g_echo_prod_n, pcm, written);
+                echo_flush_if_full();
                 /* 0.93 echo attribution: 0.92's preroll gate did NOT kill the
                  * intro echo on device, and our ring is append-only/monotonic
                  * -- it CANNOT repeat audio.  Only FMOD/game re-emitting PCM
@@ -1517,7 +1565,21 @@ static void *fmod_java_thread(void *arg)
                 }
             }
             blocks++;
-            if (blocks <= 4 || blocks % 300 == 0) {
+            /* music start/stop transitions are always interesting; the
+             * periodic block + state dumps are GDS_VERBOSE-only (0.95.0:
+             * they were ~2 lines per second forever). */
+            {
+                static int wr_on = 0;
+                int now_on = written != 0;
+                if (now_on != wr_on) {
+                    fprintf(stderr, "[audio] music %s at block #%lu (wr=%uB, fill=%u)\n",
+                            now_on ? "START" : "STOP ", blocks, written,
+                            g_fmod_player ? ring_readable(g_fmod_player) : 0);
+                    fflush(stderr);
+                    wr_on = now_on;
+                }
+            }
+            if (nx_verbose && (blocks <= 4 || blocks % 300 == 0)) {
                 fprintf(stderr, "[audio] fmod block #%lu (rc=%d %uB wr=%uB, fill=%u, zeros=%u%%, peak=%d)\n",
                         blocks, rc, bufsz, written,
                         g_fmod_player ? ring_readable(g_fmod_player) : 0,
@@ -1526,7 +1588,7 @@ static void *fmod_java_thread(void *arg)
             }
             /* watch the mixer attach: readFromMixer callback appearing
              * (NULL->ptr) marks when the FMOD core joined this output */
-            if (blocks == 1 || blocks % 300 == 0)
+            if (nx_verbose && (blocks == 1 || blocks % 300 == 0))
                 fmod_dump_state("pump");
             err_n = 0;
         } else {

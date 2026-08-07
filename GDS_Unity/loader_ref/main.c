@@ -639,10 +639,36 @@ static void arm_traps(uintptr_t il2b)
         mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
         g_nprobes++;
         if (0) (void)0;
-        { fprintf(stderr, "[trap] armed %s @ il2cpp+%#x\n", T[i].tag, T[i].va); }
+        /* 0.95.0 log diet: ~110 armed lines per boot served their purpose;
+         * verbose-only now. */
+        if (nx_verbose) fprintf(stderr, "[trap] armed %s @ il2cpp+%#x\n", T[i].tag, T[i].va);
     }
 }
 
+
+
+/* 0.95.0 log diet: probes that fire constantly with boot-stable content.
+ * First 2 hits print fully; hit 3+ only under GDS_VERBOSE.  The probes
+ * stay armed and still feed mechanics (step-over etc) -- only the text
+ * dies. */
+static int trap_quiet(const struct probe *pr)
+{
+    static const char *const noisy[] = {
+        "Storage.Open.entry", "GetFolder.basepath", "GetFolder.idx1",
+        "GetFolder.idx2", "GetFolder.substring", "GetFolder.result",
+        "Setup.postOpen", "RecordStore.Setup.store",
+        "storm.raise", "raiseNRE.stub", "rethrow-exobj.stub",
+        "raiseAOREchk.stub", "raiseAOREmsg.stub", "raiseInvalidCast.stub",
+        "Substring.entry", "step-over", "GetNumRecords.files",
+        NULL
+    };
+    extern int nx_verbose;
+    if (nx_verbose) return 0;
+    for (int i = 0; noisy[i]; i++)
+        if (!strcmp(pr->tag, noisy[i]))
+            return pr->hit > 2;
+    return 0;
+}
 
 static void disarm_throw(void)
 {
@@ -729,7 +755,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
             }
             g_in_dump = 1;
             uintptr_t x30 = (uintptr_t)u->uc_mcontext.regs[30];
-            if (p->kind != 13)
+            if (p->kind != 13 && !trap_quiet(p))
                 fprintf(stderr, "\n[trap] hit %s @ il2cpp+%#lx caller=il2cpp+%#lx\n",
                         p->tag, (unsigned long)(p->addr - g_il2b),
                         (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
@@ -868,13 +894,13 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                                             ? mra - g_il2b : mra));
                     }
                 }
-                fprintf(stderr,
+                if (!trap_quiet(p)) fprintf(stderr,
                         "[trap]   NRE[%d] %s.%s ra=il2cpp+%#lx thunk=il2cpp+%#lx\n",
                         p->hit, ns, nm,
                         (unsigned long)(trap_ptr_ok(mra) && mra >= g_il2b ?
                                         mra - g_il2b : mra),
                         (unsigned long)(x30 >= g_il2b ? x30 - g_il2b : x30));
-                if (trap_ptr_ok(spv) && trap_mapped(spv)) {
+                if (!trap_quiet(p) && trap_ptr_ok(spv) && trap_mapped(spv)) {
                     for (int q = 1; q < 8; q++) {
                         uintptr_t v = *(uintptr_t *)(spv + 8 * q);
                         if (!trap_ptr_ok(v))
@@ -995,7 +1021,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 }
             } else if (p->kind == 24) {
                 /* Storage::Open(folder=w0, w1, x2, x3): multi-hit marker */
-                fprintf(stderr,
+                if (!trap_quiet(p)) fprintf(stderr,
                         "[trap]   Storage.Open folder=%ld w1=%ld caller=il2cpp+%#lx\n",
                         (long)u->uc_mcontext.regs[0],
                         (long)u->uc_mcontext.regs[1],
@@ -1005,7 +1031,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 char b1[600];
                 uintptr_t s = (uintptr_t)u->uc_mcontext.regs[20];
                 trap_il2str(s, b1, sizeof b1);
-                fprintf(stderr,
+                if (!trap_quiet(p)) fprintf(stderr,
                         "[trap]   GetFolder: folder(w19)=%ld basepath(x20)='%s'\n",
                         (long)u->uc_mcontext.regs[19], b1);
             } else if (p->kind == 26 || p->kind == 27) {
@@ -1017,13 +1043,13 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                                 ? *(uintptr_t *)rec : 0;
                 char b1[300];
                 trap_il2str(lit, b1, sizeof b1);
-                fprintf(stderr,
+                if (!trap_quiet(p)) fprintf(stderr,
                         "[trap]   GetFolder: %s=%ld literal='%s'\n",
                         p->kind == 26 ? "idx1" : "idx2",
                         (long)(int)u->uc_mcontext.regs[0], b1);
             } else if (p->kind == 28) {
                 /* Substring(x0=this, w1=start, w2=len) call site */
-                fprintf(stderr,
+                if (!trap_quiet(p)) fprintf(stderr,
                         "[trap]   GetFolder: Substring start=%ld len=%ld\n",
                         (long)(int)u->uc_mcontext.regs[1],
                         (long)(int)u->uc_mcontext.regs[2]);
@@ -1031,7 +1057,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 /* GetFolder shared epilogue: x0 = x20 = final folder string */
                 char b1[600];
                 trap_il2str((uintptr_t)u->uc_mcontext.regs[0], b1, sizeof b1);
-                fprintf(stderr,
+                if (!trap_quiet(p)) fprintf(stderr,
                         "[trap]   GetFolder: result='%s' folder(w19)=%ld\n",
                         b1, (long)u->uc_mcontext.regs[19]);
             } else if (p->kind == 21) {
@@ -1164,8 +1190,12 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                 }
             } else if (p->kind == 33) {
                 /* 0.93.2: NRE-storm forensics.  The ~2s post-naming storm
-                 * (raiseNRE callers il2cpp+0x16e3724/8, twice observed, ends
-                 * in IApplication.Terminate = game suicide) roots in storm
+                 * (raiseNRE callers il2cpp+0x16e3724/8, thrice observed).
+                 * 0.94.0 RETRACTION: it does NOT end in suicide -- the
+                 * IApplication.Terminate in the old logs was the user's own
+                 * in-game menu quit; the storm is the background GCM lookup
+                 * returning null, caught+retried, same as real Android.
+                 * It roots in storm
                  * fn 0x16e3468: the guard at 0x16e3658 jumps HERE (the raise
                  * call at 0x16e3724) when 0xf04490(...) returns NULL.  The
                  * success path never runs, so x9/x10 are stale -- read the
@@ -1173,16 +1203,23 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                  * the success path as query names) straight from globals;
                  * they are double-indirect (cell -> slot -> Il2CppString).
                  * Owner object is x20 (loaded 0x16e360c): dump its class. */
-                char sA[300], sB[300], n1[96], n2[96];
-                for (int which = 0; which < 2; which++) {
-                    uintptr_t c = g_il2b + (which ? 0x1ec9228 : 0x1ec9248);
+                char sA[300], sB[300], n1[96], n2[96], sC[300];
+                for (int which = 0; which < 3; which++) {
+                    uintptr_t c = g_il2b + (which == 0 ? 0x1ec9248 :
+                                            which == 1 ? 0x1ec9228 : 0x1ec9240);
                     uintptr_t slot = trap_mapped(c) ? *(uintptr_t *)c : 0;
                     int ok = trap_ptr_ok(slot) && trap_mapped(slot);
                     trap_il2str(ok ? *(uintptr_t *)slot : 0,
-                                which ? sB : sA, 300);
+                                which == 0 ? sA : which == 1 ? sB : sC, 300);
                 }
-                fprintf(stderr, "[trap]   storm-fn literals: [1ec9248]='%s' [1ec9228]='%s'\n",
-                        sA, sB);
+                /* 0.94.0: the storm is USER-CONFIRMED benign (the game keeps
+                 * running; it's the background GCM reg-id lookup returning
+                 * null, caught+retried like real Android w/o Play Services).
+                 * [1ec9240] = the NAME of the invoke that returns NULL --
+                 * cell adjacent to 'getID' ([1ec9248]); suspect
+                 * 'getGCMRegistrationId' per metadata literal adjacency. */
+                fprintf(stderr, "[trap]   storm-fn literals: [1ec9240]='%s' [1ec9248]='%s' [1ec9228]='%s'\n",
+                        sC, sA, sB);
                 uintptr_t o = (uintptr_t)u->uc_mcontext.regs[20];
                 if (trap_ptr_ok(o) && trap_mapped(o)) {
                     uintptr_t k = *(uintptr_t *)o;
@@ -1510,7 +1547,7 @@ static void run_unity(void)
         }
         uint8_t keep = ((uint8_t (*)(void *, void *))render)(env, player);
         frame++;
-        if (frame <= 10 || frame % 300 == 0)
+        if (nx_verbose && (frame <= 10 || frame % 300 == 0))
             fprintf(stderr, "[gds] frame %lu keep=%u\n", frame, keep);
         if (!keep) {
             fprintf(stderr, "[gds] Unity requested render-loop stop at frame %lu\n",
@@ -1600,7 +1637,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.94.0-wirepack)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.0-quietlog)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */

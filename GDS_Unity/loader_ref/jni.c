@@ -756,6 +756,7 @@ static int32_t j_MonitorExit(void *e, void *o) { (void)e; (void)o; return 0; }
 static int g_strprobe_n;
 static void strprobe(const char *what, jobj *s)
 {
+    if (!nx_verbose) return;   /* 0.95.0 log diet (name fix proven) */
     if (!s || !s->str || s->len < 2 || s->len > 64) return;
     if (g_strprobe_n >= 24) return;
     for (int i = 0; i < s->len; i++)
@@ -2877,7 +2878,8 @@ static int64_t j_kairo_InputPanel(jctx *c)
          * ARE the getInputPanelResult conversion -- which entry point, with
          * what content, answering where the first char goes. */
         g_strprobe_n = 0;
-        fprintf(stderr, "[jni] strprobe window re-armed at %s (cap=24)\n", name);
+        if (nx_verbose)
+            fprintf(stderr, "[jni] strprobe window re-armed at %s (cap=24)\n", name);
         /* Return the shape the CALLER asked for.  The device-proven dex
          * surface (0.85.0) requests getInputPanelResult()Ljava/lang/String;
          * -- a single string (null = canceled).  0.84.x answered with a

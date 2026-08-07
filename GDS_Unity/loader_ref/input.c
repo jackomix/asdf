@@ -173,6 +173,12 @@ static long watch_mono_ms(void) {
 }
 
 static int evdev_find_gamepad(void) {
+    /* 0.94.0 device run: this scan matched NOTHING and said so nowhere --
+     * the chord was dead and the log was silent about why.  Dump the first
+     * pass: every node with its name and the two capability bits. */
+    static int scan_logged = 0;
+    int log_this = !scan_logged;
+    scan_logged = 1;
     char path[40];
     for (int i = 0; i < 32; i++) {
         snprintf(path, sizeof path, "/dev/input/event%d", i);
@@ -188,6 +194,13 @@ static int evdev_find_gamepad(void) {
                         (BTN_SELECT % (8 * sizeof(long)))) & 1;
         int have_sta = (keybits[BTN_START / (8 * sizeof(long))] >>
                         (BTN_START % (8 * sizeof(long)))) & 1;
+        if (log_this) {
+            char name[128] = { 0 };
+            if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0)
+                snprintf(name, sizeof name, "?");
+            fprintf(stderr, "[input] evdev %s '%s' sel=%d start=%d\n",
+                    path, name, have_sel, have_sta);
+        }
         if (have_sel && have_sta) {
             char name[128] = { 0 };
             if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0)
@@ -197,6 +210,9 @@ static int evdev_find_gamepad(void) {
         }
         close(fd);
     }
+    if (log_this)
+        fprintf(stderr, "[input] evdev: no node exposes SELECT+START --"
+                        " chord falls back to SDL pad state\n");
     return -1;
 }
 
@@ -216,12 +232,27 @@ static void *pad_watch_thread(void *arg) {
     int chord_frames = 0;
     long chord_down_ms = 0;
     for (;;) {
+        int down;
         if (fd < 0) {
             fd = evdev_find_gamepad();
-            usleep(2000000);   /* node scan is cheap but don't spin on it */
-            continue;
+            if (fd < 0) {
+                /* 0.94.0: NO evdev node exposed both keys on the R36S --
+                 * mirror the SDL pad state pad_poll() publishes instead
+                 * (0.94.0 log proves the SDL-side chord never fired either:
+                 * SELECT never surfaced as SDL BACK).  Volatile-word reads
+                 * cross-thread are fine for a quit chord.  A wedged frame
+                 * simply freezes g_npb at its last state, which is exactly
+                 * the state we force-quit on. */
+                down = (*(volatile unsigned char *)&g_npb[NPB_BACK] &&
+                        *(volatile unsigned char *)&g_npb[NPB_START]) ? 1 : 0;
+                usleep(100000);   /* 100ms cadence while watching SDL state */
+            } else {
+                usleep(2000000);  /* node scan is cheap but don't spin on it */
+                continue;
+            }
+        } else {
+            down = evdev_chord_down(fd);
         }
-        int down = evdev_chord_down(fd);
         if (down < 0) {        /* node vanished: rescan */
             close(fd);
             fd = -1;
@@ -945,8 +976,10 @@ static unsigned g_kq[12][24];
 static void kq_note(int fam, const char *fn, int id) {
     if (fam < 0 || fam >= 12 || id < 0 || id >= 24) return;
     if (!g_kq[fam][id]++) {
-        fprintf(stderr, "[input] kjoy query: %s(%d)\n", fn, id);
-        fflush(stderr);
+        if (nx_verbose) {
+            fprintf(stderr, "[input] kjoy query: %s(%d)\n", fn, id);
+            fflush(stderr);
+        }
     }
 }
 /* kairo.unity.ui.Canvas virtual joystick layer (2 args: this, id). */
@@ -1198,8 +1231,9 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
         if (!g_patched && frame > 0 && frame % 600 == 0)
             fprintf(stderr, "[input] hooks not installed yet (frame %lu)\n", frame);
     }
-    /* periodic kjoy query histogram (every 1200 frames): what the game asks */
-    if (frame > 0 && frame % 1200 == 0) {
+    /* periodic kjoy query histogram (every 1200 frames): what the game
+     * asks -- GDS_VERBOSE-only (0.95.0 log diet) */
+    if (nx_verbose && frame > 0 && frame % 1200 == 0) {
         static const char *const fam[8] = { "Btn", "Axis", "Down", "Up",
                                             "Press", "Ana", "AnaP", "Hold" };
         /* 0.93: this used the `snprintf(line+p, sizeof line - p, ...)` idiom

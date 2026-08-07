@@ -159,11 +159,21 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
         text_copy(g_text, sizeof g_text, initial);
     size_t n = strlen(g_text);
     if (n > (size_t)g_maxlen) g_text[g_maxlen] = 0;
+    /* The prefill arrives with a trailing space glued on (user-verified
+     * 0.94.0: "Sunny Studios" + one literal space they must backspace out;
+     * the dex plugin copies text_ verbatim into the EditText, so the space
+     * comes from the game data itself).  Nobody wants to delete a space
+     * every naming -- trim trailing spaces from the PREFILL ONLY (never
+     * from typed text). */
+    n = strlen(g_text);
+    size_t trimmed = 0;
+    while (n > 0 && g_text[n - 1] == ' ') { g_text[--n] = 0; trimmed++; }
     g_upper = n == 0 || g_text[n - 1] == ' ';
     g_done = 0;
     g_ok = 0;
-    fprintf(stderr, "[osk] open title=\"%s\" initial=\"%s\" maxlen=%d\n",
-            g_title, g_text, g_maxlen);
+    fprintf(stderr, "[osk] open title=\"%s\" initial(%zu)=\"%s\" maxlen=%d%s\n",
+            g_title, n, g_text, g_maxlen,
+            trimmed ? " (trailing space(s) trimmed)" : "");
     fflush(stderr);
 }
 
@@ -377,9 +387,10 @@ void gds_osk_draw(void)
     size_t tl = strlen(t);
     if ((int)tl * 24 > 900)
         t += tl - (900 / 24);
-    /* no caret: the user reads the appended "_" as a stray space
-     * ("extra space at the end by default" / "I don't want a cursor"). */
-    snprintf(shown, sizeof shown, "%s", t);
+    /* keep the caret: the "no cursor" wish was about the MOUSE pointer,
+     * not this text caret -- and the real trailing space turned out to be
+     * in the prefill text itself (handled at open above). */
+    snprintf(shown, sizeof shown, "%s_", t);
     vk_text(sw, sh, 190, 323, shown, 4, 0.98f, 0.91f, 0.58f);
     for (int i = 0; i < VK_NKEYS; i++) {
         const struct vk_key *key = &vk_keys[i];

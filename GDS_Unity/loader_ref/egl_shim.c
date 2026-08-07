@@ -728,10 +728,15 @@ static void gds_capture_real_egl(void) {
   }
 }
 
-/* 0.61: always-on call trace (stderr; swap/getproc are hot -> capped). */
+/* 0.61: always-on call trace (stderr; swap/getproc are hot -> capped).
+ * 0.95.0: the boot forensics this fed are long done; GDS_VERBOSE-only now
+ * (the MakeCurrent bind/unbind flap escaped the streak dedupe by
+ * alternating two strings and dominated the log). */
+extern int nx_verbose;
 static int g_trc_cap = 400;
 static int g_trc_n = 0;
 static void TR(const char *msg) {
+  if (!nx_verbose) return;
   /* 0.92: identical repeats flood the boot log (Unity re-queries the very
    * same config attrs/surface attribs hundreds of times): show the first of
    * each exact string, then one per 32 with a marker. */

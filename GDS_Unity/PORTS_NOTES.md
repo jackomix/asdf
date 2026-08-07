@@ -4,6 +4,43 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.0-quietlog (user-verified name fix on device; log diet; echo capture)
+**Device-verified in 0.94.0:** the wire-packed name arrives whole
+(`DONE "Sunny Stud"` → parser `[0]='Sunny Stud'`). Name bug CLOSED.
+
+- **Log diet (user request: "can the log not print so much").** Quiet is now
+  the default; `GDS_VERBOSE=1` in gds_env.cfg restores everything. Gated:
+  EGL TR trace (MakeCurrent flap / config-attrib walls), trap-arming lines
+  (~110/boot), periodic fmod block/mixer-state pumps, kjoy query + 1200-frame
+  hit-summaries, JNI string-conversion probe, per-frame render counter.
+  Repeat-fire traps (Storage.Open / GetFolder×5 / NRE stubs / storm.raise /
+  Substring / step-over / GetNumRecords) print their first 2 hits only.
+  Kept always: boot chain, music START/STOP transitions, OSK open/result
+  lines, echo/preroll events, first NREs of a NEW kind, exits/errors.
+- **Music intro echo — capture harness.** Producer (fmodProcess push) and
+  consumer (SDL ring read) both dump the first 512KB after music starts to
+  `<gamedir>/echo_prod.pcm` + `echo_play.pcm` (24000Hz stereo s16, RAM-captured,
+  flushed off the audio thread when full). Compare offline: prod==play ⇒
+  the repeat is upstream (FMOD/game), prod!=play ⇒ consumer-side. Ship the
+  files for analysis. New clue from the user: the pre-repeat piece LENGTH
+  VARIES per boot ⇒ timing-dependent (race), consistent with consumer-side.
+- **OSK trailing space:** user-verified it's a REAL character before the
+  caret (they backspace it out), and the dex shows the plugin copies
+  `text_` verbatim — the space comes from the game data itself. Fix:
+  `gds_osk_open` right-trims spaces from the PREFILL only (never typed
+  text), with a "(trailing space(s) trimmed)" marker in the open log.
+  Also: the `_` caret is BACK (the "no cursor" wish was the mouse pointer).
+- **Start+Select force-quit:** evdev now logs every probed node once
+  (name + sel/start capability bits) AND, when no node exposes both codes
+  (the 0.94.0 silent failure), the watcher falls back to the SDL pad state
+  pad_poll already publishes — same chord semantics, still able to _exit
+  on a 2s hold. Diagnostics will show what the GO-Super Gamepad exposes.
+- **Benign storm, confirmed:** the ~40 post-naming NREs = background GCM
+  reg-id lookup returning null (dex: preference `_registration_id`, returns
+  null when unset — real phones without Play Services behave identically).
+  Extended kind-33 dump now also prints literal cell `[1ec9240]` (the name
+  of the invoke that returns null; suspect `getGCMRegistrationId`).
+
 ## 0.94.0-wirepack (name fix, proven from the original dex — no guessing)
 **Symptom fixed:** typed name lost its first and last character
 (`qwsaderdf` → game stored `wsaderd`).
