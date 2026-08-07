@@ -45,6 +45,7 @@
 
 typedef struct SDL_Window SDL_Window;
 typedef void *SDL_GLContext;
+typedef struct SDL_Surface SDL_Surface;
 typedef struct { int format; int w; int h; int refresh_rate; void *driverdata; } SDL_DisplayMode;
 /* SDL_Event is a 56-byte union; we only drain and drop events. */
 typedef union { unsigned char pad[56]; } SDL_Event;
@@ -964,6 +965,52 @@ const char *gds_gl_string_for_jni(unsigned name) {
   return (const char *)nullgl_GetString(name);
 }
 
+/* ---- boot splash (0.93) --------------------------------------------------
+ * On Android the "Made with Unity"/Kairosoft splash comes from UnityPlayer's
+ * Java splash pipeline, which this loader does not have -- so the whole long
+ * module-load/il2cpp-warmup window was just a black screen.  Draw a static
+ * BMP (gamedir/splash.bmp, 640x480 24-bit) once the SDL window exists; it
+ * stays on the KMSDRM scanout until Unity's first real frame swaps.
+ * Best-effort: no file / no window surface -> skip silently. */
+static void gds_splash_show(SDL_Window *w)
+{
+    if (!w) return;
+    void *sdl = dlopen("libSDL2-2.0.so.0", RTLD_NOW | RTLD_NOLOAD);
+    if (!sdl) sdl = dlopen("libSDL2.so.0", RTLD_NOW | RTLD_NOLOAD);
+    if (!sdl) sdl = dlopen("libSDL2.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!sdl) return;
+    void *(*rw_from_file)(const char *, const char *) =
+        (void *(*)(const char *, const char *))dlsym(sdl, "SDL_RWFromFile");
+    SDL_Surface *(*load_bmp_rw)(void *, int) =
+        (SDL_Surface *(*)(void *, int))dlsym(sdl, "SDL_LoadBMP_RW");
+    SDL_Surface *(*get_win_surf)(SDL_Window *) =
+        (SDL_Surface *(*)(SDL_Window *))dlsym(sdl, "SDL_GetWindowSurface");
+    int (*blit_scaled)(SDL_Surface *, const void *, SDL_Surface *, void *) =
+        (int (*)(SDL_Surface *, const void *, SDL_Surface *, void *))dlsym(sdl, "SDL_UpperBlitScaled");
+    int (*update_win_surf)(SDL_Window *) =
+        (int (*)(SDL_Window *))dlsym(sdl, "SDL_UpdateWindowSurface");
+    void (*free_surf)(SDL_Surface *) =
+        (void (*)(SDL_Surface *))dlsym(sdl, "SDL_FreeSurface");
+    if (!rw_from_file || !load_bmp_rw || !get_win_surf ||
+        !blit_scaled || !update_win_surf)
+        return;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/splash.bmp", gds_gamedir);
+    void *rw = rw_from_file(path, "rb");
+    if (!rw) { fprintf(stderr, "[egl] splash: no %s\n", path); return; }
+    SDL_Surface *img = load_bmp_rw(rw, 1);
+    if (!img) { fprintf(stderr, "[egl] splash: load failed\n"); return; }
+    SDL_Surface *ws = get_win_surf(w);
+    if (ws) {
+        blit_scaled(img, NULL, ws, NULL);
+        int rc = update_win_surf(w);
+        fprintf(stderr, "[egl] splash: shown (update rc=%d)\n", rc);
+    } else {
+        fprintf(stderr, "[egl] splash: window has no software surface\n");
+    }
+    if (free_surf) free_surf(img);
+}
+
 /* ---- window + share-root context creation (must run on the main thread) ---- */
 void egl_shim_create_window(void) {
   if (g_did_init) return;
@@ -1106,6 +1153,7 @@ void egl_shim_create_window(void) {
     printf("[egl] window=%p context=%p (SDL_CreateWindow may have logged a surface warning)\n",
            (void *)egl_window, (void *)egl_share_root);
     printf("[egl] negotiated a%d d%d s%d ES%d (report d%d s%d)\n", g_alpha_size, g_depth_size, g_stencil_size, g_es_major, g_report_depth, g_report_stencil);
+    gds_splash_show(egl_window);
 
     /* KMSDRM settles the drawable a few frames after the context appears;
      * Horizon polls events and waits for the size to match (30 x 10ms)

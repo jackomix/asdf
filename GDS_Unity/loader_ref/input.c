@@ -1062,19 +1062,31 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
     if (frame > 0 && frame % 1200 == 0) {
         static const char *const fam[8] = { "Btn", "Axis", "Down", "Up",
                                             "Press", "Ana", "AnaP", "Hold" };
-        char line[512]; int p = 0;
-        p += snprintf(line + p, sizeof line - p, "[input] kjoy hit-summary:");
+        /* 0.93: this used the `snprintf(line+p, sizeof line - p, ...)` idiom
+         * with an UNCLAMPED p -- snprintf returns the would-be length even
+         * when truncated, so once p > 512 the next call wrote out of bounds
+         * with a huge size.  Device proof 0.92 run: kjoy hit-summary line
+         * truncated mid-print, then SIGSEGV strb wzr,[NULL+k] from the
+         * stack-canary fail path (__strcpy_chk) -- idle-death after ~1-2 min
+         * of gameplay.  Clamp p; a full summary is ~700B so 1024 fits. */
+        char line[1024]; int p = 0;
+#define SUMCAT(...) do { \
+        if (p < (int)sizeof line) \
+            p += snprintf(line + p, sizeof line - (size_t)p, __VA_ARGS__); \
+    } while (0)
+        SUMCAT("[input] kjoy hit-summary:");
         for (int f = 0; f < 8; f++) {
             int first = 1;
-            p += snprintf(line + p, sizeof line - p, " %s[", fam[f]);
+            SUMCAT(" %s[", fam[f]);
             for (int i = 0; i < 24; i++)
                 if (g_kq[f][i]) {
-                    p += snprintf(line + p, sizeof line - p, "%s%d:%u",
-                                  first ? "" : " ", i, g_kq[f][i]);
+                    SUMCAT("%s%d:%u", first ? "" : " ", i, g_kq[f][i]);
                     first = 0;
                 }
-            p += snprintf(line + p, sizeof line - p, "]");
+            SUMCAT("]");
         }
+#undef SUMCAT
+        line[sizeof line - 1] = 0;
         fprintf(stderr, "%s\n", line);
         fflush(stderr);
     }

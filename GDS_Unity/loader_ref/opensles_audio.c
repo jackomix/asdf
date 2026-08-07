@@ -28,6 +28,7 @@
 #include <math.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <time.h>
 #include <pthread.h>
 
 typedef uint32_t SLresult;
@@ -321,6 +322,10 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
             uint32_t rd = ring_readable(p);
             if (p->preroll_bytes) {
                 if (rd >= p->preroll_bytes || ++p->preroll_ticks > 12) {
+                    { static int n; if (n++ < 10)
+                        fprintf(stderr, "[audio] preroll open (fill=%u ticks=%u%s)\n",
+                                rd, p->preroll_ticks,
+                                rd >= p->preroll_bytes ? "" : " FLUSH-timeout"); }
                     p->preroll_bytes = 0;
                     p->preroll_ticks = 0;
                 } else {
@@ -329,6 +334,8 @@ static void sdl_audio_callback(void *userdata, uint8_t *stream, int len) {
             } else if (rd == 0) {
                 p->preroll_bytes = 4096;
                 p->preroll_ticks = 0;
+                { static int n; if (n++ < 10)
+                    fprintf(stderr, "[audio] preroll armed (ring starved)\n"); }
             }
         }
 
@@ -1340,6 +1347,52 @@ static void *fmod_java_thread(void *arg)
             if (g_fmod_player && written) {
                 if (written > bufsz) written = bufsz;
                 ring_write(g_fmod_player, pcm, written);
+                /* 0.93 echo attribution: 0.92's preroll gate did NOT kill the
+                 * intro echo on device, and our ring is append-only/monotonic
+                 * -- it CANNOT repeat audio.  Only FMOD/game re-emitting PCM
+                 * can.  Fingerprint every pushed quantum for the first ~2.7s
+                 * of a stream session (session = push after >=2s of silence);
+                 * if the opening 8-quantum (~170ms) pattern reappears at a
+                 * later position, log the offset: proof of upstream
+                 * re-emission with an exact millisecond drift. */
+                {
+                    static uint32_t qh[128]; static int qn;
+                    static struct timespec lastp;
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    long gap = lastp.tv_sec
+                        ? (now.tv_sec - lastp.tv_sec) * 1000 +
+                          (now.tv_nsec - lastp.tv_nsec) / 1000000 : 9999;
+                    if (gap >= 2000) {
+                        qn = 0;
+                        fprintf(stderr,
+                                "[audio] echo-probe: stream session start (gap %ldms)\n",
+                                gap);
+                    }
+                    lastp = now;
+                    uint32_t h = 5381;
+                    for (unsigned i = 0; i + 4 <= written; i += 4)
+                        h = (h * 33u) ^ *(const uint32_t *)(const void *)(pcm + i);
+                    if (qn < 128) {
+                        qh[qn] = h; qn++;
+                        if (qn == 128) {
+                            int k = -1;
+                            for (int j = 8; j <= 120; j++) {
+                                int ok = 1;
+                                for (int m = 0; m < 8; m++)
+                                    if (qh[j + m] != qh[m]) { ok = 0; break; }
+                                if (ok) { k = j; break; }
+                            }
+                            if (k >= 0)
+                                fprintf(stderr,
+                                        "[audio] echo-probe: opening pattern REPEATS at quantum %d (~%dms) -- FMOD/game re-emits the intro, NOT our ring\n",
+                                        k, k * 21);
+                            else
+                                fprintf(stderr,
+                                        "[audio] echo-probe: no repeat in first 2.7s -- repeat must be earlier than 8 quanta or consumer-side\n");
+                        }
+                    }
+                }
             }
             blocks++;
             if (blocks <= 4 || blocks % 300 == 0) {

@@ -37,7 +37,40 @@ SDL surface blit of a bundled BMP right after KMSDRM comes up, before egl
 init — cheap; (b) investigate libunity's SplashScreen native path — likely a
 rabbit hole (Java-side scheduling), recommend (a) or nothing.
 
-## RESOLVED: crash after company-name DONE (fix pending device confirm)
+## RESOLVED (device-confirmed 0.92): crash after company-name DONE
+User verdict: "no more crash! i can play the game!" (2026-08-06 0.92 run).
+
+## RESOLVED (0.93): idle/background SIGSEGV (stack smash in input poll)
+Device evidence (0.92 log): `[input] kjoy hit-summary` printed TRUNCATED
+mid-line, then `signal 11 pc=__strcpy_chk' strb wzr,[NULL+0]` from
+gds_input_poll ~60s into gameplay.  Cause: the hit-summary used
+`snprintf(line+p, sizeof line - p, ...)` with p unclamped; snprintf returns
+the would-be length, so past 512 bytes p ran ahead of the actual write end
+and the next call wrote out-of-bounds with a wrapped (huge) size into a
+512-byte stack buffer -> canary trip.  Fixed: clamp p per call, buffer 1024
+(a full 8-family x 24-slot summary is ~700B).
+
+## OPEN: company name loses its first char ("unny Studios")
+getInputPanelResult logs "Sunny Studios" correctly, but FepPanel result [0]
+AND the on-disk save both show the S dropped.  mk_string/getInputPanelResult
+jstrings are freshly strdup'd and clean.  0.93 ships a capped probe on
+GetStringLength/GetStringChars/GetStringUTFChars/GetStringUTFRegion logging
+every short printable string -> next naming run shows exactly which shim
+sees the mangled form (or proves it never transits JNI = inside C#).
+
+## Music intro echo -- 0.92 preroll gate did NOT fix it on device
+Ring is append-only/monotonic: it cannot repeat PCM, so the ~1s repeat must
+be the source (FMOD/game) re-emitting.  0.93: echo-probe fingerprints every
+pushed 512-frame quantum for the first 128 after a >=2s silence and reports
+if the opening 8-quantum pattern recurs (+ offset in ms).  Plus preroll
+arm/open/flush transition logs (cap 10).  Await next run's verdict.
+
+## Boot splash -- shipped 0.93 (bid)
+`gds_splash_show(egl_window)` right after SDL window creation: software-blit
+`gamedir/splash.bmp` (640x480 24-bit, committed) onto the window surface;
+stays on scanout through module load + Unity warmup until first real frame.
+Note KMSDRM GL windows may refuse SDL_GetWindowSurface -- logged if so
+(`[egl] splash:` line tells which branch ran).
 `System.IndexOutOfRangeException` from `FepPanel::Update` @0x17f4aac:
 `GetFepPanelResult` delivered `String[1] {text}` but the consumer requires
 Length ≥ 2 (`[0]` = button marker, non-null→positive listener; `[1]` = text).

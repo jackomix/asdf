@@ -725,16 +725,34 @@ static int32_t j_MonitorExit(void *e, void *o) { (void)e; (void)o; return 0; }
 
 /* --- strings ----------------------------------------------------------- */
 
+/* 0.93: jstring -> managed-string conversion probe.  Device evidence: the
+ * FepPanel result [0] AND the on-disk save both read "unny Studios" though
+ * getInputPanelResult returned "Sunny Studios" -- the first char drops
+ * somewhere in the conversion path.  Log short printable strings through
+ * these four entry points (the only ones libunity can use) until found. */
+static int g_strprobe_n;
+static void strprobe(const char *what, jobj *s)
+{
+    if (!s || !s->str || s->len < 2 || s->len > 64) return;
+    if (g_strprobe_n >= 24) return;
+    for (int i = 0; i < s->len; i++)
+        if ((unsigned char)s->str[i] < 0x20 || (unsigned char)s->str[i] > 0x7e)
+            return;
+    g_strprobe_n++;
+    fprintf(stderr, "[jni] %s: len=%d '%s'\n", what, s->len, s->str);
+}
+
 static jobj *j_NewStringUTF(void *e, const char *s) { (void)e; return mk_string(s); }
 static const char *j_GetStringUTFChars(void *e, jobj *s, uint8_t *copy)
 {
     (void)e;
     if (copy) *copy = 0;
+    strprobe("GetStringUTFChars", s);
     return s && s->str ? s->str : "";
 }
 static void j_ReleaseStringUTFChars(void *e, jobj *s, const char *c) { (void)e; (void)s; (void)c; }
 static int32_t j_GetStringUTFLength(void *e, jobj *s) { (void)e; return s ? s->len : 0; }
-static int32_t j_GetStringLength(void *e, jobj *s) { (void)e; return s ? s->len : 0; }
+static int32_t j_GetStringLength(void *e, jobj *s) { (void)e; strprobe("GetStringLength", s); return s ? s->len : 0; }
 static jobj *j_NewString(void *e, const uint16_t *u, int32_t n)
 {
     (void)e;
@@ -750,6 +768,7 @@ static const uint16_t *j_GetStringChars(void *e, jobj *s, uint8_t *copy)
 {
     (void)e;
     if (copy) *copy = 1;
+    strprobe("GetStringChars", s);
     int n = s ? s->len : 0;
     uint16_t *u = calloc((size_t)n + 1, 2);
     for (int i = 0; i < n; i++)
@@ -760,8 +779,15 @@ static void j_ReleaseStringChars(void *e, jobj *s, const uint16_t *u) { (void)e;
 static void j_GetStringUTFRegion(void *e, jobj *s, int32_t off, int32_t len, char *out)
 {
     (void)e;
-    if (s && s->str)
+    if (s && s->str) {
+        { static int n; if (n++ < 24 && s->len >= 2 && s->len <= 64)
+            fprintf(stderr, "[jni] GetStringUTFRegion: off=%d len=%d (strlen=%d) '%s'\n",
+                    off, len, s->len, s->str); }
+        if (off < 0) off = 0;
+        if (off > s->len) off = s->len;
+        if (len > s->len - off) len = s->len - off;
         memcpy(out, s->str + off, (size_t)len);
+    }
 }
 
 /* --- arrays ------------------------------------------------------------ */
