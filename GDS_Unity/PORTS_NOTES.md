@@ -4,6 +4,27 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.7-bindfix (splash VISIBLE + one-line crash regression fixed)
+0.95.6 device run, in the user's words: "it displayed the kairosoft logo and
+then crashed".  Both halves confirmed and handled:
+
+- **SPLASH WORKS:** draw witness `px=fff202ff` = the KAIROSOFT wordmark
+  yellow at dead center — the ES1 fixed-func path draws correctly and the
+  multi-present put it on the panel across the boot gap (presents #1
+  window-ready … #4 nativeResume OK all logged).
+- **CRASH = my one-line regression, diagnosed by the log itself:** 0.95.6's
+  present function added `SDL_GL_MakeCurrent(NULL)` after every present.
+  The window-ready call site runs BEFORE `gds_capture_real_egl()`, whose
+  real-EGL discovery reads the CURRENT SDL binding (the 0.68 precondition,
+  even commented in-tree).  With the binding released: `real dpy=(nil)` →
+  `no real EGLDisplay` → `real_cfg=(nil)` → SIGTRAP/abort when Unity asks
+  for its EGL config.  Fix: `leave_current` parameter — window-ready keeps
+  the share root bound (exact 0.95.5 semantics, which booted fine); the
+  later milestone re-presents release it so the render thread's shrswap can
+  never hit EGL_BAD_ACCESS.  PLUS defensive hardening:
+  `gds_capture_real_egl` now rebinds the share root itself at entry, so its
+  precondition never depends on callers again.
+
 ## 0.95.6-multishow (crackle device-VERIFIED gone; chord now 1s; splash re-presented at milestones)
 Device-verified on 0.95.5: **crackle GONE** (user) with the continuous-phase
 resampler line live in the log (`[audio] resample 24000->44100

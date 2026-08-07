@@ -434,6 +434,13 @@ static void maybe_tag_flash(void) {
 
 static void gds_capture_real_egl(void) {
   if (g_nullgl) return;
+  /* precondition (0.68): discovery below reads the CURRENT SDL binding, so
+   * the share root must be bound on this thread.  0.95.6 taught us a caller
+   * can silently break that (a well-meaning "release after present" left
+   * nothing current -> real dpy=(nil) -> real_cfg=(nil) -> Unity abort).
+   * Rebind defensively so the precondition can never depend on callers. */
+  if (S.GL_MakeCurrent && egl_window && egl_share_root)
+    S.GL_MakeCurrent(egl_window, egl_share_root);
   const char *drv = getenv("SDL_VIDEO_EGL_DRIVER");
   const char *names[] = { (drv && *drv) ? drv : "libEGL.so",
                           "libEGL.so.1", "libEGL.so", 0 };
@@ -1950,8 +1957,13 @@ static int spl1_resolve(void) {
   return 1;
 }
 
-/* one draw+present; no-ops once Unity has presented its first real frame */
-static void splash_present_once(const char *where) {
+/* one draw+present; no-ops once Unity has presented its first real frame.
+ * leave_current: 1 = keep the share root bound afterwards (REQUIRED at the
+ * window-ready call site: gds_capture_real_egl discovers the real dpy via
+ * the CURRENT binding -- 0.95.6 released it there and Unity died with
+ * real_cfg=(nil)); 0 = release (later boot milestones, so the render
+ * thread's shrswap can always rebind the share root without BAD_ACCESS). */
+static void splash_present_once(const char *where, int leave_current) {
   if (!g_spl1.ok || g_first_unity_swap) return;
   if (S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, egl_share_root);
   if (!g_spl1.tex) {
@@ -2008,7 +2020,7 @@ static void splash_present_once(const char *where) {
   g_spl1.glDisable(SPL1_GL_TEXTURE_2D);
   g_spl1.glBindTexture(SPL1_GL_TEXTURE_2D, 0);
   S.GL_SwapWindow(egl_window);
-  if (S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, NULL);
+  if (!leave_current && S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, NULL);
   static int shown = 0;
   shown++;
   printf("[egl] splash: presented #%d (%s, %s tex)\n", shown, where,
@@ -2017,7 +2029,7 @@ static void splash_present_once(const char *where) {
 
 static void splash_early_show(void) {
   if (!spl1_resolve()) return;
-  splash_present_once("window-ready");
+  splash_present_once("window-ready", 1);   /* leave bound: capture reads it */
   g_splash_early_ok = 1;   /* late gate stays silent either way now */
 }
 
@@ -2025,7 +2037,7 @@ static void splash_early_show(void) {
  * flip with later ones, always strictly before the game's first frame. */
 void gds_splash_reshow(const char *where) {
   if (g_splash_early_ok && !g_first_unity_swap)
-    splash_present_once(where ? where : "boot");
+    splash_present_once(where ? where : "boot", 0);
 }
 
 static int splash_gl_load(void) {
