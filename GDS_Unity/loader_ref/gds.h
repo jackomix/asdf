@@ -30,6 +30,10 @@ void gds_jni_init(void);
 
 void *gds_android_sym(const char *name);
 void *gds_egl_sym(const char *name);
+
+/* 0.95.6: re-present the early boot splash at a boot milestone until Unity's
+ * first real frame (egl_shim.c internal; no-op once the game is drawing). */
+void gds_splash_reshow(const char *where);
 void *gds_gl_sym(const char *name);
 void *gds_jni_sym(const char *name);
 void *gds_jni_env(void);

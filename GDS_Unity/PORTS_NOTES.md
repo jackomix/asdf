@@ -4,6 +4,33 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.6-multishow (crackle device-VERIFIED gone; chord now 1s; splash re-presented at milestones)
+Device-verified on 0.95.5: **crackle GONE** (user) with the continuous-phase
+resampler line live in the log (`[audio] resample 24000->44100
+continuous-phase (16.16 carry, step=35666)`); **chord hold works**
+(`SELECT+START held 2004ms -> graceful exit`, clean lifecycle shutdown,
+exit 0). Follow-ups shipped here:
+
+- **Chord hold default 2000->1000ms** (user request), both the evdev watcher
+  and the SDL-side fallback; `GDS_QUITCHORD_MS` still overrides; the +4s
+  wedged-loop `_exit` escape hatch is unchanged.
+- **Splash ran but was never visible (user 0.95.5: "didn't see it at all,
+  the game just opened up to the loading screen")** even though the log
+  proved `splash_early_show` executed (npot tex upload, swap). The black
+  phase the user describes (ES pop-up gone -> black -> game loading screen)
+  is provably OUR era (window + module load + Unity boot = seconds), so a
+  splash there is feasible; the draw or the flip was eaten. 0.95.6
+  converges with evidence + redundancy, no blind fix:
+  - **readback witness** (one line, first present): center pixel after the
+    draw — navy/white = pixels landed (flip is the suspect), 000000 = GL
+    no-op'd (draw is the suspect);
+  - **multi-present**: same proven SDL_GL_SwapWindow route re-fires at
+    `modules loaded` / `initJni OK` / `nativeResume OK` milestones
+    (gds_splash_reshow from main.c) until `g_first_unity_swap` (set in both
+    eglSwapBuffers present paths), so a dropped first KMSDRM flip is
+    covered by later ones — all strictly before the loading screen's first
+    frame, so the game's own screen is still never covered.
+
 ## 0.95.5-earlysplash (splash in the boot gap; real chord hold; music crackle SOLVED)
 Device-verified 0.95.5 must still confirm on hardware; the three items and
 their mechanisms:

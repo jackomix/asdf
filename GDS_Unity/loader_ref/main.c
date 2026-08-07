@@ -1497,6 +1497,7 @@ static void run_unity(void)
     fprintf(stderr, "[gds] initJni...\n");
     ((void (*)(void *, void *, void *))fn)(env, player, activity);
     fprintf(stderr, "[gds] initJni OK\n");
+    gds_splash_reshow("initJni OK");
 
     fn = gds_jni_native("com/unity3d/player/UnityPlayer",
                         "nativeRecreateGfxState");
@@ -1531,6 +1532,7 @@ static void run_unity(void)
     if (fn) {
         ((void (*)(void *, void *))fn)(env, player);
         fprintf(stderr, "[gds] nativeResume OK\n");
+        gds_splash_reshow("nativeResume OK");
     }
 
     gds_audio_start(env);
@@ -1650,7 +1652,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.5-earlysplash)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.6-multishow)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */
@@ -1673,6 +1675,7 @@ int main(int argc, char **argv)
 
     int missing = gds_load_modules();
     fprintf(stderr, "[gds] modules loaded, %d relocations unresolved\n", missing);
+    gds_splash_reshow("modules loaded");
 
     /* 0.82: install address-table input/landscape hooks NOW (before any
      * managed frame).  0.81 installed them on frame ~3; disassembly shows

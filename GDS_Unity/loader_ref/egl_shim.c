@@ -1820,6 +1820,7 @@ static long spl_mono_ms(void) {
 #define SPL1_GL_EXTENSIONS          0x1F03u
 
 static int g_splash_early_ok = 0;   /* set: present-gate stays silent */
+static int g_first_unity_swap = 0; /* set on Unity's 1st real present */
 
 static int splash_bmp_load(const char *path, int *ow, int *oh,
                            unsigned char **orp) {
@@ -1859,18 +1860,57 @@ static int splash_bmp_load(const char *path, int *ow, int *oh,
   return 1;
 }
 
-static void splash_early_show(void) {
-  static int tried = 0;
-  if (tried) return;
-  tried = 1;
+/* 0.95.6 multi-present early splash -------------------------------------------
+ * 0.95.5 drew+swapped ONCE at window-ready; the log proved the code ran yet
+ * the user's panel showed nothing ("didn't see it at all ... the game just
+ * opened up to the loading screen").  Two suspect classes: the draw itself
+ * no-op'd (the share root is an odd ES-CM 1.1 context fed through
+ * libGLESv1_CM), or a first-swap KMSDRM flip gets dropped while the CRTC
+ * warms up.  This round:
+ *   - a READBACK WITNESS (one line, first present): reads the center pixel
+ *     after drawing -- navy/white = pixels landed, 000000 = GL no-op'd;
+ *   - re-presents at LATER boot milestones (gds_splash_reshow, called from
+ *     main.c) until Unity's first real swap, so a dropped first flip is
+ *     covered by a later one -- all strictly before the loading screen's
+ *     first frame, so the game's own screen is never covered.
+ * Both stay on the same proven present route (SDL_GL_SwapWindow), and the
+ * next device log says exactly which class the failure was. */
+
+static struct {
+  int resolved, ok, npot;
+  void (*glEnable)(unsigned);
+  void (*glDisable)(unsigned);
+  void (*glEnableClientState)(unsigned);
+  void (*glDisableClientState)(unsigned);
+  void (*glVertexPointer)(int, unsigned, int, const void *);
+  void (*glTexCoordPointer)(int, unsigned, int, const void *);
+  void (*glDrawArrays)(unsigned, int, int);
+  void (*glViewport)(int, int, int, int);
+  const unsigned char *(*glGetString)(unsigned);
+  void (*glGenTextures)(int, unsigned *);
+  void (*glBindTexture)(unsigned, unsigned);
+  void (*glTexImage2D)(unsigned, int, int, int, int, int,
+                       unsigned, unsigned, const void *);
+  void (*glTexSubImage2D)(unsigned, int, int, int, int, int, unsigned,
+                          unsigned, const void *);
+  void (*glTexParameteri)(unsigned, unsigned, int);
+  void (*glReadPixels)(int, int, int, int, unsigned, unsigned, void *);
+  unsigned char *rgb;        /* cached splash pixels (row 0 = image bottom) */
+  int iw, ih;
+  unsigned tex;              /* 0 until the first present uploads it */
+  float um, vm;              /* uv far edge (<1 only on the POT canvas) */
+} g_spl1;
+
+static int spl1_resolve(void) {
+  if (g_spl1.resolved) return g_spl1.ok;
+  g_spl1.resolved = 1;
+  g_spl1.um = g_spl1.vm = 1.0f;
   const char *e = getenv("GDS_SPLASH_MS");
-  long ms = e ? atol(e) : 2200;     /* 0 disables the splash entirely */
-  if (ms == 0 || !egl_window || !egl_share_root || !S.GL_SwapWindow) return;
+  long ms = e ? atol(e) : 2200;               /* 0 disables entirely */
+  if (ms == 0 || !egl_window || !egl_share_root || !S.GL_SwapWindow) return 0;
   char path[1200];
   snprintf(path, sizeof path, "%s/splash.bmp", gds_gamedir);
-  int iw = 0, ih = 0;
-  unsigned char *rgb = NULL;
-  if (!splash_bmp_load(path, &iw, &ih, &rgb)) return;   /* gate reports it */
+  if (!splash_bmp_load(path, &g_spl1.iw, &g_spl1.ih, &g_spl1.rgb)) return 0;
   const char *gld = getenv("SDL_VIDEO_GL_DRIVER");
   const char *names[] = { (gld && *gld) ? gld : "libGLESv1_CM.so",
                           "libGLESv1_CM.so", "libGLESv1_CM.so.1", 0 };
@@ -1880,100 +1920,112 @@ static void splash_early_show(void) {
     if (!h) h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
   }
   if (!h) {
-    free(rgb);
     printf("[egl] splash: no libGLESv1_CM -- leaving it to the late gate\n");
-    return;
+    return 0;
   }
-  void (*glEnableV)(unsigned) = (void *)dlsym(h, "glEnable");
-  void (*glDisableV)(unsigned) = (void *)dlsym(h, "glDisable");
-  void (*glEnableClientStateV)(unsigned) = (void *)dlsym(h, "glEnableClientState");
-  void (*glDisableClientStateV)(unsigned) = (void *)dlsym(h, "glDisableClientState");
-  void (*glVertexPointerV)(int, unsigned, int, const void *) =
-      (void *)dlsym(h, "glVertexPointer");
-  void (*glTexCoordPointerV)(int, unsigned, int, const void *) =
-      (void *)dlsym(h, "glTexCoordPointer");
-  void (*glDrawArraysV)(unsigned, int, int) = (void *)dlsym(h, "glDrawArrays");
-  void (*glViewportV)(int, int, int, int) = (void *)dlsym(h, "glViewport");
-  const unsigned char *(*glGetStringV)(unsigned) = (void *)dlsym(h, "glGetString");
-  void (*glGenTexturesV)(int, unsigned *) = (void *)dlsym(h, "glGenTextures");
-  void (*glBindTextureV)(unsigned, unsigned) = (void *)dlsym(h, "glBindTexture");
-  void (*glTexImage2DV)(unsigned, int, int, int, int, int,
-                        unsigned, unsigned, const void *) =
-      (void *)dlsym(h, "glTexImage2D");
-  void (*glTexSubImage2DV)(unsigned, int, int, int, int, int, unsigned,
-                           unsigned, const void *) =
-      (void *)dlsym(h, "glTexSubImage2D");
-  void (*glTexParameteriV)(unsigned, unsigned, int) =
-      (void *)dlsym(h, "glTexParameteri");
-  if (!glEnableV || !glDisableV || !glEnableClientStateV ||
-      !glDisableClientStateV || !glVertexPointerV || !glTexCoordPointerV ||
-      !glDrawArraysV || !glViewportV || !glGenTexturesV || !glBindTextureV ||
-      !glTexImage2DV || !glTexParameteriV) {
-    free(rgb);
+#define S1(f) g_spl1.f = (void *)dlsym(h, #f)
+  S1(glEnable); S1(glDisable); S1(glEnableClientState);
+  S1(glDisableClientState); S1(glVertexPointer); S1(glTexCoordPointer);
+  S1(glDrawArrays); S1(glViewport); S1(glGetString); S1(glGenTextures);
+  S1(glBindTexture); S1(glTexImage2D); S1(glTexSubImage2D);
+  S1(glTexParameteri); S1(glReadPixels);
+#undef S1
+  if (!g_spl1.glEnable || !g_spl1.glDisable || !g_spl1.glEnableClientState ||
+      !g_spl1.glDisableClientState || !g_spl1.glVertexPointer ||
+      !g_spl1.glTexCoordPointer || !g_spl1.glDrawArrays || !g_spl1.glViewport ||
+      !g_spl1.glGenTextures || !g_spl1.glBindTexture || !g_spl1.glTexImage2D ||
+      !g_spl1.glTexParameteri) {
     printf("[egl] splash: ES1 entry points missing -- leaving it to the late gate\n");
-    return;
+    return 0;
   }
-  if (S.GL_MakeCurrent)
-    S.GL_MakeCurrent(egl_window, egl_share_root);   /* usually already current */
-  int npot = 0;
-  if (glGetStringV) {
-    const unsigned char *x = glGetStringV(SPL1_GL_EXTENSIONS);
-    if (x && strstr((const char *)x, "GL_OES_texture_npot")) npot = 1;
+  if (g_spl1.glGetString) {
+    const unsigned char *x = g_spl1.glGetString(SPL1_GL_EXTENSIONS);
+    if (x && strstr((const char *)x, "GL_OES_texture_npot")) g_spl1.npot = 1;
   }
-  unsigned tex = 0;
-  float um = 1.0f, vm = 1.0f;    /* uv far edge (<1 only on the POT canvas) */
-  glGenTexturesV(1, &tex);
-  glBindTextureV(SPL1_GL_TEXTURE_2D, tex);
-  if (npot) {
-    glTexImage2DV(SPL1_GL_TEXTURE_2D, 0, (int)SPL1_GL_RGB, iw, ih, 0,
-                  SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, rgb);
-  } else if (glTexSubImage2DV) {
-    int pw = 1, ph = 1;
-    while (pw < iw) pw <<= 1;
-    while (ph < ih) ph <<= 1;
-    glTexImage2DV(SPL1_GL_TEXTURE_2D, 0, (int)SPL1_GL_RGB, pw, ph, 0,
-                  SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, NULL);
-    glTexSubImage2DV(SPL1_GL_TEXTURE_2D, 0, 0, 0, iw, ih,
-                     SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, rgb);
-    um = (float)iw / (float)pw;
-    vm = (float)ih / (float)ph;
-  } else {
-    free(rgb);
+  if (!g_spl1.npot && !g_spl1.glTexSubImage2D) {
     printf("[egl] splash: NPOT unsupported, no glTexSubImage2D -- late gate\n");
-    return;
+    return 0;
   }
-  free(rgb);
-  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_MIN_FILTER,
-                   (int)SPL1_GL_LINEAR);
-  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_MAG_FILTER,
-                   (int)SPL1_GL_LINEAR);
-  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_WRAP_S,
-                   (int)SPL1_GL_CLAMP_TO_EDGE);
-  glTexParameteriV(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_WRAP_T,
-                   (int)SPL1_GL_CLAMP_TO_EDGE);
+  g_spl1.ok = 1;
+  return 1;
+}
+
+/* one draw+present; no-ops once Unity has presented its first real frame */
+static void splash_present_once(const char *where) {
+  if (!g_spl1.ok || g_first_unity_swap) return;
+  if (S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, egl_share_root);
+  if (!g_spl1.tex) {
+    g_spl1.glGenTextures(1, &g_spl1.tex);
+    g_spl1.glBindTexture(SPL1_GL_TEXTURE_2D, g_spl1.tex);
+    if (g_spl1.npot) {
+      g_spl1.glTexImage2D(SPL1_GL_TEXTURE_2D, 0, (int)SPL1_GL_RGB,
+                          g_spl1.iw, g_spl1.ih, 0, SPL1_GL_RGB,
+                          SPL1_GL_UNSIGNED_BYTE, g_spl1.rgb);
+    } else {
+      int pw = 1, ph = 1;
+      while (pw < g_spl1.iw) pw <<= 1;
+      while (ph < g_spl1.ih) ph <<= 1;
+      g_spl1.glTexImage2D(SPL1_GL_TEXTURE_2D, 0, (int)SPL1_GL_RGB, pw, ph, 0,
+                          SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, NULL);
+      g_spl1.glTexSubImage2D(SPL1_GL_TEXTURE_2D, 0, 0, 0, g_spl1.iw, g_spl1.ih,
+                             SPL1_GL_RGB, SPL1_GL_UNSIGNED_BYTE, g_spl1.rgb);
+      g_spl1.um = (float)g_spl1.iw / (float)pw;
+      g_spl1.vm = (float)g_spl1.ih / (float)ph;
+    }
+    g_spl1.glTexParameteri(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_MIN_FILTER, (int)SPL1_GL_LINEAR);
+    g_spl1.glTexParameteri(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_MAG_FILTER, (int)SPL1_GL_LINEAR);
+    g_spl1.glTexParameteri(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_WRAP_S, (int)SPL1_GL_CLAMP_TO_EDGE);
+    g_spl1.glTexParameteri(SPL1_GL_TEXTURE_2D, SPL1_GL_TEXTURE_WRAP_T, (int)SPL1_GL_CLAMP_TO_EDGE);
+  }
   /* identity matrices are the ES1 reset state: a +/-1 quad IS fullscreen */
-  glViewportV(0, 0, g_screen_w > 0 ? g_screen_w : 640,
-              g_screen_h > 0 ? g_screen_h : 480);
-  glEnableV(SPL1_GL_TEXTURE_2D);
-  glEnableClientStateV(SPL1_GL_VERTEX_ARRAY);
-  glEnableClientStateV(SPL1_GL_TEXTURE_COORD_ARRAY);
+  g_spl1.glViewport(0, 0, g_screen_w > 0 ? g_screen_w : 640,
+                    g_screen_h > 0 ? g_screen_h : 480);
+  g_spl1.glEnable(SPL1_GL_TEXTURE_2D);
+  g_spl1.glBindTexture(SPL1_GL_TEXTURE_2D, g_spl1.tex);
+  g_spl1.glEnableClientState(SPL1_GL_VERTEX_ARRAY);
+  g_spl1.glEnableClientState(SPL1_GL_TEXTURE_COORD_ARRAY);
   float verts[12] = { -1.f,-1.f,  1.f,-1.f,  1.f,1.f,
                       -1.f,-1.f,  1.f,1.f,  -1.f,1.f };
-  float uvs[12]   = { 0.f,0.f,    um,0.f,    um,vm,
-                      0.f,0.f,    um,vm,     0.f,vm };
-  glVertexPointerV(2, SPL1_GL_FLOAT, 0, verts);
-  glTexCoordPointerV(2, SPL1_GL_FLOAT, 0, uvs);
-  glDrawArraysV(SPL1_GL_TRIANGLES, 0, 6);
-  glDisableClientStateV(SPL1_GL_TEXTURE_COORD_ARRAY);
-  glDisableClientStateV(SPL1_GL_VERTEX_ARRAY);
-  glDisableV(SPL1_GL_TEXTURE_2D);
-  glBindTextureV(SPL1_GL_TEXTURE_2D, 0);
+  float uvs[12]   = { 0.f,0.f,              g_spl1.um,0.f,
+                      g_spl1.um,g_spl1.vm,  0.f,0.f,
+                      g_spl1.um,g_spl1.vm,  0.f,g_spl1.vm };
+  g_spl1.glVertexPointer(2, SPL1_GL_FLOAT, 0, verts);
+  g_spl1.glTexCoordPointer(2, SPL1_GL_FLOAT, 0, uvs);
+  g_spl1.glDrawArrays(SPL1_GL_TRIANGLES, 0, 6);
+  static int witness_done = 0;
+  if (!witness_done && g_spl1.glReadPixels) {
+    witness_done = 1;
+    unsigned char px[4] = { 0, 0, 0, 0 };
+    g_spl1.glReadPixels(g_screen_w > 0 ? g_screen_w / 2 : 320,
+                        g_screen_h > 0 ? g_screen_h / 2 : 240, 1, 1,
+                        0x1908u /*GL_RGBA*/, SPL1_GL_UNSIGNED_BYTE, px);
+    printf("[egl] splash: draw witness px=%02x%02x%02x%02x "
+           "(navy 293139.. / white = drew; 000000 = GL no-op)\n",
+           px[0], px[1], px[2], px[3]);
+  }
+  g_spl1.glDisableClientState(SPL1_GL_TEXTURE_COORD_ARRAY);
+  g_spl1.glDisableClientState(SPL1_GL_VERTEX_ARRAY);
+  g_spl1.glDisable(SPL1_GL_TEXTURE_2D);
+  g_spl1.glBindTexture(SPL1_GL_TEXTURE_2D, 0);
   S.GL_SwapWindow(egl_window);
-  /* texture object intentionally left alive: the share root never renders
-   * anything else, and deleting under a queued flip is an avoidable risk. */
-  g_splash_early_ok = 1;
-  printf("[egl] splash: showing APK-harvested KAIROSOFT across the boot gap "
-         "(%s tex, until first Unity frame)\n", npot ? "npot" : "pot-canvas");
+  if (S.GL_MakeCurrent) S.GL_MakeCurrent(egl_window, NULL);
+  static int shown = 0;
+  shown++;
+  printf("[egl] splash: presented #%d (%s, %s tex)\n", shown, where,
+         g_spl1.npot ? "npot" : "pot-canvas");
+}
+
+static void splash_early_show(void) {
+  if (!spl1_resolve()) return;
+  splash_present_once("window-ready");
+  g_splash_early_ok = 1;   /* late gate stays silent either way now */
+}
+
+/* re-present from main.c boot milestones (0.95.6): covers a dropped first
+ * flip with later ones, always strictly before the game's first frame. */
+void gds_splash_reshow(const char *where) {
+  if (g_splash_early_ok && !g_first_unity_swap)
+    splash_present_once(where ? where : "boot");
 }
 
 static int splash_gl_load(void) {
@@ -2225,6 +2277,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
    * presents that exact surface -- the only working path on this stack. */
   if (current_context && current_context->is_real) {
     if (!current_context->is_pbuffer && g_win_surf) {
+      g_first_unity_swap = 1;
 
       /* 0.77 mid-game probes (GDS_RTFLASH=1).  f60 MAGENTA control (raw ctx
        * draw + route swap; 0.76 proved invisible).  f120 ORANGE compose:
@@ -2344,6 +2397,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
    * are silent no-ops so uploads don't fight the front buffer. */
   if (has_real_gl && egl_window && S.GL_SwapWindow &&
       current_context && !current_context->is_pbuffer) {
+    g_first_unity_swap = 1;
     S.GL_SwapWindow(egl_window);
     if (g_n_eglSwapBuffers <= 3) {
       egl_show_counts("SwapBuffers(real)");

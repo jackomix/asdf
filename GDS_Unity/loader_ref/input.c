@@ -707,8 +707,8 @@ static void pad_poll(void) {
 
     /* exit chord: SELECT+START (native_pad.c Bully/Sonic pattern).
      * 0.95.5: same real-hold rule as the evdev watcher -- the chord must be
-     * held continuously for GDS_QUITCHORD_MS (default 2000) before anything
-     * happens; releasing early resets the timer. */
+     * held continuously for GDS_QUITCHORD_MS (0.95.6: default 1000 per user
+     * request) before anything happens; releasing early resets the timer. */
     static long npb_chord_ms = 0;
     if (!g_exit_requested && g_npb[NPB_BACK] && g_npb[NPB_START]) {
         if (!npb_chord_ms)
@@ -716,7 +716,7 @@ static void pad_poll(void) {
         static long hold_ms = -1;
         if (hold_ms < 0) {
             const char *v = getenv("GDS_QUITCHORD_MS");
-            hold_ms = v ? atol(v) : 2000;
+            hold_ms = v ? atol(v) : 1000;
         }
         long held = watch_mono_ms() - npb_chord_ms;
         if (held >= hold_ms) {
