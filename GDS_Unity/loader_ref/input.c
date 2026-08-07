@@ -173,6 +173,7 @@ int  gds_input_exit_requested(void) { return g_exit_requested; }
  * node's real codes; GDS_QUITCHORD_KEYS="0x129,0x12b" (hex or decimal)
  * then pins the pair from gds_env.cfg with NO rebuild needed. */
 static unsigned g_code_sel = BTN_SELECT, g_code_start = BTN_START;
+static int g_codes_from_env = 0;
 static void chord_codes_init(void) {
     const char *e = getenv("GDS_QUITCHORD_KEYS");
     if (e) {
@@ -182,12 +183,23 @@ static void chord_codes_init(void) {
         if (a && b && a <= KEY_MAX && b <= KEY_MAX) {
             g_code_sel = (unsigned)a;
             g_code_start = (unsigned)b;
+            g_codes_from_env = 1;
         }
     }
     fprintf(stderr, "[input] force-quit chord: sel key=0x%x start key=0x%x%s\n",
             g_code_sel, g_code_start,
             e ? " (GDS_QUITCHORD_KEYS)" : "");
 }
+
+/* 0.95.4: device-proven chord tables.  The 0.95.3 device run's raw
+ * transition logger caught the user's physical presses: SELECT=0x2c0,
+ * START=0x2c1 on the 'GO-Super Gamepad' node (0.95.2's boot dump had
+ * proven the node does NOT advertise the standard 0x13a/0x13b pair).
+ * Keyed by node name; GDS_QUITCHORD_KEYS in gds_env.cfg still wins. */
+static const struct { const char *name; unsigned sel, start; } g_known_pads[] = {
+    { "GO-Super Gamepad", 0x2c0, 0x2c1 },
+    { NULL, 0, 0 }
+};
 
 /* shared SDL slot names (padlog + first-seen roll below) */
 static const char *const g_npb_names[] = {
@@ -290,6 +302,31 @@ static int evdev_find_gamepad(void) {
                         (g_code_sel % (8 * sizeof(long)))) & 1;
         int have_sta = (keybits[g_code_start / (8 * sizeof(long))] >>
                         (g_code_start % (8 * sizeof(long)))) & 1;
+        if (!(have_sel && have_sta) && !g_codes_from_env) {
+            /* known-pad table (0.95.4): this stock node's SELECT/START
+             * live at device-specific codes -- adopt its pair. */
+            char nm0[128] = { 0 };
+            if (ioctl(fd, EVIOCGNAME(sizeof nm0), nm0) < 0)
+                nm0[0] = 0;
+            for (int t = 0; g_known_pads[t].name; t++) {
+                if (!strstr(nm0, g_known_pads[t].name)) continue;
+                unsigned c1 = g_known_pads[t].sel, c2 = g_known_pads[t].start;
+                int h1 = (keybits[c1 / (8 * sizeof(long))] >>
+                          (c1 % (8 * sizeof(long)))) & 1;
+                int h2 = (keybits[c2 / (8 * sizeof(long))] >>
+                          (c2 % (8 * sizeof(long)))) & 1;
+                if (h1 && h2) {
+                    g_code_sel = c1;
+                    g_code_start = c2;
+                    have_sel = have_sta = 1;
+                    fprintf(stderr,
+                            "[input] known pad '%s': chord keys sel=0x%x "
+                            "start=0x%x (device-proven last run)\n",
+                            nm0, c1, c2);
+                }
+                break;
+            }
+        }
         if (log_this) {
             char name[128] = { 0 };
             if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0)

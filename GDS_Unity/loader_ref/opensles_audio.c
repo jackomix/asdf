@@ -1481,13 +1481,29 @@ static void *fmod_java_thread(void *arg)
          * BECAUSE this pacing let it: that backlog, played before the
          * restarted stream, WAS the echo (length varies per boot = however
          * much pile-up the race allowed, exactly the user's report).
-         * So: hard backpressure like AudioTrack -- never let more than
-         * 8192B (~85ms) of mixed audio sit unplayed.  The game can restart
-         * the music all it wants; the seam can never be longer than the
-         * queue.  No content sniffing, no prediction, and it holds for
-         * every future Kairosoft game, not just this song. */
+         * So: hard backpressure like AudioTrack -- cap the unplayed queue.
+         * No content sniffing, no prediction; it holds for every future
+         * Kairosoft game, not just this song.
+         * 0.95.4 (user: "tiny clicks/pops as the music plays"): 0.95.3's
+         * flat 8192B (~85ms) is tight enough that normal frame jitter can
+         * momentarily starve the SDL callback = the clicks.  Split the cap
+         * by RISK WINDOW instead: the game's double-start/restart (the
+         * only echo producer, and it only happens right at a track's
+         * start) is covered by holding 8192B for the first ~1.2s of every
+         * music run; after that, relax to 24576B (~5.5 SDL callbacks)
+         * for jitter noise margin.  Echo stays structurally impossible in
+         * the vulnerable window; steady play gets its breathing room. */
+        static struct timespec g_run_t0;
+        long run_ms = -1;
+        if (g_run_t0.tv_sec) {
+            struct timespec n_;
+            clock_gettime(CLOCK_MONOTONIC, &n_);
+            run_ms = (n_.tv_sec - g_run_t0.tv_sec) * 1000 +
+                     (n_.tv_nsec - g_run_t0.tv_nsec) / 1000000;
+        }
+        uint32_t cap = (run_ms >= 0 && run_ms < 1200) ? 8192 : 24576;
         while (g_fmod_player &&
-               ring_readable(g_fmod_player) >= 8192) {
+               ring_readable(g_fmod_player) >= cap) {
             if (!gds_jni_fmod_should_run()) break;
             usleep(4000);
         }
@@ -1550,6 +1566,9 @@ static void *fmod_java_thread(void *arg)
                 static int wr_on = 0;
                 int now_on = written != 0;
                 if (now_on != wr_on) {
+                    /* 0.95.4 adaptive cap clock: a restart re-arms the
+                     * tight window at every track start (see above). */
+                    if (now_on) clock_gettime(CLOCK_MONOTONIC, &g_run_t0);
                     /* peak= ... 0.95.3 loudness witness: the per-block peak
                      * of what FMOD mixed, so the next 'clip-ish' report can
                      * be checked against the actual digital level. */

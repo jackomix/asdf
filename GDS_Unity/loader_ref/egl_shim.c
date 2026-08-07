@@ -1,5 +1,8 @@
 /* egl_shim.c -- real GLES2 window/context for the GDS glibc loader.
  *
+
+
+ *
  * GDS's libunity.so runs Android's Unity engine.  Its graphics init
  * (nativeRecreateGfxState) asks the EGL surface layer for a display/config/
  * context/surface and then resolves every GL entry point through
@@ -1725,6 +1728,242 @@ static void draw_cursor_overlay(void) {
   }
 }
 
+/* ---- boot splash (0.95.4, user wish) -------------------------------------
+ * The REAL Kairosoft boot splash, harvested from the APK at package time
+ * (tools/harvest_splash.py: res/iF.png 1024x2048 portrait -> navy fill +
+ * centered wordmark band -> gamedir/splash.bmp 640x480 24-bit).  This is a
+ * PRESENT-GATE: at swap time we draw it over Unity's backbuffer for the
+ * first GDS_SPLASH_MS (default 2200, 0=off) after the first real present.
+ * The boot path is never touched and nothing is timed out on -- 0.93.0's
+ * SDL-software-surface blit forced the window down a nil-display path and
+ * earned a same-day hotfix; that class of risk is designed out here.
+ * Missing file / no GL -> silent skip.  Same state save/restore discipline
+ * as the cursor overlay: the engine cannot tell we drew. */
+
+#define SPL_GL_TEXTURE_2D        0x0DE1u
+#define SPL_GL_RGB               0x1907u
+#define SPL_GL_UNSIGNED_BYTE     0x1401u
+#define SPL_GL_TEXTURE_MIN_FILTER 0x2801u
+#define SPL_GL_TEXTURE_MAG_FILTER 0x2800u
+#define SPL_GL_TEXTURE_WRAP_S    0x2802u
+#define SPL_GL_TEXTURE_WRAP_T    0x2803u
+#define SPL_GL_LINEAR            0x2601u
+#define SPL_GL_CLAMP_TO_EDGE     0x812Fu
+#define SPL_GL_TEXTURE_BINDING_2D 0x8069u
+
+static struct {
+  int tried, ok;
+  unsigned prog, vbo, vao, tex;
+  int a_pos, a_uv, u_tex;
+  void (*glGenTextures)(int, unsigned *);
+  void (*glBindTexture)(unsigned, unsigned);
+  void (*glTexImage2D)(unsigned, int, int, int, int, int,
+                       unsigned, unsigned, const void *);
+  void (*glTexParameteri)(unsigned, unsigned, int);
+  void (*glUniform1i)(int, int);
+} g_spl_gl;
+
+static long spl_mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* 24-bit uncompressed BMP -> RGB rows bottom-first (GL upload order). */
+static int splash_bmp_load(const char *path, int *ow, int *oh,
+                           unsigned char **orp) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  unsigned char hdr[54];
+  if (fread(hdr, 1, 54, f) != 54 || hdr[0] != 'B' || hdr[1] != 'M') {
+    fclose(f); return 0;
+  }
+  unsigned long off = *(unsigned *)(hdr + 10);
+  int iw = *(int *)(hdr + 18), ih = *(int *)(hdr + 22);
+  unsigned short bits = *(unsigned short *)(hdr + 28);
+  unsigned comp = *(unsigned *)(hdr + 30);
+  if (!iw || !ih || bits != 24 || comp != 0) { fclose(f); return 0; }
+  int topdown = ih < 0;
+  if (ih < 0) ih = -ih;
+  size_t stride = (((size_t)iw * 3) + 3) & ~3u, n = stride * (size_t)ih;
+  unsigned char *raw = (unsigned char *)malloc(n);
+  unsigned char *px = (unsigned char *)malloc((size_t)iw * ih * 3);
+  if (!raw || !px || fseek(f, (long)off, SEEK_SET) ||
+      fread(raw, 1, n, f) != n) {
+    free(raw); free(px); fclose(f); return 0;
+  }
+  fclose(f);
+  for (int y = 0; y < ih; y++) {
+    int sy = topdown ? (ih - 1 - y) : y;  /* bottom-up BMP: file row 0 = bottom */
+    const unsigned char *sr = raw + (size_t)sy * stride;
+    unsigned char *dr = px + (size_t)y * (size_t)iw * 3;
+    for (int x = 0; x < iw; x++) {        /* BMP is BGR */
+      dr[x * 3 + 0] = sr[x * 3 + 2];
+      dr[x * 3 + 1] = sr[x * 3 + 1];
+      dr[x * 3 + 2] = sr[x * 3 + 0];
+    }
+  }
+  free(raw);
+  *ow = iw; *oh = ih; *orp = px;
+  return 1;
+}
+
+static int splash_gl_load(void) {
+  if (g_spl_gl.tried) return g_spl_gl.ok;
+  g_spl_gl.tried = 1;
+  if (!cursor_gl_load() || !g_cur_gl.ok) return 0;   /* shares the raw funcs */
+  const char *gld = getenv("SDL_VIDEO_GL_DRIVER");
+  const char *names[] = { (gld && *gld) ? gld : "libGLESv2.so",
+                          "libGLESv2.so.2", "libGLESv2.so", 0 };
+  void *h = NULL;
+  for (int i = 0; names[i] && !h; i++) {
+    h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+  }
+  if (!h) return 0;
+#define RS(f) g_spl_gl.f = (void *)dlsym(h, #f)
+  RS(glGenTextures); RS(glBindTexture); RS(glTexImage2D);
+  RS(glTexParameteri); RS(glUniform1i);
+#undef RS
+  if (!g_spl_gl.glGenTextures || !g_spl_gl.glBindTexture ||
+      !g_spl_gl.glTexImage2D || !g_spl_gl.glTexParameteri ||
+      !g_spl_gl.glUniform1i)
+    return 0;
+  static const char *vs_src =
+      "attribute vec2 aPos;\n"
+      "attribute vec2 aUV;\n"
+      "varying vec2 vUV;\n"
+      "void main(){ gl_Position = vec4(aPos, 0.0, 1.0); vUV = aUV; }\n";
+  static const char *fs_src =
+      "precision mediump float;\n"
+      "varying vec2 vUV;\n"
+      "uniform sampler2D uTex;\n"
+      "void main(){ gl_FragColor = texture2D(uTex, vUV); }\n";
+  unsigned vs = g_cur_gl.glCreateShader(CUR_GL_VERTEX_SHADER);
+  g_cur_gl.glShaderSource(vs, 1, &vs_src, 0);
+  g_cur_gl.glCompileShader(vs);
+  int okc = 0; g_cur_gl.glGetShaderiv(vs, CUR_GL_COMPILE_STATUS, &okc);
+  unsigned fs = g_cur_gl.glCreateShader(CUR_GL_FRAGMENT_SHADER);
+  g_cur_gl.glShaderSource(fs, 1, &fs_src, 0);
+  g_cur_gl.glCompileShader(fs);
+  int okf = 0; g_cur_gl.glGetShaderiv(fs, CUR_GL_COMPILE_STATUS, &okf);
+  g_spl_gl.prog = g_cur_gl.glCreateProgram();
+  g_cur_gl.glAttachShader(g_spl_gl.prog, vs);
+  g_cur_gl.glAttachShader(g_spl_gl.prog, fs);
+  g_cur_gl.glLinkProgram(g_spl_gl.prog);
+  int okl = 0; g_cur_gl.glGetProgramiv(g_spl_gl.prog, CUR_GL_LINK_STATUS, &okl);
+  g_cur_gl.glDeleteShader(vs); g_cur_gl.glDeleteShader(fs);
+  if (!okc || !okf || !okl) {
+    printf("[egl] splash: shader build failed c=%d f=%d l=%d\n", okc, okf, okl);
+    return 0;
+  }
+  g_spl_gl.a_pos = g_cur_gl.glGetAttribLocation(g_spl_gl.prog, "aPos");
+  g_spl_gl.a_uv  = g_cur_gl.glGetAttribLocation(g_spl_gl.prog, "aUV");
+  g_spl_gl.u_tex = g_cur_gl.glGetUniformLocation(g_spl_gl.prog, "uTex");
+  if (g_spl_gl.a_pos < 0 || g_spl_gl.a_uv < 0) return 0;
+  g_cur_gl.glGenBuffers(1, &g_spl_gl.vbo);
+  g_cur_gl.glGenVertexArrays(1, &g_spl_gl.vao);
+  static const float quad[6 * 4] = {
+      -1.f, -1.f,  0.f, 0.f,    1.f, -1.f,  1.f, 0.f,    1.f, 1.f,  1.f, 1.f,
+      -1.f, -1.f,  0.f, 0.f,    1.f,  1.f,  1.f, 1.f,   -1.f, 1.f,  0.f, 1.f };
+  g_cur_gl.glBindVertexArray(g_spl_gl.vao);
+  g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, g_spl_gl.vbo);
+  g_cur_gl.glBufferData(CUR_GL_ARRAY_BUFFER, (long)sizeof quad, quad,
+                        CUR_GL_STREAM_DRAW);
+  g_cur_gl.glVertexAttribPointer((unsigned)g_spl_gl.a_pos, 2, CUR_GL_FLOAT,
+                                 0, 4 * (int)sizeof(float), (const void *)0);
+  g_cur_gl.glEnableVertexAttribArray((unsigned)g_spl_gl.a_pos);
+  g_cur_gl.glVertexAttribPointer((unsigned)g_spl_gl.a_uv, 2, CUR_GL_FLOAT,
+                                 0, 4 * (int)sizeof(float),
+                                 (const void *)(2 * sizeof(float)));
+  g_cur_gl.glEnableVertexAttribArray((unsigned)g_spl_gl.a_uv);
+  g_cur_gl.glBindVertexArray(0);
+  char path[1200];
+  snprintf(path, sizeof path, "%s/splash.bmp", gds_gamedir);
+  int iw = 0, ih = 0;
+  unsigned char *rgb = NULL;
+  if (!splash_bmp_load(path, &iw, &ih, &rgb)) {
+    printf("[egl] splash: no usable %s -- splash off\n", path);
+    return 0;
+  }
+  g_spl_gl.glGenTextures(1, &g_spl_gl.tex);
+  g_spl_gl.glBindTexture(SPL_GL_TEXTURE_2D, g_spl_gl.tex);
+  g_spl_gl.glTexImage2D(SPL_GL_TEXTURE_2D, 0, (int)SPL_GL_RGB, iw, ih, 0,
+                        SPL_GL_RGB, SPL_GL_UNSIGNED_BYTE, rgb);
+  free(rgb);
+  g_spl_gl.glTexParameteri(SPL_GL_TEXTURE_2D, SPL_GL_TEXTURE_MIN_FILTER,
+                           (int)SPL_GL_LINEAR);
+  g_spl_gl.glTexParameteri(SPL_GL_TEXTURE_2D, SPL_GL_TEXTURE_MAG_FILTER,
+                           (int)SPL_GL_LINEAR);
+  g_spl_gl.glTexParameteri(SPL_GL_TEXTURE_2D, SPL_GL_TEXTURE_WRAP_S,
+                           (int)SPL_GL_CLAMP_TO_EDGE);
+  g_spl_gl.glTexParameteri(SPL_GL_TEXTURE_2D, SPL_GL_TEXTURE_WRAP_T,
+                           (int)SPL_GL_CLAMP_TO_EDGE);
+  g_spl_gl.glBindTexture(SPL_GL_TEXTURE_2D, 0);
+  g_spl_gl.ok = 1;
+  printf("[egl] splash: %dx%d harvested splash ready (tex=%u)\n",
+         iw, ih, g_spl_gl.tex);
+  return 1;
+}
+
+static void splash_draw(void) {
+  int vp[4], cprog = 0, cvao = 0, cvbo = 0, ctex = 0;
+  int ed = 0, eb = 0, ec = 0, es = 0;
+  g_cur_gl.glGetIntegerv(CUR_GL_VIEWPORT, vp);
+  g_cur_gl.glGetIntegerv(CUR_GL_CURRENT_PROGRAM, &cprog);
+  g_cur_gl.glGetIntegerv(CUR_GL_VERTEX_ARRAY_BINDING, &cvao);
+  g_cur_gl.glGetIntegerv(CUR_GL_ARRAY_BUFFER_BINDING, &cvbo);
+  g_cur_gl.glGetIntegerv((unsigned)SPL_GL_TEXTURE_BINDING_2D, &ctex);
+  ed = g_cur_gl.glIsEnabled(CUR_GL_DEPTH_TEST);
+  eb = g_cur_gl.glIsEnabled(CUR_GL_BLEND);
+  ec = g_cur_gl.glIsEnabled(CUR_GL_CULL_FACE);
+  es = g_cur_gl.glIsEnabled(CUR_GL_SCISSOR_TEST);
+  if (ed) g_cur_gl.glDisable(CUR_GL_DEPTH_TEST);
+  if (eb) g_cur_gl.glDisable(CUR_GL_BLEND);
+  if (ec) g_cur_gl.glDisable(CUR_GL_CULL_FACE);
+  if (es) g_cur_gl.glDisable(CUR_GL_SCISSOR_TEST);
+  g_cur_gl.glUseProgram(g_spl_gl.prog);
+  g_spl_gl.glUniform1i(g_spl_gl.u_tex, 0);
+  g_spl_gl.glBindTexture(SPL_GL_TEXTURE_2D, g_spl_gl.tex);
+  g_cur_gl.glBindVertexArray(g_spl_gl.vao);
+  g_cur_gl.glDrawArrays(CUR_GL_TRIANGLES, 0, 6);
+  /* restore everything Unity could observe */
+  g_cur_gl.glBindVertexArray((unsigned)cvao);
+  g_spl_gl.glBindTexture(SPL_GL_TEXTURE_2D, (unsigned)ctex);
+  g_cur_gl.glUseProgram((unsigned)cprog);
+  g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, (unsigned)cvbo);
+  if (ed) g_cur_gl.glEnable(CUR_GL_DEPTH_TEST);
+  if (eb) g_cur_gl.glEnable(CUR_GL_BLEND);
+  if (ec) g_cur_gl.glEnable(CUR_GL_CULL_FACE);
+  if (es) g_cur_gl.glEnable(CUR_GL_SCISSOR_TEST);
+  g_cur_gl.glViewport(vp[0], vp[1], vp[2], vp[3]);
+}
+
+static void splash_present_gate(void) {
+  static long t0 = -1, ms = -1;
+  static int armed = 0;
+  if (ms == -1) {
+    const char *e = getenv("GDS_SPLASH_MS");
+    ms = e ? atol(e) : 2200;
+  }
+  if (ms <= 0) return;
+  if (!armed && t0 == -1) {
+    if (!splash_gl_load()) { t0 = -2; return; }
+    t0 = spl_mono_ms();
+    armed = 1;
+    printf("[egl] splash: showing APK-harvested KAIROSOFT for %ldms\n", ms);
+    return;                 /* let frame 0 present normally, gate from #1 */
+  }
+  if (!armed || t0 < 0) return;
+  long left = ms - (spl_mono_ms() - t0);
+  if (left <= 0) {
+    armed = 0;
+    printf("[egl] splash: done\n");
+    return;
+  }
+  splash_draw();
+}
+
 /* ------------------------------------------------ OSK overlay (begin/rect/end)
  * Same GL stack as the cursor overlay, factored so osk.c can draw arbitrary
  * axis-aligned pixel quads.  Single-threaded render thread, so the saved
@@ -1888,6 +2127,10 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
       /* 0.84: the OSK draws through the same seam (no-op unless a kairo
        * FEP panel / Unity soft-input is open). */
       gds_osk_draw();
+      /* 0.95.4 boot splash present-gate: covers the first GDS_SPLASH_MS of
+       * presented frames with the APK-harvested Kairosoft screen; no-op
+       * afterwards / when disabled / when the BMP is missing. */
+      splash_present_gate();
       if (present_mode() == 0 && egl_window && S.GL_SwapWindow) {
         S.GL_SwapWindow(egl_window);
         if (g_n_eglSwapBuffers <= 3)

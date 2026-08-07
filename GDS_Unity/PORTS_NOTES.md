@@ -4,6 +4,36 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.4-splash (real APK splash; quit-chord named; adaptive audio cap)
+User-verified on 0.95.3: **echo gone, OSK trailing blank gone, naming
+round-trips clean** (DONE "Sunny Studios" / wire "Sunny Studios").
+
+- **Start+Select force-quit — codes CAUGHT BY THE USER'S PRESSES.** The
+  0.95.3 raw transition logger recorded: SELECT=**0x2c0**, START=**0x2c1**
+  on the 'GO-Super Gamepad' node (both down/up once, nothing surfaced on
+  the SDL side, matching their dialogue). Now baked into a per-device
+  table in input.c (`g_known_pads`): the watcher adopts the pair
+  automatically when the stock node doesn't advertise standard
+  BTN_SELECT/START; `GDS_QUITCHORD_KEYS` still overrides. Other handhelds
+  just extend the table (per-game/per-device design kept for the port
+  series).
+- **Splash, per the standing directive (harvest, don't invent):**
+  `tools/harvest_splash.py` pulls the real `res/iF.png` (1024×2048
+  portrait KAIROSOFT screen) out of the APK at package time and recomposes
+  it for 640×480 (navy fill + centered wordmark band, auto-bboxed) →
+  `ports/gamedevstory/gamedevstory/splash.bmp`. The loader presents it for
+  the first **GDS_SPLASH_MS (default 2200; 0 disables)** after the first
+  real swap via a *present-gate* (drawn over the backbuffer at swap time
+  with cursor-overlay state discipline) — NOT the 0.93.0 SDL-software blit
+  that nil-displayed the window and got hotfixed.
+- **Music clicks/pops (user report on 0.95.3):** the flat 85ms queue was
+  starve-prone under normal frame jitter. The cap is now *risk-windowed*:
+  **8192B during the first 1.2s of every music run** (the double-start
+  echo window only ever opens at track start — mechanism stays impossible
+  there), then **24576B (~5.5 callbacks)** for steady-state margin. If
+  clicks persist, listen whether they cluster at track starts.
+- Repack note: zip now also carries `gamedevstory/splash.bmp`.
+
 ## 0.95.3-backpress (echo killed by mechanism, not detection; OSK CR; key hunt)
 **Echo fix done right this time (user called out the matcher as inelegant —
 they were right).** The 0.95.2 content-fingerprint never fired on-device
