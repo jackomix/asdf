@@ -4,6 +4,70 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.8-osk (full OSK overhaul; single-source-of-truth generator tool)
+
+User brief (2026-08): the OSK was a verbatim Terraria/Prizefighters port and
+"just kind of crappy" — pixel font, midnight/gold colors, staggered QWERTY
+with no number row, X shift that latched AND typed a space at the same time,
+backspace re-derived caps from the letter you deleted onto, no '#' glyph at
+all ("Game #1" untypable), panel bottom-anchored.  PC/console editions of
+GDS show a dark gradient input WINDOW with gamepad glyphs — hunted for it in
+this APK: does NOT exist.  The mobile build has only `FepPanel` -> OS-level
+EditText IME (`kairo/android/plugin` framework, shared by every Kairosoft
+game); the "dark window" memory is the system IME chrome.  No leanback/
+gamepad features in the manifest at all.  So the look had to be built, not
+enabled.  User picks (ask_user): charcoal + blue accent style, clean rounded
+sans font.
+
+**Generator tool `tools/make_osk_font.py` = single source of truth.**  One
+run rasterizes DejaVu Sans Bold @24px into a 320x320 RGBA glyph atlas
+(`ports/.../osk_font.rgba`, shipped in the zip), and emits
+`loader_ref/osk_font_data.h` (metrics + per-glyph advances) and
+`loader_ref/osk_layout.h` (palette, panel/box/positions, key tables for
+letters 36 + symbols 40 + func row 5) — the C draw and the mock can never
+drift apart.  DejaVu license file ships in `licenses/` (permissive; bitmap
+derived work, renamed/notices kept).
+
+New keyboard (default): charcoal 4-band gradient panel near screen centre
+over a 0.55 scrim, skeuomorphic bevel keys (shadow/face/lit top/dark bottom),
+blue accent for selection/caret/DONE.  Real number row, aligned 10-wide grid
+(user hated dpad-ing across staggered rows).  Letters/symbols pages toggled
+by **L1/R1** or the SYM key; '#' and full 0x20..0x7E included.  Shift is now
+a cycle: X or SHIFT key goes off -> one-shot -> CAPS LOCK -> off; a typed
+letter spends one-shot; space does not; **backspace never touches shift**.
+Open arms one-shot when the text is empty/ends in space (sentence case like
+a phone), and opens on the symbols page when the prefill ends in a symbol.
+Classic Terraria keyboard stays verbatim behind `GDS_OSK=classic`, and is
+also the automatic fallback when `osk_font.rgba` or the GL text path is
+missing (one log line).
+
+GL seam (egl_shim.c, after overlay_rect): `gds_egl_overlay_rect_a` (alpha
+rects/scrim), `gds_egl_overlay_atlas` (one-time text program aPos/aUV +
+uTex/uColor, coverage from tex alpha; lazy compile on the render thread like
+the splash), `gds_egl_overlay_quads` (batched y-down pixel quads).  Extra
+syms (glGenTextures/glTexImage2D/glActiveTexture/glBlendFunc[Separate]) come
+from the same RTLD_NOLOAD libGLESv2 pattern as splash_gl_load.  Every
+binding Unity could observe is saved/restored — including the *blend
+factors*, which plain begin/end did NOT save (glBlendFunc is global state):
+rect_a/quads snapshot the 4 factors + restore via glBlendFuncSeparate.
+
+Evidence before shipping: host logic test (`#include osk.c` + stubbed GL,
+39 asserts) — latch swallow, one-shot/caps-lock cycle, backspace/shift
+independence, L1/R1 pages, '#' typable, maxlen clamp, DONE/START commit,
+SELECT cancel, aligned-grid dpad nav (right 1->2, down 2->w->s->x->SHIFT);
+all pass.  Pixel-true render harness (`render_osk.c` records the real C
+draw's rects/quads, `render_osk.py` rasterizes with the real atlas ->
+`preview_osk_letters.png` / `preview_osk_symbols.png`) — caught the footer
+hint overflowing the panel (745px into a 580px panel), fixed by the tool's
+double-space hint string + centered 0.48 scale.  NOT yet device-verified;
+mock-level confidence is high but text rendering is new GL (texture +
+blending in the overlay path), so watch `[osk] font atlas live` in the log
+on first open.
+
+Deferred (user-mentioned, not in 0.95.8): ~0.5s dead-A right after DONE
+(probably game-side tutorial fade-in — said it may "actually just be the
+game"); big tab glyphs (other editions' UI, none in this build).
+
 ## 0.95.7-bindfix (splash VISIBLE + one-line crash regression fixed)
 0.95.6 device run, in the user's words: "it displayed the kairosoft logo and
 then crashed".  Both halves confirmed and handled:

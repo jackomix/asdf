@@ -2260,6 +2260,251 @@ void gds_egl_overlay_rect(float x, float y, float w, float h,
     g_cur_gl.glDrawArrays(CUR_GL_TRIANGLES, 0, 6);
 }
 
+/* ---- 0.95.8 (osk overhaul): alpha-blended rects + font-atlas text --------
+ * The new OSK needs two things the plain rect path cannot do: a translucent
+ * scrim over the game (rect_a) and real text from a generated RGBA font
+ * atlas (atlas + quads).  Extra entry points beyond g_cur_gl come from the
+ * same libGLESv2 dlopen pattern splash_gl_load uses. */
+#define OVT_GL_TEXTURE_2D         0x0DE1u
+#define OVT_GL_RGBA               0x1908u
+#define OVT_GL_UNSIGNED_BYTE      0x1401u
+#define OVT_GL_TEXTURE_MIN_FILTER 0x2801u
+#define OVT_GL_TEXTURE_MAG_FILTER 0x2800u
+#define OVT_GL_TEXTURE_WRAP_S     0x2802u
+#define OVT_GL_TEXTURE_WRAP_T     0x2803u
+#define OVT_GL_LINEAR             0x2601u
+#define OVT_GL_CLAMP_TO_EDGE      0x812Fu
+#define OVT_GL_TEXTURE_BINDING_2D 0x8069u
+#define OVT_GL_ACTIVE_TEXTURE     0x84E0u
+#define OVT_GL_TEXTURE0           0x84C0u
+#define OVT_GL_SRC_ALPHA          0x0302u
+#define OVT_GL_ONE_MINUS_SRC_ALPHA 0x0303u
+
+static struct {
+    int tried, ok;
+    void (*glGenTextures)(int, unsigned *);
+    void (*glBindTexture)(unsigned, unsigned);
+    void (*glTexImage2D)(unsigned, int, int, int, int, int,
+                         unsigned, unsigned, const void *);
+    void (*glTexParameteri)(unsigned, unsigned, int);
+    void (*glUniform1i)(int, int);
+    void (*glActiveTexture)(unsigned);
+    void (*glBlendFunc)(unsigned, unsigned);
+    void (*glBlendFuncSeparate)(unsigned, unsigned, unsigned, unsigned);
+} g_ovt;
+
+static int ovt_syms_load(void) {
+    if (g_ovt.tried) return g_ovt.ok;
+    g_ovt.tried = 1;
+    const char *gld = getenv("SDL_VIDEO_GL_DRIVER");
+    const char *names[] = { (gld && *gld) ? gld : "libGLESv2.so",
+                            "libGLESv2.so.2", "libGLESv2.so", 0 };
+    void *h = NULL;
+    for (int i = 0; names[i] && !h; i++) {
+        h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!h) return 0;
+#define RO(f) g_ovt.f = (void *)dlsym(h, #f)
+    RO(glGenTextures); RO(glBindTexture); RO(glTexImage2D);
+    RO(glTexParameteri); RO(glUniform1i); RO(glActiveTexture);
+    RO(glBlendFunc); RO(glBlendFuncSeparate);
+#undef RO
+    g_ovt.ok = g_ovt.glGenTextures && g_ovt.glBindTexture &&
+               g_ovt.glTexImage2D && g_ovt.glTexParameteri &&
+               g_ovt.glUniform1i && g_ovt.glActiveTexture &&
+               g_ovt.glBlendFunc && g_ovt.glBlendFuncSeparate;
+    return g_ovt.ok;
+}
+
+/* glBlendFunc is global GL state, not part of what overlay_begin/end saves:
+ * snapshot the 4 factors, run with SRC_ALPHA/1-SRC_ALPHA, then put Unity's
+ * exact factors back (BlendFuncSeparate keeps even a split RGB/alpha pair). */
+#define OVT_GL_BLEND_DST_RGB   0x80C8u
+#define OVT_GL_BLEND_SRC_RGB   0x80C9u
+#define OVT_GL_BLEND_DST_ALPHA 0x80CAu
+#define OVT_GL_BLEND_SRC_ALPHA 0x80CBu
+static void ovt_blend_save(int f[4]) {
+    g_cur_gl.glGetIntegerv(OVT_GL_BLEND_SRC_RGB, &f[0]);
+    g_cur_gl.glGetIntegerv(OVT_GL_BLEND_DST_RGB, &f[1]);
+    g_cur_gl.glGetIntegerv(OVT_GL_BLEND_SRC_ALPHA, &f[2]);
+    g_cur_gl.glGetIntegerv(OVT_GL_BLEND_DST_ALPHA, &f[3]);
+    g_ovt.glBlendFunc(OVT_GL_SRC_ALPHA, OVT_GL_ONE_MINUS_SRC_ALPHA);
+}
+static void ovt_blend_restore(const int f[4]) {
+    g_ovt.glBlendFuncSeparate((unsigned)f[0], (unsigned)f[1],
+                              (unsigned)f[2], (unsigned)f[3]);
+}
+
+/* translucent rect (scrim).  Begins disabled blend per overlay_begin, so
+ * enable -> draw -> put it back. */
+void gds_egl_overlay_rect_a(float x, float y, float w, float h,
+                            float r, float g, float b, float a) {
+    if (!g_ov.open) return;
+    if (a >= 0.999f || !ovt_syms_load() || !g_ovt.ok) {
+        gds_egl_overlay_rect(x, y, w, h, r, g, b);
+        return;
+    }
+    int bf[4]; ovt_blend_save(bf);
+    g_cur_gl.glEnable(CUR_GL_BLEND);
+    float W = (float)g_ov.w, H = (float)g_ov.h;
+    float ndc[12] = {
+        x,     y,      x + w, y,      x,     y + h,
+        x + w, y,      x + w, y + h,  x,     y + h,
+    };
+    for (int i = 0; i < 6; i++) {
+        ndc[i * 2]     = ndc[i * 2]     * 2.0f / W - 1.0f;
+        ndc[i * 2 + 1] = 1.0f - ndc[i * 2 + 1] * 2.0f / H;
+    }
+    g_cur_gl.glUniform4f(g_cur_gl.u_color, r, g, b, a);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, g_cur_gl.vbo);
+    g_cur_gl.glBufferData(CUR_GL_ARRAY_BUFFER, sizeof ndc, ndc, CUR_GL_STREAM_DRAW);
+    g_cur_gl.glVertexAttribPointer((unsigned)g_cur_gl.a_pos, 2, CUR_GL_FLOAT, 0, 0, 0);
+    g_cur_gl.glEnableVertexAttribArray((unsigned)g_cur_gl.a_pos);
+    g_cur_gl.glDrawArrays(CUR_GL_TRIANGLES, 0, 6);
+    g_cur_gl.glDisable(CUR_GL_BLEND);
+    ovt_blend_restore(bf);
+}
+
+/* text program + atlas texture (one-time init on the render thread, exactly
+ * how the splash lazily compiles its program in the same thread). */
+static struct {
+    int tried, ok;
+    unsigned prog, vbo, vao, tex;
+    int a_pos, a_uv, u_tex, u_color;
+} g_ot;
+
+int gds_egl_overlay_atlas(const unsigned char *rgba, int w, int h) {
+    if (!g_ov.open) return 0;
+    if (g_ot.ok) return 1;
+    if (g_ot.tried) return 0;
+    g_ot.tried = 1;
+    if (!cursor_gl_load() || !g_cur_gl.ok) return 0;
+    if (!ovt_syms_load() || !g_ovt.ok) return 0;
+    if (!rgba || w <= 0 || h <= 0) return 0;
+    static const char *vs_src =
+        "attribute vec2 aPos;\n"
+        "attribute vec2 aUV;\n"
+        "varying vec2 vUV;\n"
+        "void main(){ gl_Position = vec4(aPos, 0.0, 1.0); vUV = aUV; }\n";
+    static const char *fs_src =
+        "precision mediump float;\n"
+        "varying vec2 vUV;\n"
+        "uniform sampler2D uTex;\n"
+        "uniform vec4 uColor;\n"
+        "void main(){ gl_FragColor = vec4(uColor.rgb,\n"
+        "             texture2D(uTex, vUV).a * uColor.a); }\n";
+    unsigned vs = g_cur_gl.glCreateShader(CUR_GL_VERTEX_SHADER);
+    g_cur_gl.glShaderSource(vs, 1, &vs_src, 0);
+    g_cur_gl.glCompileShader(vs);
+    int okc = 0; g_cur_gl.glGetShaderiv(vs, CUR_GL_COMPILE_STATUS, &okc);
+    unsigned fs = g_cur_gl.glCreateShader(CUR_GL_FRAGMENT_SHADER);
+    g_cur_gl.glShaderSource(fs, 1, &fs_src, 0);
+    g_cur_gl.glCompileShader(fs);
+    int okf = 0; g_cur_gl.glGetShaderiv(fs, CUR_GL_COMPILE_STATUS, &okf);
+    g_ot.prog = g_cur_gl.glCreateProgram();
+    g_cur_gl.glAttachShader(g_ot.prog, vs);
+    g_cur_gl.glAttachShader(g_ot.prog, fs);
+    g_cur_gl.glLinkProgram(g_ot.prog);
+    int okl = 0; g_cur_gl.glGetProgramiv(g_ot.prog, CUR_GL_LINK_STATUS, &okl);
+    g_cur_gl.glDeleteShader(vs); g_cur_gl.glDeleteShader(fs);
+    if (!okc || !okf || !okl) {
+        printf("[osk] text shader build failed c=%d f=%d l=%d\n", okc, okf, okl);
+        return 0;
+    }
+    g_ot.a_pos = g_cur_gl.glGetAttribLocation(g_ot.prog, "aPos");
+    g_ot.a_uv  = g_cur_gl.glGetAttribLocation(g_ot.prog, "aUV");
+    g_ot.u_tex = g_cur_gl.glGetUniformLocation(g_ot.prog, "uTex");
+    g_ot.u_color = g_cur_gl.glGetUniformLocation(g_ot.prog, "uColor");
+    if (g_ot.a_pos < 0 || g_ot.a_uv < 0) return 0;
+    /* init changes bindings Unity could observe -> save/restore them all */
+    int cprog = 0, cvao = 0, cvbo = 0, ctex = 0, cact = 0;
+    g_cur_gl.glGetIntegerv(CUR_GL_CURRENT_PROGRAM, &cprog);
+    g_cur_gl.glGetIntegerv(CUR_GL_VERTEX_ARRAY_BINDING, &cvao);
+    g_cur_gl.glGetIntegerv(CUR_GL_ARRAY_BUFFER_BINDING, &cvbo);
+    g_cur_gl.glGetIntegerv(OVT_GL_ACTIVE_TEXTURE, &cact);
+    g_ovt.glActiveTexture(OVT_GL_TEXTURE0);
+    g_cur_gl.glGetIntegerv(OVT_GL_TEXTURE_BINDING_2D, &ctex);
+    g_cur_gl.glGenBuffers(1, &g_ot.vbo);
+    g_cur_gl.glGenVertexArrays(1, &g_ot.vao);
+    g_cur_gl.glBindVertexArray(g_ot.vao);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, g_ot.vbo);
+    g_cur_gl.glVertexAttribPointer((unsigned)g_ot.a_pos, 2, CUR_GL_FLOAT,
+                                   0, 4 * (int)sizeof(float), (const void *)0);
+    g_cur_gl.glEnableVertexAttribArray((unsigned)g_ot.a_pos);
+    g_cur_gl.glVertexAttribPointer((unsigned)g_ot.a_uv, 2, CUR_GL_FLOAT,
+                                   0, 4 * (int)sizeof(float),
+                                   (const void *)(2 * sizeof(float)));
+    g_cur_gl.glEnableVertexAttribArray((unsigned)g_ot.a_uv);
+    g_ovt.glGenTextures(1, &g_ot.tex);
+    g_ovt.glBindTexture(OVT_GL_TEXTURE_2D, g_ot.tex);
+    g_ovt.glTexImage2D(OVT_GL_TEXTURE_2D, 0, (int)OVT_GL_RGBA, w, h, 0,
+                       OVT_GL_RGBA, OVT_GL_UNSIGNED_BYTE, rgba);
+    g_ovt.glTexParameteri(OVT_GL_TEXTURE_2D, OVT_GL_TEXTURE_MIN_FILTER,
+                          (int)OVT_GL_LINEAR);
+    g_ovt.glTexParameteri(OVT_GL_TEXTURE_2D, OVT_GL_TEXTURE_MAG_FILTER,
+                          (int)OVT_GL_LINEAR);
+    g_ovt.glTexParameteri(OVT_GL_TEXTURE_2D, OVT_GL_TEXTURE_WRAP_S,
+                          (int)OVT_GL_CLAMP_TO_EDGE);
+    g_ovt.glTexParameteri(OVT_GL_TEXTURE_2D, OVT_GL_TEXTURE_WRAP_T,
+                          (int)OVT_GL_CLAMP_TO_EDGE);
+    g_ovt.glBindTexture(OVT_GL_TEXTURE_2D, (unsigned)ctex);
+    g_ovt.glActiveTexture((unsigned)cact);
+    g_cur_gl.glBindVertexArray((unsigned)cvao);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, (unsigned)cvbo);
+    g_cur_gl.glUseProgram((unsigned)cprog);
+    g_ot.ok = 1;
+    printf("[osk] font atlas live (%dx%d tex=%u)\n", w, h, g_ot.tex);
+    return 1;
+}
+
+/* draw nquads text quads: 6 verts/quad x 4 floats (x,y,u,v), y-down PIXEL
+ * space (same design space as overlay_rect).  Saves/restores every binding
+ * so rect() and Unity keep working after a flush. */
+void gds_egl_overlay_quads(const float *verts, int nquads,
+                           float r, float g, float b) {
+    if (!g_ov.open || !g_ot.ok || !verts || nquads <= 0) return;
+    float W = (float)g_ov.w, H = (float)g_ov.h;
+    int nv = nquads * 6;
+    float *ndc = (float *)malloc((size_t)nv * 4 * sizeof(float));
+    if (!ndc) return;
+    for (int i = 0; i < nv; i++) {
+        float x = verts[i * 4], y = verts[i * 4 + 1];
+        ndc[i * 4]     = x * 2.0f / W - 1.0f;
+        ndc[i * 4 + 1] = 1.0f - y * 2.0f / H;
+        ndc[i * 4 + 2] = verts[i * 4 + 2];
+        ndc[i * 4 + 3] = verts[i * 4 + 3];
+    }
+    int cprog = 0, cvao = 0, cvbo = 0, ctex = 0, cact = 0;
+    g_cur_gl.glGetIntegerv(CUR_GL_CURRENT_PROGRAM, &cprog);
+    g_cur_gl.glGetIntegerv(CUR_GL_VERTEX_ARRAY_BINDING, &cvao);
+    g_cur_gl.glGetIntegerv(CUR_GL_ARRAY_BUFFER_BINDING, &cvbo);
+    g_cur_gl.glGetIntegerv(OVT_GL_ACTIVE_TEXTURE, &cact);
+    g_ovt.glActiveTexture(OVT_GL_TEXTURE0);
+    g_cur_gl.glGetIntegerv(OVT_GL_TEXTURE_BINDING_2D, &ctex);
+    int eb = g_cur_gl.glIsEnabled(CUR_GL_BLEND);
+    int bf[4]; ovt_blend_save(bf);
+    if (!eb) g_cur_gl.glEnable(CUR_GL_BLEND);
+    g_cur_gl.glUseProgram(g_ot.prog);
+    if (g_ot.u_tex >= 0) g_ovt.glUniform1i(g_ot.u_tex, 0);
+    if (g_ot.u_color >= 0) g_cur_gl.glUniform4f(g_ot.u_color, r, g, b, 1.0f);
+    g_ovt.glBindTexture(OVT_GL_TEXTURE_2D, g_ot.tex);
+    g_cur_gl.glBindVertexArray(g_ot.vao);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, g_ot.vbo);
+    g_cur_gl.glBufferData(CUR_GL_ARRAY_BUFFER,
+                          (long)nv * 4 * (long)sizeof(float), ndc,
+                          CUR_GL_STREAM_DRAW);
+    g_cur_gl.glDrawArrays(CUR_GL_TRIANGLES, 0, nv);
+    g_cur_gl.glBindVertexArray((unsigned)cvao);
+    g_cur_gl.glBindBuffer(CUR_GL_ARRAY_BUFFER, (unsigned)cvbo);
+    g_ovt.glBindTexture(OVT_GL_TEXTURE_2D, (unsigned)ctex);
+    g_ovt.glActiveTexture((unsigned)cact);
+    g_cur_gl.glUseProgram((unsigned)cprog);
+    if (!eb) g_cur_gl.glDisable(CUR_GL_BLEND);
+    ovt_blend_restore(bf);
+    free(ndc);
+}
+
 void gds_egl_overlay_end(void) {
     if (!g_ov.open) return;
     g_ov.open = 0;

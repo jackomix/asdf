@@ -1,18 +1,26 @@
 /* osk.c -- gamepad on-screen keyboard for the kairo FEP text entry.
  *
- * Verbatim port of the approved Terraria NextOS controller keyboard
- * (ter_vkbd_* in terraria-nextos/src/main.c, itself ported from the
- * Prizefighters 2 port's controller keyboard): same QWERTY layout in a
- * 1280x720 design space, same move/activate/repeat logic, same latch that
- * swallows the pad until everything is released once after open, same
- * 5x7 run-length glyph renderer.  Only the platform seam differs:
- *   - Terraria stores text in its jni_softinput buffer; ours is owned here
- *     and returned through kairo's getResultInputPanel JNI (see jni.c).
- *   - Terraria draws with glScissor+glClear rects; ours reuses the
- *     game-proven cursor-overlay GL (gds_egl_overlay_*, egl_shim.c).
- * Controls (Terraria's, Y=space added; banner drawn at the bottom):
- *   dpad  move      A/R3  press key      B  backspace
- *   X     shift     Y     space          SELECT cancel    START done
+ * 0.95.8 overhaul (user brief 2026-08): the keyboard was a verbatim port of
+ * the approved Terraria/Prizefighters controller keyboard -- pixel font,
+ * midnight-blue/warm-gold, staggered QWERTY with no number row, shift that
+ * latched + re-derived caps from the letter you backspaced onto, no '#'
+ * glyph at all ("Game #1" was untypable).  The user's compromise pick:
+ *   - font:  clean rounded sans -> DejaVu Sans Bold RGBA atlas, GENERATED
+ *     by tools/make_osk_font.py (single source of truth: atlas bytes +
+ *     osk_font_data.h metrics + osk_layout.h palette/layout tables +
+ *     mock_osk.png preview).
+ *   - style: dark charcoal panel w/ 4-band vertical gradient, soft 3D
+ *     bevels on keys (skeuomorphism nod), one calm blue accent.
+ *   - layout: aligned 10-wide grid WITH number row, letters/symbols pages
+ *     (L1/R1), panel centered screen-middle, scrim dims the game behind.
+ *   - shift: X / SHIFT key cycles one-shot -> CAPS LOCK -> off.  Typing a
+ *     letter ends one-shot.  Backspace NEVER touches shift.
+ * The classic Terraria keyboard stays: GDS_OSK=classic forces it, and it
+ * is also the automatic fallback when the atlas file or GL path is gone.
+ *
+ * Controls (new style):
+ *   dpad move   A/R3 press key   B backspace   X shift cycle   Y space
+ *   L1/R1 symbol page            SELECT cancel  START done
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -21,14 +29,102 @@
 #include <stdint.h>
 
 #include "gds.h"
+#include "osk_font_data.h"
+#include "osk_layout.h"
 
-/* egl_shim export: save-state begin, axis-aligned pixel rect, restore. */
+/* egl_shim exports: save-state begin, pixel rects/text, restore. */
 extern int  gds_egl_overlay_begin(int *sw, int *sh);
 extern void gds_egl_overlay_rect(float x, float y, float w, float h,
                                  float r, float g, float b);
+extern void gds_egl_overlay_rect_a(float x, float y, float w, float h,
+                                   float r, float g, float b, float a);
+extern int  gds_egl_overlay_atlas(const unsigned char *rgba, int w, int h);
+extern void gds_egl_overlay_quads(const float *verts, int nquads,
+                                  float r, float g, float b);
 extern void gds_egl_overlay_end(void);
 extern int  egl_shim_screen_w(void);
 extern int  egl_shim_screen_h(void);
+
+/* ---------------------------------------------------------------- shared */
+static int  g_open, g_done, g_ok;
+static char g_text[128];
+static char g_title[96];
+static int  g_maxlen = 16;
+static int  g_latch;
+
+/* 0.95.3: control bytes in user/game text can redraw a printed log line
+ * over itself -- that is exactly how "Sunny Studios\r" kept turning our
+ * own diagnostics into scrambled fragments.  Escape control bytes in any
+ * string we print ("\x0d"). */
+const char *gds_vis(const char *s, char *buf, size_t cap)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p && o + 6 < cap; p++) {
+        if (*p >= 0x20) { buf[o++] = (char)*p; }
+        else o += (size_t)snprintf(buf + o, cap - o, "\\x%02x", *p);
+    }
+    buf[o] = 0;
+    return buf;
+}
+
+static void text_copy(char *dst, size_t cap, const char *src)
+{
+    if (!src)
+        src = "";
+    size_t n = strlen(src);
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+/* ------------------------------------------------------------ edit ops */
+static void vk_append_char(char c)
+{
+    size_t n = strlen(g_text);
+    if (n < (size_t)g_maxlen) {
+        g_text[n] = c;
+        g_text[n + 1] = 0;
+    }
+}
+
+static void vk_backspace(void)
+{
+    size_t n = strlen(g_text);
+    if (n > 0)
+        g_text[n - 1] = 0;
+}
+
+static void vk_commit(void)
+{
+    g_open = 0;
+    g_done = 1;
+    g_ok = 1;
+    char vis[160];
+    flockfile(stderr);
+    fprintf(stderr, "[osk] DONE text=\"%s\"\n",
+            gds_vis(g_text, vis, sizeof vis));
+    fflush(stderr);
+    funlockfile(stderr);
+}
+
+static void vk_cancel(void)
+{
+    g_open = 0;
+    g_done = 1;
+    g_ok = 0;
+    char vis[160];
+    fprintf(stderr, "[osk] CANCEL text=\"%s\"\n",
+            gds_vis(g_text, vis, sizeof vis));
+    fflush(stderr);
+}
+
+/* ================================================================ CLASSIC
+ * The approved Terraria NextOS controller keyboard
+ * (ter_vkbd_* in terraria-nextos/src/main.c, itself ported from the
+ * Prizefighters 2 port's controller keyboard): QWERTY layout in a 1280x720
+ * design space, move/activate/repeat logic, 5x7 run-length glyphs.  Kept
+ * byte-for-byte behavior: GDS_OSK=classic or automatic fallback. */
 
 enum { VK_CHARACTER, VK_BACKSPACE, VK_SHIFT, VK_SPACE, VK_DONE };
 
@@ -39,8 +135,6 @@ struct vk_key {
     int action;
 };
 
-/* QWERTY layout and interaction model ported from the approved
- * Prizefighters 2 controller keyboard (identical to Terraria's). */
 static const struct vk_key vk_keys[] = {
   { 171,382, 86,52,"Q",'q','Q',VK_CHARACTER },
   { 265,382, 86,52,"W",'w','W',VK_CHARACTER },
@@ -114,7 +208,6 @@ static int vk_glyph(char c, unsigned char r[7]) {
     case '8': VG(14,17,17,14,17,17,14); case '9': VG(14,17,17,15,1,1,14);
     case '-': VG(0,0,0,31,0,0,0);       case '_': VG(0,0,0,0,0,0,31);
     case ':': VG(0,4,4,0,4,4,0);        case ' ': return 1;
-    /* kairo dialog titles carry punctuation the Prizefighters font lacks. */
     case '.': VG(0,0,0,0,0,6,6);        case ',': VG(0,0,0,0,12,4,8);
     case '!': VG(4,4,4,4,4,0,4);        case '?': VG(14,17,1,6,4,0,4);
     case '\'': VG(4,4,4,0,0,0,0);       case '/': VG(1,1,2,4,8,16,16);
@@ -123,197 +216,16 @@ static int vk_glyph(char c, unsigned char r[7]) {
 #undef VG
 }
 
-/* ----------------------------------------------------------------- state */
-static int  g_open, g_done, g_ok;
-static char g_text[128];
-static char g_title[96];
-static int  g_maxlen = 16;
-static int  g_sel, g_upper, g_latch;
+static int  g_csel, g_upper;
 
-/* 0.95.3: control bytes in user/game text can redraw a printed log line
- * over itself -- that is exactly how "Sunny Studios\r" kept turning our
- * own diagnostics into scrambled fragments.  Escape control bytes in any
- * string we print ("\x0d"). */
-const char *gds_vis(const char *s, char *buf, size_t cap)
+static void classic_move_selection(int dx, int dy)
 {
-    size_t o = 0;
-    for (const unsigned char *p = (const unsigned char *)s; *p && o + 6 < cap; p++) {
-        if (*p >= 0x20) { buf[o++] = (char)*p; }
-        else o += (size_t)snprintf(buf + o, cap - o, "\\x%02x", *p);
-    }
-    buf[o] = 0;
-    return buf;
-}
-
-static void text_copy(char *dst, size_t cap, const char *src)
-{
-    if (!src)
-        src = "";
-    size_t n = strlen(src);
-    if (n >= cap)
-        n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
-
-/* ------------------------------------------------------------------- api */
-void gds_osk_open(const char *title, const char *initial, int maxlen)
-{
-    if (maxlen > 0 && maxlen < (int)sizeof g_text)
-        g_maxlen = maxlen;
-    else
-        g_maxlen = 16;
-    if (!g_open) {
-        g_open = 1;
-        g_sel = 0;
-        g_latch = 1;            /* swallow pad until full release once */
-        if (title && title[0]) text_copy(g_title, sizeof g_title, title);
-        else text_copy(g_title, sizeof g_title, "ENTER TEXT");
-    }
-    if (initial)
-        text_copy(g_text, sizeof g_text, initial);
-    size_t n = strlen(g_text);
-    if (n > (size_t)g_maxlen) g_text[g_maxlen] = 0;
-    /* 0.95.0 user report: a trailing blank at the end of the prefill was
-     * STILL there after the ASCII-space trim shipped, and the interleaved
-     * boot log (two threads racing stderr) couldn't prove what byte it is.
-     * 0.95.1 (a) dumps the raw tail BYTES so the char is named outright,
-     * and (b) extends the trim past ASCII space to the usual Unicode
-     * blanks a Japanese game font would use -- the OSK bitmap font draws
-     * every one of them as an empty gap + caret, exactly matching the
-     * report.  PREFILL ONLY, never typed text. */
-    n = strlen(g_text);
-    const size_t rawlen = n;
-    char tailhex[3 * 8 + 1];
-    {
-        const unsigned char *p = (const unsigned char *)g_text;
-        size_t tn = n < 8 ? n : 8, ho = 0;
-        for (size_t i = n - tn; i < n; i++)
-            ho += (size_t)snprintf(tailhex + ho, sizeof tailhex - ho,
-                                   "%02x ", p[i]);
-        if (ho) tailhex[ho - 1] = 0;
-        else tailhex[0] = 0;
-    }
-    size_t trimmed = 0;
-    for (;;) {
-        n = strlen(g_text);
-        if (n == 0) break;
-        unsigned char *u = (unsigned char *)g_text;
-        /* 0.95.3: DEVICE-NAMED the "extra space" -- the rawtail bytes in
-         * the 0.95.2 boot log were 53 74 75 64 69 6f 73 0d = "Studios" +
-         * CR (0x0d).  Not a space: no amount of "space trim" could remove
-         * it, the bitmap font drew it as an empty cell ("blank, then
-         * cursor"), and printing it raw made the log line overwrite itself
-         * (the real cause of every "interleave garble"). */
-        if (u[n - 1] == ' ' || u[n - 1] < 0x20) {          /* blank/ctrl */
-            u[--n] = 0; trimmed++; continue;
-        }
-        if (n >= 2 && u[n - 2] == 0xC2 && u[n - 1] == 0xA0) /* U+00A0 NBSP */
-            { u[n -= 2] = 0; trimmed += 2; continue; }
-        if (n >= 3 && u[n - 3] == 0xE3 && u[n - 2] == 0x80 &&
-            u[n - 1] == 0x80)                                /* U+3000 ideo. */
-            { u[n -= 3] = 0; trimmed += 3; continue; }
-        if (n >= 3 && u[n - 3] == 0xE2 && u[n - 2] == 0x80 &&
-            (u[n - 1] == 0x87 || u[n - 1] == 0xAF ||
-             u[n - 1] == 0x8B))       /* figure / narrow-NBSP / zero-width */
-            { u[n -= 3] = 0; trimmed += 3; continue; }
-        break;
-    }
-    n = strlen(g_text);
-    g_upper = n == 0 || g_text[n - 1] == ' ';
-    g_done = 0;
-    g_ok = 0;
-    /* ONE flockfile'd line, text escaped so a control byte can no longer
-     * redraw the log over itself (see the CR note above). */
-    char vis_title[128], vis_text[160];
-    flockfile(stderr);
-    fprintf(stderr, "[osk] open title=\"%s\" rawlen=%zu rawtail=[%s] -> "
-                    "text(%zu)=\"%s\" maxlen=%d%s\n",
-            gds_vis(g_title, vis_title, sizeof vis_title),
-            rawlen, tailhex, n,
-            gds_vis(g_text, vis_text, sizeof vis_text), g_maxlen,
-            trimmed ? " (trailing junk trimmed)" : "");
-    fflush(stderr);
-    funlockfile(stderr);
-}
-
-void gds_osk_set_text(const char *text)
-{
-    if (!g_open)
-        return;
-    text_copy(g_text, sizeof g_text, text);
-    size_t n = strlen(g_text);
-    if (n > (size_t)g_maxlen) g_text[g_maxlen] = 0;
-    g_upper = n == 0 || g_text[n - 1] == ' ';
-}
-
-void gds_osk_hide(void)
-{
-    if (!g_open)
-        return;
-    g_open = 0;
-    g_done = 1;
-    g_ok = 0;
-    fprintf(stderr, "[osk] external hide -> cancel\n");
-    fflush(stderr);
-}
-
-int gds_osk_active(void) { return g_open; }
-int gds_osk_done(void) { return g_done; }
-int gds_osk_result_ok(void) { return g_ok; }
-const char *gds_osk_text(void) { return g_text; }
-
-/* ------------------------------------------------------------ edit ops */
-static void vk_append_char(char c)
-{
-    size_t n = strlen(g_text);
-    if (n < (size_t)g_maxlen) {
-        g_text[n] = c;
-        g_text[n + 1] = 0;
-        g_upper = c == ' ';
-    }
-}
-
-static void vk_backspace(void)
-{
-    size_t n = strlen(g_text);
-    if (n > 0) {
-        g_text[n - 1] = 0;
-        n--;
-        g_upper = n == 0 || g_text[n - 1] == ' ';
-    }
-}
-
-static void vk_commit(void)
-{
-    g_open = 0;
-    g_done = 1;
-    g_ok = 1;
-    char vis[160];
-    flockfile(stderr);
-    fprintf(stderr, "[osk] DONE text=\"%s\"\n",
-            gds_vis(g_text, vis, sizeof vis));
-    fflush(stderr);
-    funlockfile(stderr);
-}
-
-static void vk_cancel(void)
-{
-    g_open = 0;
-    g_done = 1;
-    g_ok = 0;
-    fprintf(stderr, "[osk] CANCEL text=\"%s\"\n", g_text);
-    fflush(stderr);
-}
-
-static void vk_move_selection(int dx, int dy)
-{
-    const struct vk_key *current = &vk_keys[g_sel];
+    const struct vk_key *current = &vk_keys[g_csel];
     int current_x = current->x + current->w / 2;
     int current_y = current->y + current->h / 2;
     int best = -1, best_score = INT32_MAX;
     for (int i = 0; i < VK_NKEYS; i++) {
-        if (i == g_sel) continue;
+        if (i == g_csel) continue;
         const struct vk_key *candidate = &vk_keys[i];
         int candidate_x = candidate->x + candidate->w / 2;
         int candidate_y = candidate->y + candidate->h / 2;
@@ -325,58 +237,34 @@ static void vk_move_selection(int dx, int dy)
         int score = dx ? along + across * 8 : along * 4 + across;
         if (score < best_score) { best_score = score; best = i; }
     }
-    if (best >= 0) g_sel = best;
+    if (best >= 0) g_csel = best;
 }
 
-static void vk_activate_key(int index)
+static void classic_activate_key(int index)
 {
     if (index < 0 || index >= VK_NKEYS) return;
     const struct vk_key *key = &vk_keys[index];
     switch (key->action) {
-    case VK_CHARACTER: vk_append_char(g_upper ? key->upper : key->lower); break;
-    case VK_BACKSPACE: vk_backspace(); break;
+    case VK_CHARACTER:
+        vk_append_char(g_upper ? key->upper : key->lower);
+        {
+            size_t n = strlen(g_text);
+            g_upper = n == 0 || g_text[n - 1] == ' ';
+        }
+        break;
+    case VK_BACKSPACE: vk_backspace();
+        {   /* classic's backspace re-derives caps (the quirk the new style
+             * fixes -- kept here so classic stays classic) */
+            size_t n = strlen(g_text);
+            g_upper = n == 0 || g_text[n - 1] == ' ';
+        }
+        break;
     case VK_SHIFT: g_upper = !g_upper; break;
-    case VK_SPACE: vk_append_char(' '); break;
+    case VK_SPACE: vk_append_char(' '); g_upper = 1; break;
     case VK_DONE: vk_commit(); break;
     }
 }
 
-/* Pad arrays are indexed by the shared NPB_ enum (gds.h); Terraria's
- * native_pad uses the identical slot order, so the edge logic below is a
- * 1:1 port.  Runs once per frame from gds_input_poll (input.c). */
-void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev)
-{
-    static int rep;
-    if (!g_open) { rep = 0; return; }
-#define BTN(i)   (cur[i])
-#define BTNDN(i) (cur[i] && !prev[i])
-    if (g_latch) {
-        if (!BTN(NPB_A) && !BTN(NPB_B) && !BTN(NPB_X) && !BTN(NPB_BACK) &&
-            !BTN(NPB_START) && !BTN(NPB_R3) && !BTN(NPB_DU) && !BTN(NPB_DD) &&
-            !BTN(NPB_DL) && !BTN(NPB_DR))
-            g_latch = 0;
-        return;
-    }
-    int dx = BTN(NPB_DR) ? 1 : (BTN(NPB_DL) ? -1 : 0);
-    int dy = BTN(NPB_DD) ? 1 : (BTN(NPB_DU) ? -1 : 0);
-    int edge_move = BTNDN(NPB_DU) || BTNDN(NPB_DD) || BTNDN(NPB_DL) || BTNDN(NPB_DR);
-    if ((dx || dy) && (edge_move || rep <= 0)) {
-        if (dx) vk_move_selection(dx, 0);
-        if (dy) vk_move_selection(0, dy);
-        rep = edge_move ? 14 : 8;
-    }
-    if (rep > 0) rep--;
-    if (BTNDN(NPB_A) || BTNDN(NPB_R3)) vk_activate_key(g_sel);
-    if (BTNDN(NPB_B)) vk_backspace();
-    if (BTNDN(NPB_X)) g_upper = !g_upper;
-    if (BTNDN(NPB_Y)) vk_append_char(' ');
-    if (BTNDN(NPB_BACK)) vk_cancel();
-    if (BTNDN(NPB_START)) vk_commit();
-#undef BTN
-#undef BTNDN
-}
-
-/* ----------------------------------------------------------------- draw */
 static void design_rect(int sw, int sh, int x, int y, int w, int h,
                         float r, float g, float b)
 {
@@ -413,10 +301,8 @@ static int vk_text_width(const char *text, int scale)
     return text ? (int)strlen(text) * 6 * scale : 0;
 }
 
-void gds_osk_draw(void)
+static void classic_draw(void)
 {
-    if (!g_open)
-        return;
     int sw = 0, sh = 0;
     if (!gds_egl_overlay_begin(&sw, &sh)) {
         static int logged;
@@ -431,7 +317,6 @@ void gds_osk_draw(void)
     design_rect(sw, sh, 132, 268, 1016, 452, 0.018f, 0.025f, 0.055f);
     design_rect(sw, sh, 140, 276, 1000, 444, 0.44f, 0.29f, 0.075f);
     design_rect(sw, sh, 148, 284, 984, 436, 0.035f, 0.070f, 0.155f);
-    /* dialog title from the kairo fepTitle_ (falls back to ENTER TEXT) */
     char title[97];
     {
         size_t i, n = strlen(g_title);
@@ -446,14 +331,10 @@ void gds_osk_draw(void)
     design_rect(sw, sh, 167, 306, 947, 62, 0.66f, 0.46f, 0.11f);
     design_rect(sw, sh, 173, 312, 935, 50, 0.025f, 0.055f, 0.125f);
     char shown[130];
-    /* keep the tail visible for long entries (scale 4 = 24px/char) */
     const char *t = g_text;
     size_t tl = strlen(t);
     if ((int)tl * 24 > 900)
         t += tl - (900 / 24);
-    /* keep the caret: the "no cursor" wish was about the MOUSE pointer,
-     * not this text caret -- and the real trailing space turned out to be
-     * in the prefill text itself (handled at open above). */
     snprintf(shown, sizeof shown, "%s_", t);
     vk_text(sw, sh, 190, 323, shown, 4, 0.98f, 0.91f, 0.58f);
     for (int i = 0; i < VK_NKEYS; i++) {
@@ -469,7 +350,7 @@ void gds_osk_draw(void)
                      g_upper ? "UPPER" : "LOWER");
             label = dynamic_label;
         }
-        int highlighted = i == g_sel ||
+        int highlighted = i == g_csel ||
                           (key->action == VK_SHIFT && g_upper);
         design_rect(sw, sh, key->x - 3, key->y - 3, key->w + 6, key->h + 6,
                     highlighted ? 1.00f : 0.34f, highlighted ? 0.78f : 0.23f,
@@ -485,4 +366,573 @@ void gds_osk_draw(void)
     vk_text(sw, sh, 171, 650, "A SELECT  B DELETE  X SHIFT  START DONE", 2,
             0.82f, 0.86f, 0.94f);
     gds_egl_overlay_end();
+}
+
+/* =================================================================== NEW
+ * 0.95.8 keyboard: generated atlas text over the same overlay GL seam.
+ * Everything visual comes from osk_layout.h (tools/make_osk_font.py). */
+
+static int  g_style = -1;       /* -1 undecided, 0 new, 1 classic */
+static int  g_sel, g_shift;     /* shift: 0 off, 1 one-shot, 2 caps lock */
+static int  g_page;             /* 0 letters, 1 symbols */
+static int  g_home;             /* index of the 'g' key = open position */
+
+/* combined per-page tables (page keys + shared function row), built once */
+static ovk_key_t g_tab_letters[OVK_N_LETTERS + OVK_N_FUNC];
+static ovk_key_t g_tab_symbols[OVK_N_SYMBOLS + OVK_N_FUNC];
+static int g_tab_n[2] = { OVK_N_LETTERS + OVK_N_FUNC,
+                          OVK_N_SYMBOLS + OVK_N_FUNC };
+static int g_tabs_built;
+
+static void build_tables(void)
+{
+    if (g_tabs_built) return;
+    g_tabs_built = 1;
+    memcpy(g_tab_letters, ovk_letters, sizeof ovk_letters);
+    memcpy(g_tab_letters + OVK_N_LETTERS, ovk_func, sizeof ovk_func);
+    memcpy(g_tab_symbols, ovk_symbols, sizeof ovk_symbols);
+    memcpy(g_tab_symbols + OVK_N_SYMBOLS, ovk_func, sizeof ovk_func);
+    g_home = 0;
+    for (int i = 0; i < OVK_N_LETTERS; i++)
+        if (g_tab_letters[i].act == OVKA_CHAR && g_tab_letters[i].lo == 'g')
+            { g_home = i; break; }
+}
+
+static const ovk_key_t *page_table(void)
+{
+    return g_page ? g_tab_symbols : g_tab_letters;
+}
+
+static void style_decide(void)
+{
+    if (g_style >= 0) return;
+    const char *e = getenv("GDS_OSK");
+    g_style = (e && !strcmp(e, "classic")) ? 1 : 0;
+    build_tables();
+}
+
+/* ---- atlas file (written next to loader2 by tools/make_osk_font.py) ---- */
+static unsigned char *g_font;
+static int g_font_tried;
+static const unsigned char *font_rgba(void)
+{
+    if (g_font) return g_font;
+    if (g_font_tried) return NULL;
+    g_font_tried = 1;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/osk_font.rgba", gds_gamedir);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[osk] %s missing -> classic keyboard\n", path);
+        fflush(stderr);
+        return NULL;
+    }
+    unsigned char *buf = (unsigned char *)malloc((size_t)OVK_AW * OVK_AH * 4);
+    size_t rd = buf ? fread(buf, 1, (size_t)OVK_AW * OVK_AH * 4, f) : 0;
+    fclose(f);
+    if (rd != (size_t)OVK_AW * OVK_AH * 4) {
+        free(buf);
+        fprintf(stderr, "[osk] %s short read (%zu) -> classic keyboard\n",
+                path, rd);
+        fflush(stderr);
+        return NULL;
+    }
+    g_font = buf;
+    return g_font;
+}
+
+/* ---- quad batching: one bucket per text color, flushed after the rects */
+enum { QB_TEXT, QB_TITLE, QB_DIM, QB_HINT, QB_COUNT };
+#define QB_CAP (512 * 24)       /* floats per bucket (512 quads) */
+static float g_qb[QB_COUNT][QB_CAP];
+static int   g_qn[QB_COUNT];
+static const float *g_qb_col[QB_COUNT];
+
+static void qb_reset(void)
+{
+    memset(g_qn, 0, sizeof g_qn);
+    static const float cols[QB_COUNT][3] = {
+        { OVKC_TEXT_C }, { OVKC_TITLE_C }, { OVKC_DIM_C }, { OVKC_HINT_C },
+    };
+    for (int i = 0; i < QB_COUNT; i++) g_qb_col[i] = cols[i];
+}
+
+static void qput(int bucket, float x, float y, float w, float h,
+                 float u0, float v0, float u1, float v1)
+{
+    if (g_qn[bucket] + 24 > QB_CAP) return;
+    float *q = g_qb[bucket] + g_qn[bucket];
+    g_qn[bucket] += 24;
+    q[0] = x;     q[1] = y;     q[2] = u0;  q[3] = v0;
+    q[4] = x + w; q[5] = y;     q[6] = u1;  q[7] = v0;
+    q[8] = x;     q[9] = y + h; q[10] = u0; q[11] = v1;
+    q[12] = x + w; q[13] = y;   q[14] = u1; q[15] = v0;
+    q[16] = x + w; q[17] = y + h; q[18] = u1; q[19] = v1;
+    q[20] = x;    q[21] = y + h; q[22] = u0; q[23] = v1;
+}
+
+/* glyph advance within the atlas' metrics (space has no cell) */
+static float ovk_advw(unsigned char c)
+{
+    if (c == ' ') return OVK_SPACE_W;
+    if (c < 0x21 || c > 0x7E) c = '?';
+    return ovk_adv[c - 0x20];
+}
+
+static float ovk_textw(const char *s, float sc)
+{
+    float w = 0;
+    for (; s && *s; s++) w += ovk_advw((unsigned char)*s) * sc;
+    return w;
+}
+
+/* emit glyphs whose quads land in `bucket`; pen/baseline are UNSCALED
+ * design-space pixels -- the sxsy scale is applied here. */
+static float g_sx = 1.0f, g_sy = 1.0f;
+static void ovk_emit(int bucket, float pen, float baseline, const char *s,
+                     float sc)
+{
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == ' ') { pen += OVK_SPACE_W * sc; continue; }
+        if (c < 0x21 || c > 0x7E) c = '?';
+        int idx = c - 0x20;
+        int col = idx % OVK_COLS, row = idx / OVK_COLS;
+        float u0 = (col * OVK_CELL + 0.5f) / OVK_AW;
+        float v0 = (row * OVK_CELL + 0.5f) / OVK_AH;
+        float u1 = ((col + 1) * OVK_CELL - 0.5f) / OVK_AW;
+        float v1 = ((row + 1) * OVK_CELL - 0.5f) / OVK_AH;
+        float x = pen;
+        float y = baseline - OVK_ASC_CELL * sc;   /* cell top */
+        qput(bucket, x * g_sx, y * g_sy, OVK_CELL * sc * g_sx,
+             OVK_CELL * sc * g_sy, u0, v0, u1, v1);
+        pen += ovk_advw(c) * sc;
+    }
+}
+
+/* rect in 640x480 design space -> current drawable */
+static void RR(float x, float y, float w, float h, float r, float g, float b)
+{
+    gds_egl_overlay_rect(x * g_sx, y * g_sy, w * g_sx, h * g_sy, r, g, b);
+}
+
+static void RRA(float x, float y, float w, float h,
+                float r, float g, float b, float a)
+{
+    gds_egl_overlay_rect_a(x * g_sx, y * g_sy, w * g_sx, h * g_sy, r, g, b, a);
+}
+
+/* baseline helpers: place text by its visual top, or center the cell box
+ * inside a key. */
+static float ovk_baseline_top(float y_top, float sc)
+{
+    return y_top + (OVK_ASC_CELL - 3.0f) * sc;   /* 3 = generator top_pad */
+}
+static float ovk_baseline_cell(int y, int h, float sc)
+{
+    return y + (h - OVK_CELL * sc) * 0.5f + OVK_ASC_CELL * sc;
+}
+
+/* ---------------------------------------------------------- interaction */
+static void new_activate(const ovk_key_t *k)
+{
+    switch (k->act) {
+    case OVKA_CHAR: {
+        char c = (g_page == 0 && g_shift) ? k->hi : k->lo;
+        vk_append_char(c);
+        if (g_shift == 1) g_shift = 0;    /* one-shot spent by a letter */
+        break;
+    }
+    case OVKA_SHIFT:
+        g_shift = (g_shift + 1) % 3;      /* off -> 1-shot -> lock -> off */
+        break;
+    case OVKA_SYM:
+        g_page ^= 1;
+        if (g_sel >= g_tab_n[g_page]) g_sel = g_tab_n[g_page] - 1;
+        break;
+    case OVKA_SPACE:
+        vk_append_char(' ');
+        break;
+    case OVKA_BKSP:
+        vk_backspace();                   /* never touches shift */
+        break;
+    case OVKA_DONE:
+        vk_commit();
+        break;
+    }
+}
+
+static void new_move_selection(int dx, int dy)
+{
+    const ovk_key_t *tab = page_table();
+    int n = g_tab_n[g_page];
+    int current_x = tab[g_sel].x + tab[g_sel].w / 2;
+    int current_y = tab[g_sel].y + tab[g_sel].h / 2;
+    int best = -1, best_score = INT32_MAX;
+    for (int i = 0; i < n; i++) {
+        if (i == g_sel) continue;
+        int candidate_x = tab[i].x + tab[i].w / 2;
+        int candidate_y = tab[i].y + tab[i].h / 2;
+        int along = dx ? (candidate_x - current_x) * dx
+                       : (candidate_y - current_y) * dy;
+        if (along <= 0) continue;
+        int across = dx ? abs(candidate_y - current_y)
+                        : abs(candidate_x - current_x);
+        int score = dx ? along + across * 8 : along * 4 + across;
+        if (score < best_score) { best_score = score; best = i; }
+    }
+    if (best >= 0) g_sel = best;
+}
+
+/* ---------------------------------------------------------------- draw */
+static void new_draw(void)
+{
+    int sw = 0, sh = 0;
+    if (!gds_egl_overlay_begin(&sw, &sh)) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[osk] overlay GL unavailable -- keyboard invisible!\n");
+            fflush(stderr);
+        }
+        return;
+    }
+    const unsigned char *rgba = font_rgba();
+    if (!rgba || !gds_egl_overlay_atlas(rgba, OVK_AW, OVK_AH)) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[osk] font atlas/GL unavailable -> classic keyboard\n");
+            fflush(stderr);
+        }
+        gds_egl_overlay_end();
+        g_style = 1;
+        classic_draw();
+        return;
+    }
+    g_sx = (float)sw / 640.0f;
+    g_sy = (float)sh / 480.0f;
+    qb_reset();
+
+    /* scrim: dim the game behind (the "little bit of game behind" wish) */
+    RRA(0, 0, (float)sw / g_sx, (float)sh / g_sy, 0.0f, 0.0f, 0.0f, 0.55f);
+
+    /* charcoal panel: 4-band vertical gradient + soft hi/lo edge light */
+    {
+        static const int pnl[4] = { OVK_PANEL };
+        int px = pnl[0], py = pnl[1], pw = pnl[2], ph = pnl[3];
+        for (int i = 0; i < 4; i++) {
+            int by = py + i * (ph / 4);
+            RR((float)px, (float)by, (float)pw, (float)(ph / 4),
+               ovk_bands[i][0], ovk_bands[i][1], ovk_bands[i][2]);
+        }
+        RR((float)px, (float)py, (float)pw, 2.0f, OVKC_PANEL_HI);
+        RR((float)px, (float)(py + ph) - 2.0f, (float)pw, 2.0f, OVKC_PANEL_LO);
+        RR((float)px, (float)py, 2.0f, (float)ph, OVKC_PANEL_LO);
+        RR((float)(px + pw) - 2.0f, (float)py, 2.0f, (float)ph, OVKC_PANEL_LO);
+    }
+
+    /* title (uppercase, kairo fepTitle_) + n/max counter top-right */
+    {
+        char t[32];
+        size_t i, n = strlen(g_title);
+        if (n > 20) n = 20;
+        for (i = 0; i < n; i++) {
+            char c = g_title[i];
+            t[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32)
+                 : (c >= 0x20 && c <= 0x7E) ? c : '?';
+        }
+        t[i] = 0;
+        static const int tpos[2] = { OVK_TITLE_POS };
+        ovk_emit(QB_TITLE, (float)tpos[0], ovk_baseline_top((float)tpos[1], 0.75f),
+                 t, 0.75f);
+        char cnt[16];
+        snprintf(cnt, sizeof cnt, "%zu/%d", strlen(g_text), g_maxlen);
+        float cw = ovk_textw(cnt, 0.58f);
+        ovk_emit(QB_DIM, 584.0f - cw, ovk_baseline_top(OVK_COUNTER_Y, 0.58f),
+                 cnt, 0.58f);
+    }
+
+    /* text box + entered text (tail-scrolls) + accent caret */
+    {
+        static const int box[4] = { OVK_BOX };
+        int bx = box[0], by = box[1], bw = box[2], bh = box[3];
+        RR((float)bx - 2, (float)by - 2, (float)bw + 4, (float)bh + 4,
+           OVKC_BOX_BORDER);
+        RR((float)bx, (float)by, (float)bw, (float)bh, OVKC_BOX_FILL);
+        float sc = 0.846f;
+        float maxw = (float)bw - 20.0f;
+        const char *t = g_text;
+        size_t tl = strlen(t);
+        while (tl > 0 && ovk_textw(t, sc) > maxw) { t++; tl--; }
+        float bx0 = (float)bx + 10.0f;
+        float bsl = ovk_baseline_cell(by, bh, sc);
+        ovk_emit(QB_TEXT, bx0, bsl, t, sc);
+        float cx = bx0 + ovk_textw(t, sc) + 2.0f;
+        if (cx < bx + bw - 12.0f)
+            RR(cx, (float)by + 8.0f, 3.0f, (float)bh - 16.0f, OVKC_ACCENT);
+    }
+
+    /* keys */
+    {
+        const ovk_key_t *tab = page_table();
+        int n = g_tab_n[g_page];
+        for (int i = 0; i < n; i++) {
+            const ovk_key_t *k = &tab[i];
+            int selected = i == g_sel;
+            int is_char = k->act == OVKA_CHAR;
+            int shift_on = (k->act == OVKA_SHIFT && g_shift > 0) ||
+                           (k->act == OVKA_SYM && g_page == 1);
+            const float *face, *edge;
+            if (selected) {
+                static const float f[3] = { OVKC_SEL_FACE };
+                static const float e[3] = { OVKC_SEL_EDGE };
+                face = f; edge = e;
+                RR((float)k->x - 2.5f, (float)k->y - 2.5f,
+                   (float)k->w + 5, (float)k->h + 5, OVKC_SEL_EDGE);
+            } else if (k->act == OVKA_DONE) {
+                static const float f[3] = { OVKC_DONE_FACE };
+                static const float e[3] = { OVKC_DONE_EDGE };
+                face = f; edge = e;
+            } else if (shift_on) {
+                static const float f[3] = { OVKC_SHIFT_FACE };
+                static const float e[3] = { OVKC_DONE_EDGE };
+                face = f; edge = e;
+            } else {
+                static const float fc[3] = { OVKC_KEY_FACE };
+                static const float ff[3] = { OVKC_FN_FACE };
+                static const float e[3] = { OVKC_KEY_EDGE };
+                face = is_char ? fc : ff; edge = e;
+            }
+            /* skeuomorphic key: drop shadow, face, lit top, dark bottom */
+            RR((float)k->x + 1.0f, (float)k->y + 2.0f,
+               (float)k->w, (float)k->h, OVKC_KEY_LO);
+            RR((float)k->x, (float)k->y, (float)k->w, (float)k->h,
+               face[0], face[1], face[2]);
+            RR((float)k->x, (float)k->y, (float)k->w, 2.0f,
+               edge[0], edge[1], edge[2]);
+            RR((float)k->x, (float)(k->y + k->h) - 2.0f, (float)k->w, 2.0f,
+               OVKC_KEY_LO);
+            /* label */
+            char dyn[8];
+            const char *label = k->label;
+            float lsc;
+            if (is_char) {
+                dyn[0] = (g_page == 0 && g_shift) ? k->hi : k->lo;
+                dyn[1] = 0;
+                label = dyn;
+                lsc = 0.85f;
+            } else if (k->act == OVKA_SHIFT) {
+                label = g_shift == 2 ? "CAPS" : "SHIFT";
+                lsc = 0.62f;
+            } else if (k->act == OVKA_SYM) {
+                label = g_page ? "ABC" : "SYM";
+                lsc = 0.62f;
+            } else {
+                lsc = 0.62f;
+            }
+            float lw = ovk_textw(label, lsc);
+            float tx = (float)k->x + ((float)k->w - lw) * 0.5f;
+            float tb = ovk_baseline_cell(k->y, k->h, lsc);
+            ovk_emit(QB_TEXT, tx, tb, label, lsc);
+        }
+    }
+
+    /* footer hints (centered inside the panel: scale picked by the tool so
+     * the whole line fits the 580px panel) */
+    {
+        static const int hpos[2] = { OVK_HINT_POS };
+        const float hsc = 0.48f;
+        float hw = ovk_textw(OVK_HINT, hsc);
+        static const int pnl2[4] = { OVK_PANEL };
+        float hx = (float)pnl2[0] + ((float)pnl2[2] - hw) * 0.5f;
+        ovk_emit(QB_HINT, hx, ovk_baseline_top((float)hpos[1], hsc),
+                 OVK_HINT, hsc);
+    }
+
+    /* text over everything */
+    for (int i = 0; i < QB_COUNT; i++)
+        if (g_qn[i])
+            gds_egl_overlay_quads(g_qb[i], g_qn[i] / 24,
+                                  g_qb_col[i][0], g_qb_col[i][1],
+                                  g_qb_col[i][2]);
+    gds_egl_overlay_end();
+}
+
+/* ------------------------------------------------------------------- api */
+void gds_osk_open(const char *title, const char *initial, int maxlen)
+{
+    style_decide();
+    if (maxlen > 0 && maxlen < (int)sizeof g_text)
+        g_maxlen = maxlen;
+    else
+        g_maxlen = 16;
+    if (!g_open) {
+        g_open = 1;
+        g_csel = 0;
+        g_sel = g_home;
+        g_page = 0;
+        g_latch = 1;            /* swallow pad until full release once */
+        if (title && title[0]) text_copy(g_title, sizeof g_title, title);
+        else text_copy(g_title, sizeof g_title, "ENTER TEXT");
+    }
+    if (initial)
+        text_copy(g_text, sizeof g_text, initial);
+    size_t n = strlen(g_text);
+    if (n > (size_t)g_maxlen) g_text[g_maxlen] = 0;
+    /* 0.95.0 user report: a trailing blank at the end of the prefill was
+     * STILL there after the ASCII-space trim shipped, and the interleaved
+     * boot log (two threads racing stderr) couldn't prove what byte it is.
+     * 0.95.1 (a) dumps the raw tail BYTES so the char is named outright,
+     * and (b) extends the trim past ASCII space to the usual Unicode
+     * blanks a Japanese game font would use.  PREFILL ONLY, never typed
+     * text. */
+    n = strlen(g_text);
+    const size_t rawlen = n;
+    char tailhex[3 * 8 + 1];
+    {
+        const unsigned char *p = (const unsigned char *)g_text;
+        size_t tn = n < 8 ? n : 8, ho = 0;
+        for (size_t i = n - tn; i < n; i++)
+            ho += (size_t)snprintf(tailhex + ho, sizeof tailhex - ho,
+                                   "%02x ", p[i]);
+        if (ho) tailhex[ho - 1] = 0;
+        else tailhex[0] = 0;
+    }
+    size_t trimmed = 0;
+    for (;;) {
+        n = strlen(g_text);
+        if (n == 0) break;
+        unsigned char *u = (unsigned char *)g_text;
+        /* 0.95.3: DEVICE-NAMED the "extra space" -- the rawtail bytes in
+         * the 0.95.2 boot log were 53 74 75 64 69 6f 73 0d = "Studios" +
+         * CR (0x0d).  Not a space: no amount of "space trim" could remove
+         * it, and printing it raw made the log line overwrite itself. */
+        if (u[n - 1] == ' ' || u[n - 1] < 0x20) {          /* blank/ctrl */
+            u[--n] = 0; trimmed++; continue;
+        }
+        if (n >= 2 && u[n - 2] == 0xC2 && u[n - 1] == 0xA0) /* U+00A0 NBSP */
+            { u[n -= 2] = 0; trimmed += 2; continue; }
+        if (n >= 3 && u[n - 3] == 0xE3 && u[n - 2] == 0x80 &&
+            u[n - 1] == 0x80)                                /* U+3000 ideo. */
+            { u[n -= 3] = 0; trimmed += 3; continue; }
+        if (n >= 3 && u[n - 3] == 0xE2 && u[n - 2] == 0x80 &&
+            (u[n - 1] == 0x87 || u[n - 1] == 0xAF ||
+             u[n - 1] == 0x8B))       /* figure / narrow-NBSP / zero-width */
+            { u[n -= 3] = 0; trimmed += 3; continue; }
+        break;
+    }
+    n = strlen(g_text);
+    g_upper = n == 0 || g_text[n - 1] == ' ';
+    /* new style: sentence start -> one-shot shift, exactly like the phone
+     * keyboards this replaces. */
+    g_shift = (n == 0 || g_text[n - 1] == ' ') ? 1 : 0;
+    /* prefill may be a symbol ("Game #1"): open on the page that shows the
+     * last char so the user sees it. */
+    if (n > 0) {
+        unsigned char last = (unsigned char)g_text[n - 1];
+        int on_letters = (last >= 'a' && last <= 'z') ||
+                         (last >= 'A' && last <= 'Z') ||
+                         (last >= '0' && last <= '9') || last == ' ';
+        g_page = on_letters ? 0 : 1;
+    }
+    g_done = 0;
+    g_ok = 0;
+    char vis_title[128], vis_text[160];
+    flockfile(stderr);
+    fprintf(stderr, "[osk] open title=\"%s\" rawlen=%zu rawtail=[%s] -> "
+                    "text(%zu)=\"%s\" maxlen=%d%s\n",
+            gds_vis(g_title, vis_title, sizeof vis_title),
+            rawlen, tailhex, n,
+            gds_vis(g_text, vis_text, sizeof vis_text), g_maxlen,
+            trimmed ? " (trailing junk trimmed)" : "");
+    fflush(stderr);
+    funlockfile(stderr);
+}
+
+void gds_osk_set_text(const char *text)
+{
+    if (!g_open)
+        return;
+    text_copy(g_text, sizeof g_text, text);
+    size_t n = strlen(g_text);
+    if (n > (size_t)g_maxlen) g_text[g_maxlen] = 0;
+    g_upper = n == 0 || g_text[n - 1] == ' ';
+    g_shift = (n == 0 || g_text[n - 1] == ' ') ? 1 : 0;
+}
+
+void gds_osk_hide(void)
+{
+    if (!g_open)
+        return;
+    g_open = 0;
+    g_done = 1;
+    g_ok = 0;
+    fprintf(stderr, "[osk] external hide -> cancel\n");
+    fflush(stderr);
+}
+
+int gds_osk_active(void) { return g_open; }
+int gds_osk_done(void) { return g_done; }
+int gds_osk_result_ok(void) { return g_ok; }
+const char *gds_osk_text(void) { return g_text; }
+
+/* Pad arrays are indexed by the shared NPB_ enum (gds.h).  Runs once per
+ * frame from gds_input_poll (input.c). */
+void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev)
+{
+    static int rep;
+    if (!g_open) { rep = 0; return; }
+    style_decide();
+#define BTN(i)   (cur[i])
+#define BTNDN(i) (cur[i] && !prev[i])
+    if (g_latch) {
+        int any = 0;
+        for (int i = 0; i < NPB_COUNT; i++) any |= cur[i];
+        if (!any) g_latch = 0;
+        return;
+    }
+    int dx = BTN(NPB_DR) ? 1 : (BTN(NPB_DL) ? -1 : 0);
+    int dy = BTN(NPB_DD) ? 1 : (BTN(NPB_DU) ? -1 : 0);
+    int edge_move = BTNDN(NPB_DU) || BTNDN(NPB_DD) || BTNDN(NPB_DL) || BTNDN(NPB_DR);
+    if ((dx || dy) && (edge_move || rep <= 0)) {
+        if (dx) { if (g_style == 1) classic_move_selection(dx, 0);
+                  else new_move_selection(dx, 0); }
+        if (dy) { if (g_style == 1) classic_move_selection(0, dy);
+                  else new_move_selection(0, dy); }
+        rep = edge_move ? 14 : 8;
+    }
+    if (rep > 0) rep--;
+    if (g_style == 1) {
+        if (BTNDN(NPB_A) || BTNDN(NPB_R3)) classic_activate_key(g_csel);
+        if (BTNDN(NPB_B)) { vk_backspace();
+            size_t n = strlen(g_text);
+            g_upper = n == 0 || g_text[n - 1] == ' ';
+        }
+        if (BTNDN(NPB_X)) g_upper = !g_upper;
+        if (BTNDN(NPB_Y)) { vk_append_char(' '); g_upper = 1; }
+    } else {
+        if (BTNDN(NPB_A) || BTNDN(NPB_R3))
+            new_activate(&page_table()[g_sel]);
+        if (BTNDN(NPB_B)) vk_backspace();        /* shift untouched */
+        if (BTNDN(NPB_X)) g_shift = (g_shift + 1) % 3;
+        if (BTNDN(NPB_Y)) vk_append_char(' ');
+        if (BTNDN(NPB_LB) || BTNDN(NPB_RB)) {
+            g_page ^= 1;
+            if (g_sel >= g_tab_n[g_page]) g_sel = g_tab_n[g_page] - 1;
+        }
+    }
+    if (BTNDN(NPB_BACK)) vk_cancel();
+    if (BTNDN(NPB_START)) vk_commit();
+#undef BTN
+#undef BTNDN
+}
+
+void gds_osk_draw(void)
+{
+    if (!g_open)
+        return;
+    style_decide();
+    if (g_style == 1) classic_draw();
+    else new_draw();
 }
