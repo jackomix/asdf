@@ -4,6 +4,51 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.2-echofix (music intro echo SOLVED from user PCM captures + fixed)
+**The echo mystery is closed with hard data.** The user uploaded the 0.95.0
+captures (`echo_prod.pcm` = what FMOD's mixer pushed, `echo_play.pcm` = what
+the speaker played; 24000Hz stereo s16, first ~5.4s of the title music).
+Offline cross-correlation:
+
+- **prod == play BYTE-EXACT over the whole 5.07s overlap** (max|diff| = 0):
+  our ring repeats nothing. The echo was already inside FMOD's output.
+- **The repeat:** play[0:0.20s] reappears at **0.3628s** (ncc 0.999, same
+  amplitude, ≤-43dB sample deltas = mixer float noise) — i.e. the speaker
+  heard `stream[0:0.3628s]` and then *the same stream again from offset 0*.
+- **Mechanism (fits the 0.95.0 log exactly):** the game DOUBLE-STARTS the
+  title BGM (`music START` at producer block #15096 → ~16 content blocks →
+  one silent block → `music START` again). Real Android does the same thing
+  invisibly (its mixer backlog is ~1 block, so the restart cuts after a few
+  ms). Our first run had stacked **33800B ≈ 0.35s of unread backlog**, all
+  of which played before the restart's audio — that backlog is the echo.
+- The user's clue "the first tiny piece changes length per boot" is just
+  however much of run #1 piled up before the game's second start (race).
+
+**Fix (`echo_restart_check` in opensles_audio.c):** content-verified ring
+realignment. Every pushed quantum (~21ms) of the first 128 after ≥2s of
+music silence gets a 4-byte-word hash + its absolute ring position; when
+the opening 8-quantum pattern reappears at quantum `j` (8 exact consecutive
+hash matches — cannot false-positive on ordinary playback), we:
+1. **drop** the unread run-1 backlog (advance the read cursor to the
+   restart's first byte, `qw[j-1]`), and
+2. **skip** the restart stream forward by however much the listener already
+   heard since session start (phase-aligned continuation).
+Result by construction (verified against the real captures): what plays is
+`stream[heard:...]` — the music continues seamlessly, **zero repeated
+audio**. CAS on the ring tail with 4 retries; graceful no-op if the
+listener already passed the seam. One log line per fired fix.
+
+**Lesson for the next Kairosoft ports:** a game restarting a track at boot
+is NORMAL and inaudible when the producer can't run far ahead. Whenever a
+port buffers more than ~100ms at stream start, implement this same
+pattern-verified seam realignment (or cap the startup backlog harder) —
+do NOT wait for push-pattern evidence per game, the code is generic
+(opensles_audio.c, session detector + realign).
+
+Also in this build: nothing else changed vs 0.95.1-evidence (OSK rawtail
+hex evidence line, evdev key dumps + GDS_QUITCHORD_KEYS, log-diet round 2
+are all still in).
+
 ## 0.95.1-evidence (unambiguous OSK/key evidence; log diet round 2)
 Shipped in response to the 0.95.0 device logs (Aug 7): three open items all
 get *yes/no evidence* in the next boot log instead of more guesswork.
