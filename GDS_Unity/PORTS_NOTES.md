@@ -4,6 +4,68 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.9-osk2 (OSK v2: monochrome + console conventions, user feedback round)
+
+User feedback on 0.95.8 + "do a shit ton of research" request.  Research done
+(Xbox 2024 gamepad layout screenshots/articles, Steam Deck Big Picture
+keyboard screenshots, Switch OSK, PS5 OSK reddit complaints), then every user
+point was implemented; research only filtered HOW (not WHAT).  Key findings:
+Xbox's new layout is vertically-aligned grid w/ button-glyph badges on key
+corners (X/Y on keys, LT/RB on <> caret keys) and Microsoft's X=backspace/
+Y=space bindings; Deck shows shift PAIRS on symbol keys (small glyph above),
+dark translucent panel; PS5's redesign was PANNED for low contrast + removing
+button color/icons -> selection must stay high-contrast even when mono.
+
+Every user point -> change:
+- "no colour at all, monochromatic, aesthetically agnostic" -> full grayscale
+  palette (charcoal gradient panel #2e2e34->#141418, gray keys, white text);
+  selection = INVERTED (white face + dark text, PS5-contrast lesson).
+- "fn row doesn't align; space bar 3.5u" -> function row snapped to the grid:
+  Shift 2u, #+= 2u, Space 3u, Del 1u, Done 2u (sums exactly to 10 cols).
+- "keys spaced vertically not horizontally" -> gap 3px->8px horizontal.
+- "bottom right dead space, put quotes/periods there" -> letters page rows
+  now 10-wide: `asdfghjkl'` and `zxcvbnm,.-`.
+- "space too wide" -> space advance 18.5 (2.3x!) -> natural 8.0 (tool bug).
+- "everything is caps" -> labels title-case (Shift/#+=/Space/Del/Done),
+  title shown as the game sends it, "Caps" label only when locked.
+- "bottom legend is crappy, draw the button glyph on the key's corner" ->
+  legend deleted; badges drawn with rects: light circle + dark letter
+  (X on Shift, Y on Space, B on Del), dark pills (START on Done,
+  L1/R1 gripping the text-box edges); badge inverts on selected keys.
+- "maybe L and R move the cursor left and right" -> REAL caret: L1/R1 walk
+  it (edge+repeat), insert/backspace at caret, auto-scroll keeps caret
+  visible; page flip now lives ONLY on the #+= key.
+- "gradient is just 4 strips" -> per-1px-row lerped gradient (396 rects).
+- "background a little more darkened" -> scrim alpha 0.55 -> 0.68.
+- "text a bit too bold" -> atlas font DejaVuSans-Bold -> DejaVuSans (Book).
+- "counter should shake when typing at max" -> g_shake=14 frames of decaying
+  alternating x-offset on the n/max counter (fails insert, exact ask).
+- "shift does nothing on symbols page" -> symbols page = physical-kb shift
+  pairs (1!, 2@, ... -_ =+ [{ ]} ;: '" ,< .> /? \| and lone `~); small
+  sibling glyph drawn above (Deck style); typing shifted emits hi glyph,
+  one-shot/lock semantics shared with letters.
+- "instead of symbols text, Nintendo uses glyph" -> page key label "#+="
+  (Nintendo Switch's convention) / "ABC" when on symbols page.
+- "SEL cancel does nothing here" -> INVESTIGATED in classes.dex:
+  Utility$3$1.onCancel stores text + ok=false; FepPanel.startInputPanel
+  takes positive_/negative_ button label strings; getInputPanelResult
+  returns StringUtil.getString(result_) or null.  So prompts are
+  INDIVIDUALLY cancellable; company-name at boot passes negative_="" -> on
+  Android there was no cancel button either; the old SEL hint was a lie.
+  Now: loader passes negative_ through (gds_osk_set_negative), OSK draws a
+  "SEL <label>" pill centered in the bottom band ONLY when offered, and the
+  open log prints pos="/neg=" so future prompts can be checked.
+
+Host evidence: 60-assert logic suite green (caret ops, pairs, shake flag,
+page-flip-only-via-key, negative API, latch, nav grid); pixel-true render
+harness (real C draw -> preview_osk_letters/symbols/caps.png) caught the
+letters-page pair clutter (pair display now symbols-page-only).  NOT yet
+device-verified -- watch `[osk] font atlas live` and the open line's
+pos=/neg= fields in port_launch.log.
+
+Deferred from earlier notes: ~0.5s dead-A after DONE (likely game-side),
+big tab glyphs (not in this build), dump_hooks.py automation.
+
 ## 0.95.8-osk (full OSK overhaul; single-source-of-truth generator tool)
 
 User brief (2026-08): the OSK was a verbatim Terraria/Prizefighters port and

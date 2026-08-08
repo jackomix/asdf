@@ -133,6 +133,7 @@ int  gds_osk_active(void);          /* overlay visible, owns the pad */
 int  gds_osk_done(void);            /* latched: entry finished (ok or cancel) */
 int  gds_osk_result_ok(void);       /* DONE=1 / CANCEL=0 (valid when done) */
 const char *gds_osk_text(void);
+void gds_osk_set_negative(const char *label); /* per-prompt cancel affordance */
 void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev);
 void gds_osk_draw(void);            /* called pre-swap from egl_shim */
 

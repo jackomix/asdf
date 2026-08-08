@@ -2870,17 +2870,28 @@ static int64_t j_kairo_InputPanel(jctx *c)
         }
         /* 0.95.3: escape control bytes (the CR in the stored name kept
          * redrawing this log line over itself). */
-        char vis_title[128], vis_text[160];
+        char vis_title[128], vis_text[160], vis_pos[64], vis_neg[64];
+        const char *positive = (no >= 3 && objs[2] && objs[2]->str) ? objs[2]->str : "";
+        const char *negative = (no >= 4 && objs[3] && objs[3]->str) ? objs[3]->str : "";
         flockfile(stderr);
         fprintf(stderr, "[osk] Utility.%s%s title=\"%s\" text(%zu)=\"%s\" "
-                        "tail=[%s] nstr=%d nnum=%d max=%d\n",
+                        "tail=[%s] pos=\"%s\" neg=\"%s\" nstr=%d nnum=%d max=%d\n",
                 name, sig,
                 gds_vis(title, vis_title, sizeof vis_title), tl,
                 gds_vis(text, vis_text, sizeof vis_text),
-                tailhex, no, ni, maxlen);
+                tailhex,
+                gds_vis(positive, vis_pos, sizeof vis_pos),
+                gds_vis(negative, vis_neg, sizeof vis_neg),
+                no, ni, maxlen);
         fflush(stderr);
         funlockfile(stderr);
         gds_osk_open(title, text, maxlen);
+        /* 0.95.9: dex-verified -- FepPanel carries positive_/negative_
+         * button labels; a non-empty negative_ means the prompt offers a
+         * cancel (AlertDialog negative button on Android), so the OSK may
+         * honestly advertise SELECT.  Empty (company name at boot): no
+         * cancel exists there and the old SEL hint was a lie. */
+        gds_osk_set_negative(negative[0] ? negative : NULL);
         return 1;
     }
     if (is_poll) {

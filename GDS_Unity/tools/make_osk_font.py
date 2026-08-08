@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
 """make_osk_font.py -- rasterize the OSK font atlas + generate the single
-source of truth for the 0.95.8 OSK overhaul (charcoal + blue accent, grid
-layout, DejaVu Sans Bold per user picks).
+source of truth for the OSK (0.95.9 v2: monochromatic, console-neutral).
+
+v2 user feedback drove the redesign, cross-checked against real console
+OSKs (Xbox gamepad layout 2024, Steam Deck Big Picture keyboard, Switch):
+
+  * NO colour anywhere -- pure grayscale so it sits neutrally over every
+    Kairosoft game (user: "it should be monochromatic ... very
+    aesthetically agnostic").
+  * Grid-aligned function row: Shift/#+= = 2u, Space = 3u, Del = 1u,
+    Done = 2u, same 8px gaps as the letter grid (user: "space bar 3.5
+    key width ... kind of weird").
+  * Horizontal key gap = vertical gap (8px).
+  * Common punctuation fills the bottom-right dead zone (',', '.', '-',
+    apostrophe) -- user: "that's where the quotes and . can be".
+  * Symbols page = physical-keyboard shift PAIRS (Deck/Xbox style: small
+    glyph above, big glyph below), so shift MEANS something there
+    (user: "shift doesn't do anything on the symbols page").
+  * Title-case labels (Shift/Space/Del/Done, "#+=" like Nintendo's),
+    no ALL-CAPS assault; title displayed as the game sends it.
+  * DejaVu Sans (Book, not Bold) -- user: "text is a bit too bold".
+  * No footer legend: controller button glyphs are drawn as badges on the
+    keys themselves (user's suggestion; Xbox does exactly this).
+  * Smooth per-pixel panel gradient (not 4 strips), 0.68 scrim.
 
 Outputs:
   ports/gamedevstory/gamedevstory/osk_font.rgba  (320x320 RGBA atlas, runtime-loaded)
   loader_ref/osk_font_data.h                     (advances + metrics, compiled in)
   loader_ref/osk_layout.h                        (palette + panel + key tables, compiled in)
-  mock_osk.png                                   (preview of the final look for the user)
-
-Design notes: the key tables drive BOTH the C draw and the mock, so they can
-never drift apart.  Palette: charcoal panel with a subtle top->bottom
-gradient, soft 3D-beveled keys, one calm blue accent (user pick).
+  mock_osk.png                                   (rough preview; preview_osk_*.png from
+                                                  the real C code is the pixel-true one)
 """
 import os
 from PIL import Image, ImageDraw, ImageFont
@@ -22,10 +40,10 @@ OUT_FONTH = os.path.join(ROOT, 'loader_ref/osk_font_data.h')
 OUT_LAY = os.path.join(ROOT, 'loader_ref/osk_layout.h')
 OUT_MOCK = os.path.join(ROOT, 'mock_osk.png')
 
-TTF = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+TTF = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 PX = 24            # nominal glyph px in the atlas (24 keeps tall glyphs inside 32px cells)
 CELL = 32          # atlas cell
-COLS, ROWS = 10, 9  # 95 glyphs 0x20..0x7E -> 10 cols; 9.5 rows -> use 10 rows w/ last cells blank
+COLS = 10          # 95 glyphs 0x20..0x7E -> 10 cols
 AW = COLS * CELL
 AH = 10 * CELL
 
@@ -33,59 +51,60 @@ AH = 10 * CELL
 ACT_CHAR, ACT_SHIFT, ACT_SYM, ACT_SPACE, ACT_BKSP, ACT_DONE = range(6)
 
 L = {}
-L['panel'] = (30, 34, 580, 416)                    # x, y, w, h
-L['bands'] = [                                     # top->bottom charcoal gradient
-    (0x3b, 0x43, 0x53), (0x34, 0x3b, 0x49),
-    (0x2d, 0x33, 0x3f), (0x26, 0x2b, 0x35)]
-L['panel_hi'] = (0x58, 0x62, 0x82)                 # top highlight line
-L['panel_lo'] = (0x17, 0x1a, 0x21)                 # bottom shadow line
-L['title_c'] = (0xe8, 0xec, 0xf4)
-L['dim_c'] = (0x9a, 0xa3, 0xb5)
-L['hint_c'] = (0x8f, 0x98, 0xab)
-L['box_border'] = (0x14, 0x17, 0x20)
-L['box_fill'] = (0x1b, 0x1e, 0x26)
-L['text_c'] = (0xf4, 0xf6, 0xfa)
-L['accent'] = (0x6e, 0xa8, 0xff)                   # calm blue (caret etc.)
-L['sel_face'] = (0x3d, 0x7b, 0xff)
-L['sel_edge'] = (0x9d, 0xc1, 0xff)
-L['key_face'] = (0x45, 0x4d, 0x60)
-L['key_edge'] = (0x5b, 0x64, 0x79)
-L['key_lo'] = (0x17, 0x1a, 0x21)                   # bottom bevel shadow
-L['fn_face'] = (0x3a, 0x41, 0x52)
-L['done_face'] = (0x2e, 0x63, 0xc8)
-L['done_edge'] = (0x6f, 0x9f, 0xe8)
-L['shift_face'] = (0x2f, 0x5d, 0xb8)
+L['panel'] = (30, 34, 580, 396)                    # x, y, w, h
+L['panel_top'] = (0x2e, 0x2e, 0x34)                # smooth gradient ends (C lerps per row)
+L['panel_bot'] = (0x14, 0x14, 0x18)
+L['panel_hi'] = (0x55, 0x55, 0x5f)                 # top highlight line
+L['panel_lo'] = (0x0b, 0x0b, 0x0e)                 # bottom/side shadow line
+L['title_c'] = (0xda, 0xda, 0xe0)
+L['dim_c'] = (0xa4, 0xa4, 0xab)
+L['box_border'] = (0x0a, 0x0a, 0x0c)
+L['box_fill'] = (0x12, 0x12, 0x15)
+L['text_c'] = (0xf4, 0xf4, 0xf6)
+L['sel_face'] = (0xe2, 0xe2, 0xe8)                 # inverted selection (high contrast, mono)
+L['sel_edge'] = (0xff, 0xff, 0xff)
+L['sel_text'] = (0x17, 0x17, 0x1b)
+L['key_face'] = (0x3c, 0x3c, 0x44)
+L['key_edge'] = (0x57, 0x57, 0x5f)
+L['key_lo'] = (0x15, 0x15, 0x1a)                   # bottom bevel shadow
+L['fn_face'] = (0x33, 0x33, 0x3a)
+L['done_face'] = (0x58, 0x58, 0x62)
+L['shift_face'] = (0x6a, 0x6a, 0x74)
+L['badge_face'] = (0xe2, 0xe2, 0xe8)               # face-button circles (light)
+L['badge_text'] = (0x17, 0x17, 0x1b)
+L['pill_face'] = (0x24, 0x24, 0x2b)                # shoulder/start pills (dark)
+L['pill_edge'] = (0x6f, 0x6f, 0x78)
+L['pill_text'] = (0xc9, 0xc9, 0xcf)
+L['caret'] = (0xff, 0xff, 0xff)
 L['textbox'] = (56, 84, 528, 42)                   # x,y,w,h (border incl.)
 L['title_pos'] = (58, 46)
-L['hint_pos'] = (60, 420)
 L['counter_y'] = 50
 
-KX0, KW, KGAP, KH, VGAP = 57, 50, 3, 48, 8
+KX0, KW, KGAP, KH, VGAP = 44, 48, 8, 48, 8         # 8px gaps BOTH axes (user note)
 ROWY = [142, 198, 254, 310]
 
-letters_rows = [
+letters_rows = [           # bottom-right dead zone gets common punctuation
     "1234567890",
     "qwertyuiop",
-    "asdfghjkl",
-    "zxcvbnm",
+    "asdfghjkl'",
+    "zxcvbnm,.-",
 ]
-sym_rows = [
-    "1234567890",
-    "!@#$%^&*()",
-    "-_=+[]{};:",
-    "'\",./\\|~<>",
+sym_rows = [               # physical-keyboard shift pairs (lo, hi)
+    [('1', '!'), ('2', '@'), ('3', '#'), ('4', '$'), ('5', '%'),
+     ('6', '^'), ('7', '&'), ('8', '*'), ('9', '('), ('0', ')')],
+    [('-', '_'), ('=', '+'), ('[', '{'), (']', '}'), (';', ':'),
+     ('\'', '"'), (',', '<'), ('.', '>'), ('/', '?'), ('\\', '|')],
+    [('`', '~')],
 ]
 
 FN_Y = 366
-fn_keys = [   # label, x, y, w, action
-    ("SHIFT", 60, FN_Y, 86, ACT_SHIFT),
-    ("SYM",    149, FN_Y, 66, ACT_SYM),
-    ("SPACE",  218, FN_Y, 180, ACT_SPACE),
-    ("DEL",    401, FN_Y, 66, ACT_BKSP),
-    ("DONE",   470, FN_Y, 111, ACT_DONE),
+fn_keys = [   # label, x, y, w, action -- grid units: 2u+2u+3u+1u+2u, 8px gaps
+    ("Shift", 44, FN_Y, 104, ACT_SHIFT),
+    ("#+=",   156, FN_Y, 104, ACT_SYM),
+    ("Space", 268, FN_Y, 160, ACT_SPACE),
+    ("Del",   436, FN_Y, 48, ACT_BKSP),
+    ("Done",  492, FN_Y, 104, ACT_DONE),
 ]
-HINT = "A TYPE  B DEL  X SHIFT  Y SPACE  L1/R1 PAGE  SEL CANCEL  START DONE"
-HINT_SCALE = 0.48   # fits the full hint inside the panel (x centered in C)
 
 # ---------------------------------------------------------------- font atlas
 def build_atlas():
@@ -105,12 +124,11 @@ def build_atlas():
         bb = font.getbbox(c)
         if c != ' ' and (bb[3] + top_pad > CELL or bb[2] + 1 > CELL):
             print(f"WARN: glyph {c!r} bbox {bb} exceeds cell")
-    order = [(i % COLS) * CELL + (i // COLS) * CELL * AW for i in range(95)]
     rgba = atlas.tobytes()
     os.makedirs(os.path.dirname(OUT_RGBA), exist_ok=True)
     with open(OUT_RGBA, 'wb') as f:
         f.write(rgba)
-    space_w = font.getlength('n') * 0.62 + font.getlength(' ')  # sane fallback
+    space_w = font.getlength(' ')   # natural space advance (user: too wide before)
     return asc, desc, top_pad, adv, space_w
 
 # ---------------------------------------------------------------- header emit
@@ -149,32 +167,26 @@ def emit_layout_h():
                 f.write("#define OVKC_%-10s %s\n" % (name.upper(), fl(c)))
         px, py, pw, ph = L['panel']
         f.write("#define OVK_PANEL %d, %d, %d, %d\n" % (px, py, pw, ph))
-        f.write("static const float ovk_bands[4][3] = { " +
-                ", ".join("{ %s }" % fl(b) for b in L['bands']) + " };\n")
         bx, by, bw, bh = L['textbox']
         f.write("#define OVK_BOX %d, %d, %d, %d\n" % (bx, by, bw, bh))
         tx, ty = L['title_pos']
         f.write("#define OVK_TITLE_POS %d, %d\n#define OVK_COUNTER_Y %d\n"
                 % (tx, ty, L['counter_y']))
-        hx, hy = L['hint_pos']
-        f.write("#define OVK_HINT_POS %d, %d\n#define OVK_HINT \"%s\"\n" % (hx, hy, HINT))
-        for tname, table in (("letters", letters_rows), ("symbols", sym_rows)):
-            keys = []
-            for ri, row in enumerate(table):
-                for ci, c in enumerate(row):
-                    keys.append((c, KX0 + ci * (KW + KGAP), ROWY[ri], KW, KH,
-                                 c if c != ' ' else ' ', c.upper() if c.isalpha() else c))
-            f.write("static const ovk_key_t ovk_%s[] = {\n" % tname)
-            for c, x, y, w, h, lo, hi in keys:
-                emit_key(f, c, x, y, w, h, lo, hi, ACT_CHAR)
-            f.write("};\n")
+        f.write("static const ovk_key_t ovk_letters[] = {\n")
+        for ri, row in enumerate(letters_rows):
+            for ci, c in enumerate(row):
+                emit_key(f, c, KX0 + ci * (KW + KGAP), ROWY[ri], KW, KH,
+                         c, c.upper() if c.isalpha() else c, ACT_CHAR)
+        f.write("};\n")
+        f.write("static const ovk_key_t ovk_symbols[] = {\n")
+        for ri, row in enumerate(sym_rows):
+            for ci, (lo, hi) in enumerate(row):
+                emit_key(f, lo, KX0 + ci * (KW + KGAP), ROWY[ri], KW, KH,
+                         lo, hi, ACT_CHAR)
+        f.write("};\n")
         f.write("static const ovk_key_t ovk_func[] = {\n")
         for lab, x, y, w, act in fn_keys:
-            f.write('    { %d, %d, %d, %d, 0, 0, %s, "%s" },\n' %
-                    (x, y, w, KH,
-                     {ACT_SHIFT: 'OVKA_SHIFT', ACT_SYM: 'OVKA_SYM',
-                      ACT_SPACE: 'OVKA_SPACE', ACT_BKSP: 'OVKA_BKSP',
-                      ACT_DONE: 'OVKA_DONE'}[act], lab))
+            emit_key(f, lab, x, y, w, KH, '0', '0', act)
         f.write("};\n")
         f.write("#define OVK_N_LETTERS %d\n#define OVK_N_SYMBOLS %d\n#define OVK_N_FUNC %d\n"
                 % (sum(len(r) for r in letters_rows), sum(len(r) for r in sym_rows),
@@ -184,71 +196,68 @@ def emit_layout_h():
 def mock(asc, top_pad):
     font = ImageFont.truetype(TTF, PX)
     S = 2  # draw at 2x
-    im = Image.new('RGB', (640 * S, 480 * S), (0x4c, 0x73, 0xe2))  # game-ish bg
+    im = Image.new('RGB', (640 * S, 480 * S), (0x55, 0x33, 0x7a))  # game-ish bg
     dr = ImageDraw.Draw(im)
     def rr(x, y, w, h, c):
         dr.rectangle([x * S, y * S, (x + w) * S - 1, (y + h) * S - 1], fill=c)
-    # scrim
     ov = Image.new('RGBA', im.size, (0, 0, 0, 0))
     ImageDraw.Draw(ov).rectangle([0, 0, im.size[0] - 1, im.size[1] - 1],
-                                 fill=(0, 0, 0, int(0.55 * 255)))
+                                 fill=(0, 0, 0, int(0.68 * 255)))
     im = Image.alpha_composite(im.convert('RGBA'), ov).convert('RGB')
     dr = ImageDraw.Draw(im)
     px, py, pw, ph = L['panel']
-    bh = ph // 4
-    for i, b in enumerate(L['bands']):
-        rr(px, py + i * bh, pw, bh + (ph - 4 * bh if i == 3 else 0), b)
+    for yy in range(ph):              # smooth gradient like the C side
+        t = yy / (ph - 1)
+        c = tuple(round(L['panel_top'][i] + (L['panel_bot'][i] - L['panel_top'][i]) * t)
+                  for i in range(3))
+        rr(px, py + yy, pw, 1, c)
     rr(px, py, pw, 2, L['panel_hi'])
     rr(px, py + ph - 2, pw, 2, L['panel_lo'])
     def text(x, y_baseline, s, c, scale=1.0):
         pen = x
         for ch in s:
-            a = font.getlength(ch) * scale
+            f2 = font if scale == 1.0 else ImageFont.truetype(TTF, max(6, int(PX * scale)))
+            a = font.getlength(ch) * scale if scale == 1.0 else f2.getlength(ch)
             if ch != ' ':
-                # draw glyph cell: mock renders straight with scale
-                f2 = font if scale == 1.0 else ImageFont.truetype(TTF, max(6, int(PX * scale)))
                 dr.text((pen * S, (y_baseline - (top_pad + asc) * scale) * S), ch,
                         font=f2, fill=c)
             pen += a
         return pen
     tx, ty = L['title_pos']
-    text(tx, ty + 22, "COMPANY NAME", L['title_c'], 0.75)
+    text(tx, ty + 22, "Company name", L['title_c'], 0.75)
     text(500, L['counter_y'] + 22, "13/14", L['dim_c'], 0.58)
     bx, by, bw, bh = L['textbox']
-    rr(bx, by, bw, bh, L['box_border'])
-    rr(bx + 2, by + 2, bw - 4, bh - 4, L['box_fill'])
+    rr(bx - 2, by - 2, bw + 4, bh + 4, L['box_border'])
+    rr(bx, by, bw, bh, L['box_fill'])
     t = "Sunny Studios"
-    endx = text(bx + 10, by + 30, t, L['text_c'], 0.846)
-    rr(int(endx) + 2, by + 8, 3, 26, L['accent'])
-    sel = (1, 5)   # highlight 'g' row2 idx5? use row1 idx5 -> 'y'; pick (2,5)='g'
-    for vi, table in enumerate((letters_rows,)):
-        for ri, row in enumerate(table):
-            for ci, c in enumerate(row):
-                x, y = KX0 + ci * (KW + KGAP), ROWY[ri]
-                is_sel = (ri, ci) == sel
-                face = L['sel_face'] if is_sel else L['key_face']
-                edge = L['sel_edge'] if is_sel else L['key_edge']
-                if is_sel:
-                    dr.rectangle([(x - 2) * S, (y - 2) * S, (x + KW + 1) * S, (y + KH + 1) * S],
-                                 fill=(0x2b, 0x4f, 0xa8))
-                rr(x, y + 3, KW, KH - 1, L['key_lo'])
-                rr(x, y, KW, KH - 2, face)
-                rr(x, y, KW, 2, edge)
-                wpx = font.getlength(c) * 0.85
-                text(x + (KW - wpx) / 2, y + KH / 2 + 8, c, L['text_c'], 0.85)
+    endx = text(bx + 16, by + 30, t, L['text_c'], 0.846)
+    rr(int(endx) + 2, by + 8, 3, bh - 16, L['caret'])
+    sel = (1, 5)
+    for ri, row in enumerate(letters_rows):
+        for ci, c in enumerate(row):
+            x, y = KX0 + ci * (KW + KGAP), ROWY[ri]
+            is_sel = (ri, ci) == sel
+            face = L['sel_face'] if is_sel else L['key_face']
+            edge = L['sel_edge'] if is_sel else L['key_edge']
+            txt = L['sel_text'] if is_sel else L['text_c']
+            if is_sel:
+                rr(x - 2, y - 2, KW + 4, KH + 4, L['sel_edge'])
+            rr(x + 1, y + 2, KW, KH, L['key_lo'])
+            rr(x, y, KW, KH, face)
+            rr(x, y, KW, 2, edge)
+            rr(x, y + KH - 2, KW, 2, L['key_lo'])
+            f3 = ImageFont.truetype(TTF, int(PX * 0.85))
+            text(x + (KW - f3.getlength(c)) / 2, y + KH / 2 + 8, c, txt, 0.85)
     for lab, x, y, w, act in fn_keys:
         face = L['done_face'] if act == ACT_DONE else L['fn_face']
-        edge = L['done_edge'] if act == ACT_DONE else L['key_edge']
-        rr(x, y + 3, w, KH - 1, L['key_lo'])
-        rr(x, y, w, KH - 2, face)
+        edge = L['key_edge']
+        rr(x + 1, y + 2, w, KH, L['key_lo'])
+        rr(x, y, w, KH, face)
         rr(x, y, w, 2, edge)
-        f2 = ImageFont.truetype(TTF, 15)
-        tw = dr.textlength(lab, font=f2)
-        dr.text(((x + (w - tw / S) / 2) * S, (y + KH / 2 - 7) * S), lab, font=f2,
-                fill=L['text_c'])
-    hx, hy = L['hint_pos']
-    f3 = ImageFont.truetype(TTF, 13)
-    dr.text((hx * S, hy * S), HINT, font=f3, fill=L['hint_c'])
+        rr(x, y + KH - 2, w, 2, L['key_lo'])
+        f2 = ImageFont.truetype(TTF, int(PX * 0.66))
+        tw = f2.getlength(lab)
+        text(x + (w - tw) / 2, y + KH / 2 + 7, lab, L['text_c'], 0.66)
     im = im.resize((640, 480))
     im.save(OUT_MOCK)
     print("mock:", OUT_MOCK)
