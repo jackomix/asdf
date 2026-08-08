@@ -4,6 +4,100 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.10-osk3 (OSK v3 + START/SELECT input fix, user feedback round)
+
+User device-tested 0.95.9 ("this is actually really good") with another
+feedback list.  Every point -> change:
+
+- **"Start and select don't actually do anything when I press them"** --
+  INPUT BUG, not an OSK wiring bug: `gds_osk_pad_tick` already mapped
+  NPB_START->commit / NPB_BACK->cancel, but the bytes never arrived.
+  Root cause was already proven by our own 0.94.0/0.95.0 device runs
+  ("the SDL-side chord never fired: whatever physical SELECT reports as,
+  it is not SDL BACK"; the quit chord only works because the evdev
+  watcher thread polls codes 0x2c0/0x2c1 straight off the 'GO-Super
+  Gamepad' node via EVIOCGKEY).  Something between evdev and SDL's
+  button fill eats those two keys (generic mapping says back:b8/start:b9;
+  device evidence says no).  FIX = watcher shadow: `evdev_chord_down()`
+  now also publishes g_ev_sel/g_ev_sta/g_ev_live each 50ms poll, and
+  `pad_poll()` OR-merges them into g_npb[NPB_BACK/START] -- AFTER its
+  npb-chord block, so the chord path (user-approved, DO NOT TOUCH) keeps
+  reading exactly the SDL-only bytes it always read; timing/behavior
+  unchanged (2s watcher path fires first as before).  First-press roll /
+  GDS_PADLOG stay SDL-view diagnostics on purpose.  Side effect: kairo
+  slots 360/361 + Unity 108/109 (game-side SELECT/START) now also see
+  real presses for the first time -- GDS mobile ignores them, harmless.
+- **SELECT cancel gating**: with the key suddenly real, vk_cancel is now
+  gated on the prompt's negative_ label (new style).  Unadvertised
+  cancel (e.g. company-name boot prompt, negative_="" dex-verified)
+  could re-prompt-loop the game, so SELECT is inert there -- matches the
+  UI, which only shows SEL when offered.  Classic OSK keeps old
+  semantics (SELECT always cancels); classic gains START=Done.
+- "no caps visual indicator, maybe the caps button can turn white" ->
+  caps lock = Shift key face WHITE + dark text + dark badge; one-shot =
+  lit gray (0x6a->0x7a).  Layer semantics now PHYSICAL: one-shot shift
+  applies the full layer, **caps lock uppercases letters only** (a real
+  Caps Lock never touches the number row).
+- "selected colours look odd, outline wraps the sides of the shadow but
+  not underneath" -> selection is a 2px FOCUS RING + 10% white face lift
+  (no more inverted white face: white is now caps-only).  v2's ring rect
+  covered to y+h+2.5 = a hidden 0.5px sliver under the shadow -- exactly
+  the "legs on the sides, no bar underneath" they saw; v3 covers
+  y+h+4 = full 2px bottom bar.  Ring goes DARK on the caps-white key so
+  selection never washes out (PS5 lesson).
+- "highlight transition isn't seamless, both keys light then old
+  dehighlights (esp. Done)" -> CANNOT reproduce or explain in code (one
+  g_sel, one draw loop, one highlight); likely a 1-frame tearing/ghost
+  line between the letters rows and the fn row, made loud by the white
+  inverted face + white ring jumping together.  Mitigation shipped:
+  ring-only selection means a ghosted frame now shows a thin 2px ring on
+  the old key instead of a big white face.  Honest status: tell us if it
+  still bothers on device; next lever would be dpad repeat rate.
+- "symbols page is weird, barely anything there, why shift-pairs there?
+  put shift symbols on the letters page's numbers + bottom punct" ->
+  DONE, user's exact suggestion: symbols page is FLAT now -- all 32
+  printable ASCII punct, 4x8 grid of 62px keys exactly filling the grid
+  span (pairs grouped: () -_ =+ `~ [] {} \| ;: '" ,< .> /?, bang-row
+  !@#$%^&*).  Shift pairs moved to the LETTERS page digit row + bottom
+  punct row with the other-layer glyph small top-left (physical
+  keyboards don't print a small 'A' on 'a', so letters show nothing).
+  Shift/X still cycle globally on both pages (uniform state, no inert
+  keys); "#+=" flips to "ABC" on the symbols page as before.
+- "ABXY badges are white-with-black but start/bumper pills are
+  black-with-white" -> pills unified: light face + dark text, mid-gray
+  hairline edge.  Badges invert (dark disc) ONLY on the caps-white key.
+- "B symbol sits on top of Del" -> badge tucked to (x+11,y+11) r=8, "Del"
+  label nudged down+right.  Still a ~1-2px kiss on a 48px key; user
+  already called this a possible necessary evil.
+- "select thing on the bottom looks ugly, it's the only thing there" ->
+  bottom band deleted; SEL pill + negative label now sit in the title
+  band just left of n/max, only when the prompt offers cancel.
+- "keyboard not centred vertically, a bit too high" -> whole panel +8px
+  (screen margins now 42/42; all row/fn Y constants shifted in the
+  generator, single source of truth).
+- "title slightly higher than the counter's line" -> title + n/max now
+  share one optical centre (cell-centre math at both scales).
+- "max-length shake not noticeable; cut the counter to RED then fade
+  back" -> exactly that: cut to red instantly, fade to gray across the
+  shake; shake 14->22 frames, 5px->8px amplitude.  Red is the ONE
+  sanctioned colour exception to the grayscale rule -- user requested.
+  Also: fresh prompt no longer inherits a mid-decay flash (g_shake=0 in
+  gds_osk_open).
+- "darken the background a tad more" -> scrim 0.68 -> 0.74.
+- Retracted by user, no action: single-quote rationale; L1/R1 pill
+  placement ("I'm kind of used to it now" -- kept as-is).
+
+Evidence on host: 74-assert logic suite green (shift layer truth table
+incl. caps-letters-only + one-shot full layer, flat symbols no-pairs,
+10<->8 page-flip mapping + col clamp + fn<->fn, caret ops, START/SELECT
+gating incl. classic, maxlen).  Pixel-true render harness regenerated
+preview_osk_{letters,shift,symbols,caps}.png from the REAL C draw path
+(caught the stale-shake bug in scene 3's counter!).  Device: watch for
+`[input] force-quit watcher on ...` (shadow source live) and exercise
+START=Done at the company-name prompt; SELECT there should do NOTHING
+(no pill, inert) while a prompt WITH a negative label shows SEL<->cancel
+in the title band (open line logs pos=/neg=).
+
 ## 0.95.9-osk2 (OSK v2: monochrome + console conventions, user feedback round)
 
 User feedback on 0.95.8 + "do a shit ton of research" request.  Research done

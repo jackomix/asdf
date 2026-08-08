@@ -397,6 +397,15 @@ static int evdev_find_gamepad(void) {
     return -1;
 }
 
+/* 0.95.10: the watcher node is the ONLY proven carrier of physical
+ * SELECT/START on the R36S -- SDL never surfaced either (0.94.0/0.95.0:
+ * the SDL-side chord never fired, and the first-press roll never named
+ * them).  The OSK's START=Done / SELECT=cancel were dead for the same
+ * reason.  Publish each poll; pad_poll() merges them into g_npb AFTER
+ * its npb chord block, so the chord keeps reading the exact bytes it
+ * always read (2s watcher path untouched -- user: chord is fine). */
+static volatile unsigned char g_ev_sel, g_ev_sta, g_ev_live;
+
 static int evdev_chord_down(int fd) {
     unsigned char keys[(KEY_MAX + 8) / 8];
     memset(keys, 0, sizeof keys);
@@ -404,6 +413,9 @@ static int evdev_chord_down(int fd) {
         return -1;
     int sel = keys[g_code_sel / 8] & (1 << (g_code_sel % 8));
     int sta = keys[g_code_start / 8] & (1 << (g_code_start % 8));
+    g_ev_sel = sel ? 1 : 0;
+    g_ev_sta = sta ? 1 : 0;
+    g_ev_live = 1;
     return (sel && sta) ? 1 : 0;
 }
 
@@ -416,6 +428,8 @@ static void *pad_watch_thread(void *arg) {
     for (;;) {
         int down;
         if (fd < 0) {
+            g_ev_live = 0;      /* no node: shadow merge stays silent */
+            g_ev_sel = g_ev_sta = 0;
             fd = evdev_find_gamepad();
             if (fd < 0) {
                 /* 0.94.0: NO evdev node exposed both keys on the R36S --
@@ -725,6 +739,17 @@ static void pad_poll(void) {
         }
     } else {
         npb_chord_ms = 0;
+    }
+    /* evdev shadow merge (0.95.10): physical SELECT/START reach g_npb via
+     * the force-quit watcher's node -- deliberately AFTER the npb chord
+     * above so that code path sees exactly the SDL-only bytes it always
+     * saw (the R36S chord lives in the watcher thread and is unchanged).
+     * First-press roll / GDS_PADLOG above stay the SDL-view diagnostics
+     * they were designed as.  kairo slots 360/361, Unity 108/109 and the
+     * OSK all read g_npb after this point, so they now see real keys. */
+    if (g_ev_live) {
+        g_npb[NPB_BACK]  |= g_ev_sel;
+        g_npb[NPB_START] |= g_ev_sta;
     }
 }
 

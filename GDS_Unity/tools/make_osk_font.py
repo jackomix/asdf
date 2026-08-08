@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """make_osk_font.py -- rasterize the OSK font atlas + generate the single
-source of truth for the OSK (0.95.9 v2: monochromatic, console-neutral).
+source of truth for the OSK (0.95.10 v3: monochromatic, console-neutral).
 
-v2 user feedback drove the redesign, cross-checked against real console
-OSKs (Xbox gamepad layout 2024, Steam Deck Big Picture keyboard, Switch):
+v3 user feedback (device-tested 0.95.9) drove this round:
 
-  * NO colour anywhere -- pure grayscale so it sits neutrally over every
-    Kairosoft game (user: "it should be monochromatic ... very
-    aesthetically agnostic").
-  * Grid-aligned function row: Shift/#+= = 2u, Space = 3u, Del = 1u,
-    Done = 2u, same 8px gaps as the letter grid (user: "space bar 3.5
-    key width ... kind of weird").
-  * Horizontal key gap = vertical gap (8px).
-  * Common punctuation fills the bottom-right dead zone (',', '.', '-',
-    apostrophe) -- user: "that's where the quotes and . can be".
-  * Symbols page = physical-keyboard shift PAIRS (Deck/Xbox style: small
-    glyph above, big glyph below), so shift MEANS something there
-    (user: "shift doesn't do anything on the symbols page").
-  * Title-case labels (Shift/Space/Del/Done, "#+=" like Nintendo's),
-    no ALL-CAPS assault; title displayed as the game sends it.
-  * DejaVu Sans (Book, not Bold) -- user: "text is a bit too bold".
-  * No footer legend: controller button glyphs are drawn as badges on the
-    keys themselves (user's suggestion; Xbox does exactly this).
-  * Smooth per-pixel panel gradient (not 4 strips), 0.68 scrim.
+  * Selection is back to a FOCUS RING around the key (the 0.95.9 inverted
+    white face read as "odd"; white is now reserved for CAPS LOCK, and
+    the ring fully encloses the key + its drop shadow, fixing "outline
+    surrounds the sides of the shadow but not underneath").
+  * Caps lock = the Shift key turns WHITE with dark text (user: "maybe
+    for the caps button, it can turn white"); one-shot shift = lit gray.
+  * Symbols page is FLAT: all 32 ASCII punctuation glyphs fill a 4x8
+    grid (user: "barely anything there ... there's so much room").
+    Shift PAIRS moved to the LETTERS page: digits get !@#$%^&*() and the
+    bottom-row punctuation gets its physical-keyboard partners (user:
+    "why not have the shift symbols on the actual letters page").
+  * Panel moved down 8px -- it sat too high, now truly centred.
+  * Scrim 0.68 -> 0.74 ("darken just a tad bit more").
+  * Badges unified: pills (START/L1/R1/SEL) are light-face + dark text
+    like the ABXY circles (were dark-face + light text); SEL pill moved
+    from the lonely bottom band up to the title band next to n/max.
+  * Max-length error: counter CUTS to red then fades back + a stronger
+    shake (user: "not as noticeable ... cut to red then fade back") --
+    the one sanctioned colour exception, requested by the user.
+  * Title text and the n/max counter now share one vertical centre.
+
+v2 (0.95.9) basics that still hold: pure grayscale family, grid-aligned
+function row (2u/2u/3u/1u/2u, 8px gaps both axes), bottom-row punct,
+title-case labels, "#+="/"ABC" page key like Nintendo's, DejaVu Sans
+Book, badges instead of a footer legend, smooth panel gradient.
 
 Outputs:
   ports/gamedevstory/gamedevstory/osk_font.rgba  (320x320 RGBA atlas, runtime-loaded)
@@ -51,7 +57,7 @@ AH = 10 * CELL
 ACT_CHAR, ACT_SHIFT, ACT_SYM, ACT_SPACE, ACT_BKSP, ACT_DONE = range(6)
 
 L = {}
-L['panel'] = (30, 34, 580, 396)                    # x, y, w, h
+L['panel'] = (30, 42, 580, 396)                    # x, y, w, h (v-centred: 42/42 margins)
 L['panel_top'] = (0x2e, 0x2e, 0x34)                # smooth gradient ends (C lerps per row)
 L['panel_bot'] = (0x14, 0x14, 0x18)
 L['panel_hi'] = (0x55, 0x55, 0x5f)                 # top highlight line
@@ -61,27 +67,26 @@ L['dim_c'] = (0xa4, 0xa4, 0xab)
 L['box_border'] = (0x0a, 0x0a, 0x0c)
 L['box_fill'] = (0x12, 0x12, 0x15)
 L['text_c'] = (0xf4, 0xf4, 0xf6)
-L['sel_face'] = (0xe2, 0xe2, 0xe8)                 # inverted selection (high contrast, mono)
-L['sel_edge'] = (0xff, 0xff, 0xff)
-L['sel_text'] = (0x17, 0x17, 0x1b)
+L['sel_edge'] = (0xff, 0xff, 0xff)                 # focus ring (fully encloses key)
 L['key_face'] = (0x3c, 0x3c, 0x44)
 L['key_edge'] = (0x57, 0x57, 0x5f)
 L['key_lo'] = (0x15, 0x15, 0x1a)                   # bottom bevel shadow
 L['fn_face'] = (0x33, 0x33, 0x3a)
 L['done_face'] = (0x58, 0x58, 0x62)
-L['shift_face'] = (0x6a, 0x6a, 0x74)
+L['shift_face'] = (0x7a, 0x7a, 0x84)               # one-shot shift = lit gray
+L['caps_face'] = (0xe2, 0xe2, 0xe8)                # caps lock = WHITE key (user ask)
 L['badge_face'] = (0xe2, 0xe2, 0xe8)               # face-button circles (light)
 L['badge_text'] = (0x17, 0x17, 0x1b)
-L['pill_face'] = (0x24, 0x24, 0x2b)                # shoulder/start pills (dark)
-L['pill_edge'] = (0x6f, 0x6f, 0x78)
-L['pill_text'] = (0xc9, 0xc9, 0xcf)
+L['pill_face'] = (0xe2, 0xe2, 0xe8)                # pills now light like the circles
+L['pill_edge'] = (0x6f, 0x6f, 0x78)                # hairline around the light pill
+L['pill_text'] = (0xc9, 0xc9, 0xcf)                # light text for DARK badges (caps key)
 L['caret'] = (0xff, 0xff, 0xff)
-L['textbox'] = (56, 84, 528, 42)                   # x,y,w,h (border incl.)
-L['title_pos'] = (58, 46)
-L['counter_y'] = 50
+L['err'] = (0xe8, 0x2a, 0x20)                      # maxlen flash; sanctioned red exception
+L['textbox'] = (56, 92, 528, 42)                   # x,y,w,h (border incl.)
+L['title_pos'] = (58, 67)                          # x, BAND-CENTRE y (title & counter)
 
 KX0, KW, KGAP, KH, VGAP = 44, 48, 8, 48, 8         # 8px gaps BOTH axes (user note)
-ROWY = [142, 198, 254, 310]
+ROWY = [150, 206, 262, 318]                        # +8 vs 0.95.9 (panel re-centre)
 
 letters_rows = [           # bottom-right dead zone gets common punctuation
     "1234567890",
@@ -89,15 +94,24 @@ letters_rows = [           # bottom-right dead zone gets common punctuation
     "asdfghjkl'",
     "zxcvbnm,.-",
 ]
-sym_rows = [               # physical-keyboard shift pairs (lo, hi)
-    [('1', '!'), ('2', '@'), ('3', '#'), ('4', '$'), ('5', '%'),
-     ('6', '^'), ('7', '&'), ('8', '*'), ('9', '('), ('0', ')')],
-    [('-', '_'), ('=', '+'), ('[', '{'), (']', '}'), (';', ':'),
-     ('\'', '"'), (',', '<'), ('.', '>'), ('/', '?'), ('\\', '|')],
-    [('`', '~')],
+# physical-keyboard shift pairs, on the LETTERS page (user v3 request):
+# digits -> shifted symbols, bottom-row punct -> its shift partners.
+# Letters pair with their own uppercase.  Caps lock uppercases letters
+# ONLY (like a real Caps Lock); one-shot shift applies the whole layer.
+pairs = {
+    '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
+    '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+    "'": '"', ',': '<', '.': '>', '-': '_',
+}
+sym_rows = [               # FLAT: every printable ASCII punct, one key each,
+    "!@#$%^&*",            # 4x8 = 32 keys exactly fills the grid (v3)
+    "()-_=+`~",
+    "[]{}\\|;:",
+    "'\",<.>/?",
 ]
+SX0, SW, SGAP = 44, 62, 8                          # symbols grid: 8 x 62px = same span
 
-FN_Y = 366
+FN_Y = 374
 fn_keys = [   # label, x, y, w, action -- grid units: 2u+2u+3u+1u+2u, 8px gaps
     ("Shift", 44, FN_Y, 104, ACT_SHIFT),
     ("#+=",   156, FN_Y, 104, ACT_SYM),
@@ -170,19 +184,19 @@ def emit_layout_h():
         bx, by, bw, bh = L['textbox']
         f.write("#define OVK_BOX %d, %d, %d, %d\n" % (bx, by, bw, bh))
         tx, ty = L['title_pos']
-        f.write("#define OVK_TITLE_POS %d, %d\n#define OVK_COUNTER_Y %d\n"
-                % (tx, ty, L['counter_y']))
+        f.write("#define OVK_TITLE_POS %d, %d   /* x, band-centre y */\n" % (tx, ty))
         f.write("static const ovk_key_t ovk_letters[] = {\n")
         for ri, row in enumerate(letters_rows):
             for ci, c in enumerate(row):
+                hi = pairs.get(c, c.upper() if c.isalpha() else c)
                 emit_key(f, c, KX0 + ci * (KW + KGAP), ROWY[ri], KW, KH,
-                         c, c.upper() if c.isalpha() else c, ACT_CHAR)
+                         c, hi, ACT_CHAR)
         f.write("};\n")
         f.write("static const ovk_key_t ovk_symbols[] = {\n")
         for ri, row in enumerate(sym_rows):
-            for ci, (lo, hi) in enumerate(row):
-                emit_key(f, lo, KX0 + ci * (KW + KGAP), ROWY[ri], KW, KH,
-                         lo, hi, ACT_CHAR)
+            for ci, c in enumerate(row):
+                emit_key(f, c, SX0 + ci * (SW + SGAP), ROWY[ri], SW, KH,
+                         c, c, ACT_CHAR)
         f.write("};\n")
         f.write("static const ovk_key_t ovk_func[] = {\n")
         for lab, x, y, w, act in fn_keys:
@@ -202,7 +216,7 @@ def mock(asc, top_pad):
         dr.rectangle([x * S, y * S, (x + w) * S - 1, (y + h) * S - 1], fill=c)
     ov = Image.new('RGBA', im.size, (0, 0, 0, 0))
     ImageDraw.Draw(ov).rectangle([0, 0, im.size[0] - 1, im.size[1] - 1],
-                                 fill=(0, 0, 0, int(0.68 * 255)))
+                                 fill=(0, 0, 0, int(0.74 * 255)))
     im = Image.alpha_composite(im.convert('RGBA'), ov).convert('RGB')
     dr = ImageDraw.Draw(im)
     px, py, pw, ph = L['panel']
@@ -223,9 +237,9 @@ def mock(asc, top_pad):
                         font=f2, fill=c)
             pen += a
         return pen
-    tx, ty = L['title_pos']
-    text(tx, ty + 22, "Company name", L['title_c'], 0.75)
-    text(500, L['counter_y'] + 22, "13/14", L['dim_c'], 0.58)
+    tx, ty = L['title_pos']                        # ty = band centre (v3)
+    text(tx, ty + 9, "Company name", L['title_c'], 0.75)
+    text(530, ty + 7, "13/14", L['dim_c'], 0.58)
     bx, by, bw, bh = L['textbox']
     rr(bx - 2, by - 2, bw + 4, bh + 4, L['box_border'])
     rr(bx, by, bw, bh, L['box_fill'])
@@ -237,11 +251,11 @@ def mock(asc, top_pad):
         for ci, c in enumerate(row):
             x, y = KX0 + ci * (KW + KGAP), ROWY[ri]
             is_sel = (ri, ci) == sel
-            face = L['sel_face'] if is_sel else L['key_face']
-            edge = L['sel_edge'] if is_sel else L['key_edge']
-            txt = L['sel_text'] if is_sel else L['text_c']
-            if is_sel:
-                rr(x - 2, y - 2, KW + 4, KH + 4, L['sel_edge'])
+            face = L['key_face']
+            edge = L['key_edge']
+            txt = L['text_c']
+            if is_sel:                             # focus ring encloses shadow too
+                rr(x - 2, y - 2, KW + 4, KH + 6, L['sel_edge'])
             rr(x + 1, y + 2, KW, KH, L['key_lo'])
             rr(x, y, KW, KH, face)
             rr(x, y, KW, 2, edge)
