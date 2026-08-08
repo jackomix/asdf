@@ -4,6 +4,30 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.11-osk4 (caret repeat speed + badge AA; SELECT crash PENDING LOG)
+
+- "holding L1/R1 repeats too slow (1.5-2x please)" -> caret repeat
+  initial 14f->8f, repeat 8f->4f (~2x at device frame rate).  Dpad
+  repeat untouched (nav speed was praised).
+- "button icons look kind of pixelated" -> badges were integer-scanline
+  discs/pills (hard stair-stepped edges at 640x480).  Now coverage-AA:
+  solid middle runs + fractional edge pixels blended via RRA, soft
+  single-pixel shape tips; badge circle radius 8->8.5 to keep apparent
+  size.  Pixel-true preview zoom shows smooth perimeters.
+- **"the start button works, but going back doesn't work, it crashes the
+  game" -- OPEN, need /roms/ports/port_launch.log from THAT run (before
+  the next launch overwrites it).**  Three candidates, log discriminates
+  instantly: (1) held SELECT+START ~2s tripped the user-approved quit
+  chord (log: "SELECT+START held ... graceful exit") = looks like a
+  crash, is not; (2) OSK SELECT-cancel path (log: "[osk] CANCEL" then a
+  fault) -- never device-exercised before 0.95.10 because SELECT never
+  arrived; (3) game-side SELECT (kairo slot 10 / Unity 360/109) live for
+  the first time ever (in-game Back was always NPB_B -> KC_ESCAPE, which
+  still works).  Loader has a SIGSEGV/SIGBUS/SIGILL/SIGTRAP handler with
+  backtrace to stderr, so a native fault self-describes.  Code review of
+  the cancel path shows it returns plain JNI null = exactly the Android
+  cancel contract; no suspected mechanism found on host yet.
+
 ## 0.95.10-osk3 (OSK v3 + START/SELECT input fix, user feedback round)
 
 User device-tested 0.95.9 ("this is actually really good") with another

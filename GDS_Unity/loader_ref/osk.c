@@ -43,6 +43,7 @@
 #include "gds.h"
 #include "osk_font_data.h"
 #include "osk_layout.h"
+#include <math.h>               /* sqrtf/floorf: AA badge edges (0.95.11) */
 
 /* egl_shim exports: save-state begin, pixel rects/text, restore. */
 extern int  gds_egl_overlay_begin(int *sw, int *sh);
@@ -587,31 +588,55 @@ static float ovk_baseline_cy(float cy, float sc)
     return ovk_baseline_cell((int)(cy - 17.0f), 34, sc);
 }
 
-/* ---- badge shapes (controller buttons drawn with rects only) ---- */
-static int isqrt_i(int n)
+/* ---- badge shapes, anti-aliased (0.95.11) ---- */
+/* integer-scanline circles/pills stepped visibly at 640x480 -- the user
+ * saw exactly that ("the button icons look kind of pixelated").  Edge
+ * pixels now carry real coverage: solid middle run via RR, the two
+ * fractional edge pixels blended via RRA, shape tips one soft pixel. */
+static void hline_cov(float xa, float xb, float y, const float *col)
 {
-    if (n <= 0) return 0;
-    int x = n, y = (x + 1) / 2;
-    while (y < x) { x = y; y = (x + n / x) / 2; }
-    return x;
+    if (xb - xa < 1.6f) {           /* tip sliver: a single soft pixel */
+        float xm = (xa + xb) * 0.5f;
+        RRA(xm - 0.5f, y, 1.0f, 1.0f, col[0], col[1], col[2],
+            (xb - xa) * 0.45f);
+        return;
+    }
+    float lf = floorf(xa), rf = floorf(xb);
+    float covl = lf + 1.0f - xa, covr = xb - rf;
+    if (covl >= 0.98f && covr >= 0.98f) {          /* edges ~full */
+        RR3(lf, y, rf - lf, 1.0f, col);
+        return;
+    }
+    RRA(lf, y, 1.0f, 1.0f, col[0], col[1], col[2], covl);
+    if (rf - lf > 1.0f)
+        RR3(lf + 1.0f, y, rf - lf - 1.0f, 1.0f, col);
+    RRA(rf, y, 1.0f, 1.0f, col[0], col[1], col[2], covr);
 }
 
-static void disc(float cx, float cy, int r, const float *col)
+static void disc(float cx, float cy, float r, const float *col)
 {
-    for (int dy = -r; dy <= r; dy++) {
-        int hw = isqrt_i(r * r - dy * dy);
-        RR3(cx - hw, cy + dy, 2 * hw + 1, 1, col);
+    for (int di = -10; di <= 10; di++) {
+        float d2 = r * r - (float)(di * di);
+        if (d2 < 1.0f) continue;                   /* past the shape */
+        float hw = sqrtf(d2);
+        hline_cov(cx - hw, cx + hw, cy + (float)di, col);
     }
 }
 
 static void rrect(float x, float y, float w, float h, const float *col)
 {
-    int r = (int)(h * 0.5f);
+    float rc = h * 0.5f;
     for (int dy = 0; dy < (int)h; dy++) {
-        int dy2 = dy < r ? r - dy
-              : dy >= (int)h - r ? dy - (int)h + 1 + r : 0;
-        int inset = r - isqrt_i(r * r - dy2 * dy2);
-        RR3(x + inset, y + dy, w - 2 * inset, 1, col);
+        float yc = (float)dy + 0.5f;               /* row centre sample */
+        float inset = 0.0f;
+        if (yc < rc) {
+            float d = rc - yc;
+            inset = rc - sqrtf(rc * rc - d * d);
+        } else if (yc > h - rc) {
+            float d = yc - (h - rc);
+            inset = rc - sqrtf(rc * rc - d * d);
+        }
+        hline_cov(x + inset, x + w - inset, y + (float)dy, col);
     }
 }
 
@@ -624,7 +649,7 @@ static void badge_circle(float cx, float cy, char letter, int bright_key)
     static const float face_l[3] = { OVKC_BADGE_FACE };
     static const float face_d[3] = { OVKC_FN_FACE };
     char s[2] = { letter, 0 };
-    disc(cx, cy, 8, bright_key ? face_d : face_l);
+    disc(cx, cy, 8.5f, bright_key ? face_d : face_l);   /* AA disc */
     float sc = 0.46f;
     float lw = ovk_textw(s, sc);
     int bucket = bright_key ? QB_BADGEL : QB_BADGED;
@@ -1159,7 +1184,9 @@ void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev)
         if (BTNDN(NPB_B)) vk_backspace();        /* shift untouched */
         if (BTNDN(NPB_X)) g_shift = (g_shift + 1) % 3;
         if (BTNDN(NPB_Y)) insert_char(' ');
-        /* L1/R1 walk the text caret (Xbox LT/RB precedent) */
+        /* L1/R1 walk the text caret (Xbox LT/RB precedent).  0.95.11
+         * user: held-bumper repeat was "pretty slow, should move 1.5-2x
+         * as fast" -- initial 14f->8f, repeat 8f->4f (~2x). */
         int cd = BTN(NPB_RB) ? 1 : (BTN(NPB_LB) ? -1 : 0);
         int edge_caret = BTNDN(NPB_LB) || BTNDN(NPB_RB);
         if (cd && (edge_caret || rep2 <= 0)) {
@@ -1167,7 +1194,7 @@ void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev)
             g_caret += cd;
             if (g_caret < 0) g_caret = 0;
             if (g_caret > len) g_caret = len;
-            rep2 = edge_caret ? 14 : 8;
+            rep2 = edge_caret ? 8 : 4;
         }
         if (rep2 > 0) rep2--;
     }
