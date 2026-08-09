@@ -290,6 +290,25 @@ int main(void) {
     g_style = -1;
     style_decide();
 
+    /* 16. probe mode: GDS_OSK_CANCEL=null restores the RAW Android null
+     * contract (0.95.14 -- device evidence-gathering for whether the
+     * mid-game cancel handler is benign; disasm showed the cancel handler
+     * is a runtime-registered delegate, not hardwired fatal code) */
+    setenv("GDS_OSK_CANCEL", "null", 1);
+    gds_osk_open("t", "abc", 12);
+    release_all();
+    gds_osk_set_negative("back");
+    press(NPB_BACK);
+    CHECK(g_done == 1 && g_ok == 0,
+          "probe mode returns raw null (old Android contract)");
+    unsetenv("GDS_OSK_CANCEL");
+    gds_osk_open("t", "abc", 12);
+    release_all();
+    gds_osk_set_negative("back");
+    press(NPB_BACK);
+    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abc") == 0,
+          "probe off -> safe back-out again");
+
     printf(failures ? "\n%d FAILURES\n" : "\nALL OK\n", failures);
     return failures ? 1 : 0;
 }

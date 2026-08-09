@@ -163,14 +163,32 @@ static void vk_commit(void)
 
 static void vk_cancel(void)
 {
-    /* 0.95.13: a NULL result is FATAL -- device log (0.95.12, boot
-     * Company Name prompt): CANCEL -> getInputPanelResult null -> the
-     * GAME itself shows "An error has occurred." -> render-loop stop ->
-     * clean exit.  The FepPanel negative path cannot be reached safely,
-     * so cancel is redefined as "back out UNCHANGED": restore the
-     * prefill snapshot from open and finish on the normal OK path.
-     * Boot keeps the default studio name, mid-game renames keep the old
-     * name, and the game-fatal null is gone for good. */
+    /* 0.95.13: a NULL result is FATAL at the boot prompt -- device log:
+     * CANCEL -> getInputPanelResult null -> the GAME shows "An error has
+     * occurred." -> render-loop stop -> clean exit.  BUT the 0.95.14
+     * disasm of the FepPanel cancel branch (il2cpp 0x17f4e48) proved the
+     * fatal handler is RUNTIME-REGISTERED data (a static-slot delegate,
+     * guarded cbz before the tail dispatch), not hardwired code -- so
+     * SOME other prompt may handle null gracefully.  That is per-prompt
+     * evidence only the device can supply, so the raw Android contract
+     * stays available as an explicit probe: GDS_OSK_CANCEL=null in
+     * gds_env.cfg.  NEVER probe at the boot Company-Name prompt (known
+     * fatal); probe a mid-game rename and read port_launch.log after.
+     * Default remains game-safe: "back out UNCHANGED" -- restore the
+     * open-time prefill and finish on the normal OK path. */
+    const char *probe = getenv("GDS_OSK_CANCEL");
+    if (probe && !strcmp(probe, "null")) {
+        g_open = 0;
+        g_done = 1;
+        g_ok = 0;
+        char vis[160];
+        fprintf(stderr, "[osk] PROBE CANCEL (GDS_OSK_CANCEL=null) -> raw "
+                        "Android null, text=\"%s\" -- check for the game error "
+                        "dialog after this line\n",
+                gds_vis(g_text, vis, sizeof vis));
+        fflush(stderr);
+        return;
+    }
     text_copy(g_text, sizeof g_text, g_orig);
     g_caret = (int)strlen(g_text);
     g_open = 0;

@@ -4,6 +4,34 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.14-osk7 (cancel probe knob; cancel-branch disasm says PER-PROMPT)
+
+- **Is the raw Android cancel (null) ever safe?  The BINARY says: it is
+  per-prompt DATA, not a hardwired fatal.**  Disasm of the FepPanel
+  negative branch (il2cpp file VA == offset 0x17f4e48, reached by
+  `cbz x0` in FepPanel::Update 0x17f4974): static-init guarded loads of
+  an object from a static slot, `cmp` gate, then at 0x17f4f74
+  `cbz x19 -> skip; ldr args; b #0xf003f0` -- a guarded tail dispatch
+  into a RUNTIME-REGISTERED handler.  The boot Company-Name handler is
+  the fatal error-dialog one (device-proven 0.95.12); what OTHER prompts
+  register cannot be known from the binary without chasing every
+  registration store site through generated code -- deliberately NOT
+  chased (rabbit hole).  The cheap ground truth is the device.
+- **Probe knob shipped: `GDS_OSK_CANCEL=null` in gds_env.cfg** restores
+  the raw Android null on SELECT-cancel (default stays the 0.95.13
+  safe "back out unchanged").  Probe logs `[osk] PROBE CANCEL ...` so
+  port_launch.log self-describes the experiment.  PROTOCOL for the
+  device: (1) never probe at the boot prompt (known fatal -- if the
+  session ends there, that's expected); (2) boot past Company Name with
+  Done, rename something mid-game (e.g. a game title), press SELECT;
+  (3) outcome decides: error dialog + session end => the fatal handler
+  is (near-)universal => 0.95.13 uniform behavior is FINAL, document
+  and done; game continues with old name => that prompt is cancel-safe
+  => implement a curated title->cancel-mode table (true null cancel for
+  proven-safe prompts, unchanged-text everywhere else).
+- Host asserts 76 -> 80: probe on returns g_ok==0 (raw null), probe off
+  restores the safe path.
+
 ## 0.95.13-osk6 (cancel can no longer kill the game + even blink + echo-dump retired)
 
 - **Cancel redefined: NULL is game-fatal, so cancel = "back out
