@@ -4,6 +4,35 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.16-osk9 (swallow gate CORRECTED + probeA phys-vs-game timestamps)
+
+- **0.95.15's release gate was NOT actually what ran on the device.**  A
+  leftover `osk_swallow--` from the old fixed-18 code inside the zeroing
+  block decremented the gate away regardless of release, so silence
+  after close was ~1 frame in practice -- and the user's dead-A did NOT
+  budge.  Two readings: (a) the swallow was probably never the cause
+  (symptom persisted at 1 frame), pushing suspicion toward a game-side
+  post-FEP cooldown (scene fade / tutorial typewriter text); (b) the
+  experiment was not clean, so 0.95.16 makes it clean: pure release
+  gate (silence until pad fully idle), capped at 8 frames as insurance
+  against a noisy axis.
+- **probeA: phys-vs-game timestamp pair per A press**, windowed to the
+  user's scenario (15s after boot, 15s after each OSK close, ~2 log
+  lines per press, quiet otherwise):
+  `[probeA] PHYSICAL A down at t=...ms` (pad tail, SDL+evdev merged
+  view) and `[probeA] GAME consumed A at t=...ms (+Nms)` (first
+  Canvas.GetJoystickButton(slot0) read observing it).  Verdict rules:
+  +N ~1-2 frames but action lags ~0.5s -> GAME-side cooldown (nothing
+  left on our side to fix); consumption absent for ~0.5s -> game not
+  polling during a fade/tutorial lockout, still game-side; any real
+  PHYSICAL->table lag -> ours.  The gate episode line
+  `[input] osk closed: game input resumed after N frame(s)` proves the
+  swallow is no longer a fixed blackout.
+- Ask alongside: EXACTLY when the dead press is felt (immediately after
+  Company Name Done? office intro dialogue? main menu?) and the retail
+  A/B: same APK on an Android phone, same moment -- if retail feels the
+  same, case closed with gold-standard evidence.
+
 ## 0.95.15-osk8 (SELECT fully inert + dead-A root-caused: OUR 18-frame swallow)
 
 - **SELECT removed from the OSK entirely** (user decision 2026-08-09:

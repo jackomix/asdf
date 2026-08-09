@@ -138,6 +138,15 @@ enum { NPA_LX, NPA_LY, NPA_RX, NPA_RY, NPA_LT, NPA_RT, NPA_COUNT };
 
 static unsigned char g_npb[NPB_COUNT];
 static unsigned char g_npb_prev[NPB_COUNT];
+
+/* 0.95.16 probeA -- answer "is the ~0.5s dead-A ours or the game's?"
+ * with two timestamps per press: PHYSICAL edge (pad_poll tail) vs the
+ * game's own first consumption of the A level (kjoy case 0).  Windowed
+ * to 15s after boot + 15s after each OSK close so logs stay quiet. */
+static long g_probea_arm;      /* window end (ms); 0 = disarmed */
+static long g_probea_rise;     /* timestamp of last physical A down */
+static int  g_probea_read;     /* first game consumption already logged */
+static int  g_a_prev_phys;     /* physical edge memory */
 static float g_npa[NPA_COUNT];
 static SDL_GameController *g_gc;
 static int g_sdl_inited, g_open_retry;
@@ -754,6 +763,20 @@ static void pad_poll(void) {
         g_npb[NPB_BACK]  |= g_ev_sel;
         g_npb[NPB_START] |= g_ev_sta;
     }
+    /* probeA physical edge (0.95.16): timestamp A-downs while armed so the
+     * device log pairs them with the first GAME-side consumption */
+    {
+        long tn = gds_mono_ms();
+        if (g_probea_arm && tn < g_probea_arm &&
+                g_npb[NPB_A] && !g_a_prev_phys) {
+            g_probea_rise = tn;
+            g_probea_read = 0;
+            fprintf(stderr, "[probeA] PHYSICAL A down at t=%ldms\n",
+                    tn % 100000);
+            fflush(stderr);
+        }
+        g_a_prev_phys = g_npb[NPB_A];
+    }
 }
 
 /* ------------------------------------------------ first-hit diagnostics */
@@ -863,7 +886,20 @@ static int kjoy_button(int id) {
      * on-screen keyboard owns the pad the game must see NOTHING pressed. */
     if (gds_osk_active()) return 0;
     switch (id & 0xff) {
-    case 0:  return g_npb[NPB_A];
+    case 0:  { int v = g_npb[NPB_A];
+               /* 0.95.16 probeA: mark WHEN the game itself first consumes
+                * the A level after a physical press.  Negative answer to
+                * "is the dead A ours": consumed +16ms but the on-screen
+                * action lags ~0.5s -> game-side cooldown. */
+               if (v && g_probea_rise && !g_probea_read) {
+                   long tn = gds_mono_ms();
+                   fprintf(stderr, "[probeA] GAME consumed A at t=%ldms "
+                                   "(+%ldms after physical)\n",
+                           tn % 100000, tn - g_probea_rise);
+                   fflush(stderr);
+                   g_probea_read = 1;
+               }
+               return v; }
     case 1:  return g_npb[NPB_B];
     case 2:  return g_npb[NPB_X];
     case 3:  return g_npb[NPB_Y];
@@ -1466,8 +1502,12 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
      * resume instantly.  Log each episode so the device can prove the
      * hold is now release-length, not fixed. */
     static int osk_was, osk_swallow, osk_swallow_frames;
+    static int probea_boot;
+    if (!probea_boot) { probea_boot = 1; g_probea_arm = gds_mono_ms() + 15000; }
     int osk_active = gds_osk_active();
-    if (osk_was && !osk_active) { osk_swallow = 1; osk_swallow_frames = 0; }
+    if (osk_was && !osk_active) { osk_swallow = 1; osk_swallow_frames = 0;
+                                  g_probea_arm = gds_mono_ms() + 15000;
+                                  g_probea_rise = 0; g_probea_read = 0; }
     osk_was = osk_active;
     if (osk_active)
         gds_osk_pad_tick(g_npb, g_npb_prev);
@@ -1479,15 +1519,21 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
         if (idle)
             for (int i = 0; i < NPA_COUNT; i++)
                 if (g_npa[i] > 0.5f || g_npa[i] < -0.5f) { idle = 0; break; }
-        if (idle) {
+        /* pure release gate, capped: 0.95.15's retry of the same block
+         * kept a leftover decrement from the old fixed-18 code, so in
+         * practice silence still lasted ~1 frame and the "dead A" the
+         * user reported did NOT budge -- evidence AGAINST the swallow
+         * theory (0.95.16 keeps the gate clean; the log line settles it) */
+        if (idle || osk_swallow_frames >= 8) {
             fprintf(stderr, "[input] osk closed: game input resumed after "
-                            "%d frame(s) of release-gate\n", osk_swallow_frames);
+                            "%d frame(s)%s\n",
+                    osk_swallow_frames,
+                    idle ? "" : " (release-gate cap, pad still held)");
             fflush(stderr);
             osk_swallow = 0;
         }
     }
     if (osk_active || osk_swallow > 0) {
-        if (osk_swallow > 0) osk_swallow--;
         memset(g_key_now, 0, sizeof g_key_now);
         memcpy(g_kjoy_prev, g_kjoy_now, sizeof g_kjoy_prev);
         memset(g_kjoy_now, 0, sizeof g_kjoy_now);
