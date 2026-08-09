@@ -34,6 +34,34 @@ Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
   future Kairosoft ports' audio diffs.
 - Tests: 76 -> 78 asserts green; cancel now proven to restore the
   prefill AND undo mid-prompt edits (new style + classic).
+- **Deploy script v2: ATOMIC install + save preservation** (device
+  incident, 2026-08-09).  The user redeployed 0.95.13 and the launcher
+  found `/roms/ports/gamedevstory` containing ONLY `data/`.  Root
+  cause: v1's on-device flow was `rm -rf gamedevstory` THEN `unzip`,
+  with the uploaded zip never re-validated on the device.  When the
+  upload landed unusable (truncated transfer / tight card), unzip died
+  after the archive's first entries (`gamedevstory/data/` is first in
+  the zip) and the live folder was already gone -> launcher refused to
+  boot ("Put the contents of the gamedevstory/ inner folder here.").
+  v2: integrity-test the uploaded zip ON THE DEVICE, require >=200MB
+  free (zip + staged + live coexist briefly), extract into
+  `$PORTS_DIR/.gds_install`, verify staged loader2+libil2cpp exist and
+  the version banner parses, THEN carry over player state and swap
+  live<->staged (old tree kept as `gamedevstory.old` until the end).
+  Every failure aborts with the LIVE folder untouched and prints
+  `df -h` so the next report names the cause.
+- **SAVES now survive redeploys.**  Loader home = `gamedevstory/home`
+  (main.c `gds_home`): RecordStore save slots + shared-preferences.bin
+  live there, and v1 silently wiped them at EVERY deploy -- unnoticed
+  only because playtime was still at the boot Company-Name prompt.  v2
+  copies `home/` and `gds_env.cfg` into the staged tree BEFORE the
+  swap (replacing the old /tmp keep-file dance).
+- v2 verified end-to-end locally against a mocked ssh/scp device:
+  happy path (swap + saves/knobs carried over + zero leftovers) and a
+  replay of the incident (truncated upload -> abort, live folder and
+  saves untouched).  WHY the device upload was truncated is still
+  open (prime suspect: free space on /roms after roms pile up);
+  v2's bail prints `df` output so the next failure report settles it.
 
 ## 0.95.12-osk5 (SELECT "crash" SOLVED-BY-LOG + caret blink + title CR trim)
 

@@ -44,6 +44,9 @@ SSHBASE=(ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=no -o UserKnownHostsF
 SCPBASE=(scp -o ConnectTimeout=12 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 
 echo "=== Game Dev Story deploy to $HOST ==="
+# v2: atomic install (2026-08-09).  v1 wiped the live folder BEFORE unzip;
+# a truncated upload or full SD card left the device with an empty game dir.
+echo "  deploy script v2 (atomic install, saves-preserving)"
 
 # ---- 1. health + login check (retries; flaky R36S) ----
 up=0
@@ -155,28 +158,87 @@ if [ "$up" != "1" ]; then
 fi
 echo "✓ uploaded"
 
-# ---- 4. install + run ----
-echo "Installing and running..."
+# ---- 4. install (ATOMIC v2: stage + verify + swap; never wipes live files) ----
+# 0.95.13 device incident: the user re-deployed and the launcher found
+# /roms/ports/gamedevstory containing ONLY data/.  Root cause: v1 did
+# 'rm -rf gamedevstory' BEFORE 'unzip' -- when the freshly uploaded zip was
+# unusable on-device (truncated upload / full card), unzip died after the
+# first entries (data/ is first in the zip) and the live folder was already
+# gone.  v2: integrity-test the uploaded zip ON THE DEVICE, extract into a
+# scratch dir, verify the staged build, THEN swap.  A failure at any step
+# aborts with the live folder untouched and prints df so the cause is clear.
+echo "Installing (staged + verified; old folder kept until the swap)..."
 "${SSHBASE[@]}" "$HOST" "
   set -e
+  bail() {
+    echo \"!! \$1\"
+    echo \"   free space on '$PORTS_DIR':\"
+    df -h '$PORTS_DIR' | tail -1
+    rm -rf '$PORTS_DIR/.gds_install'
+    exit 1
+  }
   # kill any stale loader2 FIRST: a leftover loader holds the DRM master and
   # makes SDL_CreateWindow fail for the fresh run (seen on-device: stale
   # NullGL loader still printing frames during the next test)
   pkill -9 -x loader2 2>/dev/null || true
   sleep 1
-  # 0.88: preserve the user's gds_env.cfg knob edits across redeploys --
-  # zip contents reset every switch otherwise (already cost us a test run:
-  # GDS_TRAP_AT/GDS_DPI were silently off during the 0.87.0 run)
-  [ -f '$PORTS_DIR/gamedevstory/gds_env.cfg' ] && cp '$PORTS_DIR/gamedevstory/gds_env.cfg' /tmp/gds_env.cfg.keep || true
-  rm -rf '$PORTS_DIR/gamedevstory'
   cd '$PORTS_DIR'
-  unzip -o gamedevstory.zip >/dev/null 2>&1
+
+  # 1) the uploaded zip must be self-consistent BEFORE we touch anything
+  unzip -t gamedevstory.zip >/dev/null 2>&1 ||
+      bail 'uploaded zip failed integrity test on device -- live folder NOT touched.  Free space on the card and re-run the deploy.'
+
+  # 2) enough room for zip + staged copy + live copy at the same time
+  FREE_KB=\$(df -k '$PORTS_DIR' | awk 'NR==2 {print \$4}')
+  NEED_KB=200000
+  if [ \"\${FREE_KB:-0}\" -lt \$NEED_KB ]; then
+      bail \"only \${FREE_KB:-0}KB free (need \${NEED_KB}KB) -- make room on the card (roms) and re-run the deploy\"
+  fi
+
+  # 3) stage into a scratch dir next to the target (same fs = instant swap)
+  rm -rf .gds_install
+  mkdir .gds_install
+  unzip -q gamedevstory.zip -d .gds_install ||
+      bail 'unzip failed on device -- live folder NOT touched'
+  [ -f .gds_install/gamedevstory/loader2 ] ||
+      bail 'staged tree missing loader2 -- aborting, live folder NOT touched'
+  [ -f .gds_install/gamedevstory/libil2cpp.so ] ||
+      bail 'staged tree missing libil2cpp.so -- aborting, live folder NOT touched'
+  STAGED_VER=\$(grep -a -oE 'reference-port 0\\.[0-9]+\\.[0-9]+(-[a-z0-9]+)?' .gds_install/gamedevstory/loader2 | head -1 | sed 's/reference-port //')
+  [ -n \"\$STAGED_VER\" ] || bail 'staged loader2 has no version banner -- aborting, live folder NOT touched'
+  echo \"  staged build verified: \$STAGED_VER\"
+
+  # 4) carry over player state the zip does not ship:
+  #    gamedevstory/home = the loader's home dir; RecordStore save slots +
+  #    shared-preferences.bin live there (jni.c gds_home).  v1 wiped this on
+  #    EVERY deploy -- only unnoticed because playtime was still at the
+  #    Company-Name prompt.  Never again.
+  if [ -d gamedevstory/home ]; then
+      cp -a gamedevstory/home .gds_install/gamedevstory/home &&
+          echo '  saves carried over (gamedevstory/home)'
+  fi
+  if [ -f gamedevstory/gds_env.cfg ]; then
+      cp gamedevstory/gds_env.cfg .gds_install/gamedevstory/gds_env.cfg &&
+          echo '  gds_env.cfg knobs carried over'
+  fi
+
+  # 5) zip is verified + extracted: drop it before the swap to keep peak low
   rm -f gamedevstory.zip
-  [ -f /tmp/gds_env.cfg.keep ] && cp /tmp/gds_env.cfg.keep '$PORTS_DIR/gamedevstory/gds_env.cfg' && rm -f /tmp/gds_env.cfg.keep || true
-  chmod +x '$PORTS_DIR/Game Dev Story.sh' '$PORTS_DIR/gamedevstory/loader2'
+
+  # 6) swap live <-> staged; keep the old tree as .old until the new one
+  #    is in place, so even here nothing is lost if the rename fails
+  rm -rf gamedevstory.old
+  [ -d gamedevstory ] && mv gamedevstory gamedevstory.old || true
+  mv .gds_install/gamedevstory gamedevstory ||
+      bail 'rename of staged tree failed -- previous tree kept at gamedevstory.old'
+  rm -rf .gds_install gamedevstory.old
+  # the launcher wrapper is NOT in the zip (one-time manual setup): a
+  # missing wrapper must not fail the install AFTER the swap succeeded
+  chmod +x '$PORTS_DIR/Game Dev Story.sh' 2>/dev/null || true
+  chmod +x '$PORTS_DIR/gamedevstory/loader2'
   # 0.89: no auto-launch (user request) -- install only; launch is done
   # from the EmulationStation Ports menu.
-  echo '=== install complete; launch from the Ports menu ==='
+  echo \"=== install complete (\$STAGED_VER); launch from the Ports menu ===\"
 "
 
 # ---- 5. pull logs ----
