@@ -255,10 +255,25 @@ static volatile unsigned g_echo_prod_n = 0;   /* bytes captured so far */
 static volatile unsigned g_echo_play_n = 0;
 static int g_echo_flushed = 0;                /* one session per boot */
 
+/* 0.95.13: intro-echo was SOLVED (0.95.3 backpressure + 0.95.5
+ * continuous-phase resampler), but this harness kept writing ~1MB of
+ * PCM into the game dir at every launch.  Off by default now;
+ * GDS_ECHO_DUMP=1 in gds_env.cfg revives it when a NEW game's audio
+ * needs the same byte-exact producer/consumer diff. */
+static int g_echo_on = -1;
+static int echo_enabled(void)
+{
+    if (g_echo_on < 0) {
+        const char *e = getenv("GDS_ECHO_DUMP");
+        g_echo_on = (e && e[0] == '1');
+    }
+    return g_echo_on;
+}
+
 static void echo_capture(uint8_t *dst, volatile unsigned *cnt,
                          const void *src, unsigned n)
 {
-    if (g_echo_flushed) return;
+    if (g_echo_flushed || !echo_enabled()) return;
     unsigned c = *cnt;
     if (c >= ECHO_CAP_BYTES) return;
     if (n > ECHO_CAP_BYTES - c) n = ECHO_CAP_BYTES - c;

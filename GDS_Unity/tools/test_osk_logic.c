@@ -248,13 +248,22 @@ int main(void) {
     press(NPB_START);
     CHECK(g_done == 1 && g_ok == 1 && g_open == 0, "START commits");
 
-    /* 14. negative label offered -> SELECT cancels */
+    /* 14. negative label offered -> SELECT backs out with the ORIGINAL
+     * prefill.  0.95.13: the old NULL result was device-proven game-fatal
+     * (cancel at boot "Company Name" -> the game raises its own error
+     * dialog and exits clean), so cancel must finish as "unchanged OK".
+     * Any mid-prompt edits are undone by the restore. */
     gds_osk_open("t", "abc", 12);
     release_all();
     gds_osk_set_negative("back");
     CHECK(g_negative[0] != 0, "negative stored");
+    g_sel = find_key(0, 'd');
+    g_shift = 0;
+    press(NPB_A);
+    CHECK(strcmp(g_text, "abcd") == 0, "edit made before cancel");
     press(NPB_BACK);
-    CHECK(g_done == 1 && g_ok == 0, "SELECT cancels when offered");
+    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abc") == 0,
+          "SELECT backs out with ORIGINAL text (game-safe)");
     gds_osk_open("t", "abc", 12);
     release_all();
     gds_osk_set_negative("");
@@ -262,7 +271,8 @@ int main(void) {
     gds_osk_set_negative("12345678901234567890");
     CHECK(strcmp(g_negative, "back") == 0, "long garbage -> generic back");
 
-    /* 15. classic style: SELECT always cancels, START commits */
+    /* 15. classic style: SELECT backs out with original text (same
+     * 0.95.13 game-fatal-null fix), START commits */
     setenv("GDS_OSK", "classic", 1);
     g_style = -1;
     style_decide();
@@ -274,7 +284,8 @@ int main(void) {
     gds_osk_open("t", "abc", 12);
     release_all();
     press(NPB_BACK);
-    CHECK(g_done == 1 && g_ok == 0, "classic SELECT still cancels");
+    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abc") == 0,
+          "classic SELECT backs out with ORIGINAL text");
     unsetenv("GDS_OSK");
     g_style = -1;
     style_decide();

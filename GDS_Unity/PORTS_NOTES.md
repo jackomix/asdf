@@ -4,6 +4,37 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.13-osk6 (cancel can no longer kill the game + even blink + echo-dump retired)
+
+- **Cancel redefined: NULL is game-fatal, so cancel = "back out
+  unchanged".**  The 0.95.12 device run answered the open question the
+  hard way: the user hit SELECT at the boot "Company Name" prompt again
+  -> same `CANCEL` -> `getInputPanelResult -> (null)` -> game shows its
+  own "An error has occurred." -> render-loop stop at frame 127 ->
+  clean exit.  The 0.95.12 verdict "not a crash" was TRUE but did
+  nothing for the player: on the device the game still ends.  Since
+  the FepPanel negative path was never observed to be safe ANYWHERE,
+  `vk_cancel` no longer returns NULL at all: it restores the open-time
+  prefill snapshot (`g_orig`, captured post-trim) and finishes on the
+  normal OK path.  Effects: SELECT at the boot prompt keeps
+  "Sunny Studios" and the game CONTINUES; SELECT at a mid-game rename
+  keeps the old name and UNDOES any mid-prompt edits; the error+
+  shutdown path is unreachable from the OSK (classic keyboard gets the
+  same protection).  This also retires the "does mid-game cancel error
+  too?" question BY DESIGN: cancel never returns null, so it cannot
+  error anywhere, and no device test is needed to prove it (host
+  asserts: cancel restores prefill, undoes edits, reports OK).
+- **Blink evened**: caret visible 500ms / hidden 500ms (was 600/400 --
+  user measured the asymmetry: "invisible for shorter than it is
+  visible"; correct, hidden was 40% of the cycle).
+- **Echo-capture harness retired behind `GDS_ECHO_DUMP=1`**: it was the
+  intro-echo evidence tool, solved since 0.95.5, yet still wrote ~1MB
+  of PCM (`echo_{prod,play}.pcm`) into the game folder at EVERY launch.
+  Delete the two files on the device (skippable); knob survives for
+  future Kairosoft ports' audio diffs.
+- Tests: 76 -> 78 asserts green; cancel now proven to restore the
+  prefill AND undo mid-prompt edits (new style + classic).
+
 ## 0.95.12-osk5 (SELECT "crash" SOLVED-BY-LOG + caret blink + title CR trim)
 
 - **The "SELECT crashes the game" verdict: NOT A CRASH, and NOT the
@@ -25,6 +56,8 @@ Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
   OPEN QUESTION for device: does SELECT-cancel at a MID-GAME rename
   (e.g. "Game name") also error+quit, or return benignly?  If it
   errors too, the SEL pill is never useful and should be retired.
+  (ANSWERED BY DESIGN in 0.95.13: cancel never returns NULL anymore,
+  so it cannot error anywhere -- it backs out with the original text.)
 - "have the cursor blink" -> caret blinks 600ms on / 400ms off via a
   shared clock (new `gds_mono_ms()` input.c export); blink snaps solid
   on open/set_text/type/backspace/caret-walk so it never hides

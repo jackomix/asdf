@@ -1,5 +1,17 @@
 /* osk.c -- gamepad on-screen keyboard for the kairo FEP text entry.
  *
+ * 0.95.13 (user device-tested 0.95.12):
+ *   - CANCEL CANNOT KILL THE GAME anymore.  Device log proved the chain:
+ *     SELECT -> result null -> the GAME raises its own "An error has
+ *     occurred." dialog -> render-loop stop -> clean exit.  A null reply
+ *     is never safe on any FepPanel prompt, so cancel now means "back
+ *     out UNCHANGED": the prefill snapshot is restored and reported via
+ *     the normal OK path.  Boot keeps "Sunny Studios", mid-game renames
+ *     keep the old name, and the error path is unreachable from the OSK
+ *     (classic keyboard included).
+ *   - Caret blink evened to 500ms on / 500ms off (was 600/400 and the
+ *     user reported "invisible for shorter than it is visible").
+ *
  * 0.95.10 v3 (user device-tested 0.95.9 and sent another round):
  *   - Selection is a FOCUS RING again (2px, fully enclosing key + drop
  *     shadow -- 0.95.9's ring ended under the face but above the shadow,
@@ -62,6 +74,8 @@ extern long gds_mono_ms(void);      /* input.c: shared clock (caret blink) */
 /* ---------------------------------------------------------------- shared */
 static int  g_open, g_done, g_ok;
 static char g_text[128];
+static char g_orig[128];        /* open-time prefill (0.95.13 cancel =
+                                 * "back out unchanged", see vk_cancel) */
 static char g_title[96];
 static int  g_maxlen = 16;
 static int  g_latch;
@@ -97,13 +111,15 @@ static void text_copy(char *dst, size_t cap, const char *src)
 #define OVK_SHAKE_FRAMES 22     /* maxlen trip: shake + red flash length */
 static int  g_shake;            /* >0: counter shake/flash frames left */
 
-/* caret blink (0.95.12 user ask): 600ms on / 400ms off, snapped back to
- * SOLID every time the text or caret moves so it never hides mid-action */
+/* caret blink (0.95.12 user ask; 0.95.13: 600/400 -> EVEN 500ms on /
+ * 500ms off -- user measured the old one: "invisible for shorter than
+ * it is visible"), snapped back to SOLID every time the text or caret
+ * moves so it never hides mid-action */
 static long g_blink_t0;
 static void blink_reset(void) { g_blink_t0 = gds_mono_ms(); }
 static int blink_visible(void)
 {
-    return ((gds_mono_ms() - g_blink_t0) % 1000 + 1000) % 1000 < 600;
+    return ((gds_mono_ms() - g_blink_t0) % 1000 + 1000) % 1000 < 500;
 }
 
 /* caret-based insert (classic keeps the caret pinned at end, so for it
@@ -147,11 +163,22 @@ static void vk_commit(void)
 
 static void vk_cancel(void)
 {
+    /* 0.95.13: a NULL result is FATAL -- device log (0.95.12, boot
+     * Company Name prompt): CANCEL -> getInputPanelResult null -> the
+     * GAME itself shows "An error has occurred." -> render-loop stop ->
+     * clean exit.  The FepPanel negative path cannot be reached safely,
+     * so cancel is redefined as "back out UNCHANGED": restore the
+     * prefill snapshot from open and finish on the normal OK path.
+     * Boot keeps the default studio name, mid-game renames keep the old
+     * name, and the game-fatal null is gone for good. */
+    text_copy(g_text, sizeof g_text, g_orig);
+    g_caret = (int)strlen(g_text);
     g_open = 0;
     g_done = 1;
-    g_ok = 0;
+    g_ok = 1;
     char vis[160];
-    fprintf(stderr, "[osk] CANCEL text=\"%s\"\n",
+    fprintf(stderr, "[osk] CANCEL -> back out unchanged, text=\"%s\""
+                    " (null result is game-fatal)\n",
             gds_vis(g_text, vis, sizeof vis));
     fflush(stderr);
 }
@@ -1094,6 +1121,10 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
         break;
     }
     n = strlen(g_text);
+    /* 0.95.13: remember exactly what the prompt asked with (post-trim),
+     * so SELECT can back out to it -- returning NULL here kills the game
+     * (see vk_cancel). */
+    text_copy(g_orig, sizeof g_orig, g_text);
     g_caret = (int)n;
     g_upper = n == 0 || g_text[n - 1] == ' ';
     /* new style: sentence start -> one-shot shift, exactly like the phone
