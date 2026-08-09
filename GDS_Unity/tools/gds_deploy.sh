@@ -48,7 +48,7 @@ echo "=== Game Dev Story deploy to $HOST ==="
 # a truncated upload or full SD card left the device with an empty game dir.
 # v3: the upload itself must now PROVE itself (md5 + byte size vs local)
 # and retries on mismatch -- Sunday's truncating upload recurred.
-echo "  deploy script v3 (atomic install, saves-preserving, md5-verified upload)"
+echo "  deploy script v4 (atomic install, md5-verified upload, park-by-rename junk -- FAT-wedge-proof)"
 
 # ---- 1. health + login check (retries; flaky R36S) ----
 up=0
@@ -213,10 +213,14 @@ echo "Installing (staged + verified; old folder kept until the swap)..."
       bail \"only \${FREE_KB:-0}KB free (need \${NEED_KB}KB) -- make room on the card (roms) and re-run the deploy\"
   fi
 
-  # 3) stage into a scratch dir next to the target (same fs = instant swap)
-  rm -rf .gds_install
-  mkdir .gds_install
-  unzip -q gamedevstory.zip -d .gds_install ||
+  # 3) stage into a scratch dir next to the target (same fs = instant swap).
+  #    Pre-clean by rename if rm refuses (FAT wedge, 2026-08-09): a top-level
+  #    mv never walks inside a wedged directory, rm -rf always does.
+  if ! rm -rf .gds_install 2>/dev/null; then
+      mv .gds_install \"gds_install.$(date +%s).park\" 2>/dev/null || true
+  fi
+  mkdir -p .gds_install
+  unzip -oq gamedevstory.zip -d .gds_install ||
       bail 'unzip failed on device -- live folder NOT touched'
   [ -f .gds_install/gamedevstory/loader2 ] ||
       bail 'staged tree missing loader2 -- aborting, live folder NOT touched'
@@ -244,20 +248,36 @@ echo "Installing (staged + verified; old folder kept until the swap)..."
   # 5) zip is verified + extracted: drop it before the swap to keep peak low
   rm -f gamedevstory.zip
 
-  # 6) swap live <-> staged; keep the old tree as .old until the new one
-  #    is in place, so even here nothing is lost if the rename fails
-  rm -rf gamedevstory.old
-  [ -d gamedevstory ] && mv gamedevstory gamedevstory.old || true
+  # 6) swap live <-> staged, TOP-LEVEL RENAMES ONLY.  2026-08-09 incident:
+  #    a FAT32-wedged dir (gamedevstory.old/data, \"Directory not empty\"
+  #    under rm -rf) killed the pre-swap cleanup under set -e on two
+  #    consecutive deployments -- cosmetic deletion gating a working
+  #    install.  NOW: the old tree is parked via mv (immune to wedged
+  #    contents), the success line fires as soon as the swap+chmod are
+  #    done, and every destructive delete afterwards is best-effort
+  #    decoration that can never block an install again.
+  OLDPARK=\"gds_old.\$(date +%s).park\"
+  [ -d gamedevstory ] && mv gamedevstory \"\$OLDPARK\" 2>/dev/null || true
   mv .gds_install/gamedevstory gamedevstory ||
-      bail 'rename of staged tree failed -- previous tree kept at gamedevstory.old'
-  rm -rf .gds_install gamedevstory.old
-  # the launcher wrapper is NOT in the zip (one-time manual setup): a
-  # missing wrapper must not fail the install AFTER the swap succeeded
+      bail \"rename of staged tree failed -- previous live tree kept at \$OLDPARK\"
   chmod +x '$PORTS_DIR/Game Dev Story.sh' 2>/dev/null || true
   chmod +x '$PORTS_DIR/gamedevstory/loader2'
   # 0.89: no auto-launch (user request) -- install only; launch is done
   # from the EmulationStation Ports menu.
   echo \"=== install complete (\$STAGED_VER); launch from the Ports menu ===\"
+
+  # 7) COSMETICS ONLY.  Sweep the staged scratch, any historic leftovers,
+  #    and today's parked tree; whatever the FAT refuses (wedge) is left
+  #    inert and gets another chance next deploy.
+  rm -rf .gds_install gamedevstory.old 2>/dev/null || true
+  for p in gds_old.*.park gds_install.*.park; do
+      rm -rf \"\$p\" 2>/dev/null || true
+  done
+  if [ -d \"\$OLDPARK\" ]; then
+      echo \"  note: previous tree parked at \$OLDPARK -- the card's FAT\"
+      echo \"        would not delete it; harmless junk, rm it over ssh\"
+      echo \"        whenever convenient.\"
+  fi
 "
 
 # ---- 5. pull logs ----

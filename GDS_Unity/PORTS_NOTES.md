@@ -45,6 +45,23 @@ Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
   and a successful run states `uploaded + verified (md5 matches)`.
   Mock-verified: one-corrupt-then-heal installs cleanly (saves carried
   over); always-corrupt aborts with live folder + save intact.
+- **Deploy v4 (FAT-wedge-proof), root cause of "0.95.16 never landed"**:
+  the user's deploy output showed upload+staging+carry-over all succeed,
+  then died at `rm: cannot remove 'gamedevstory.old/data': Directory not
+  empty`.  Chain: the /roms card is FAT32 with a wedged subdir inside an
+  old backup; v2/v3 ran a MANDATORY pre-swap `rm -rf gamedevstory.old`
+  under set -e, so a cosmetic delete gated the whole install -- device
+  stayed 0.95.13 across two sessions of dead-A measurements (all
+  banners in their launch logs confirmed).  v4: junk is PARKED BY
+  TOP-LEVEL RENAME (mv never walks inside a wedged dir, rm -rf always
+  does), the "install complete" line fires right after swap+chmod, and
+  ALL destructive rms are demoted to post-success cosmetics.  Zips were
+  byte-identical all along (repo md5 == user's zip md5 printed by their
+  own deploy run).  Mock-verified against a simulated wedged .old:
+  install completes, saves/env carried, wedged junk left inert as a
+  gds_old.*.park dir.  ALSO: the aborted run left a fully verified
+  .gds_install/gamedevstory (0.95.16 + saves + env) on the device, so a
+  two-mv manual finish unblocks without re-uploading.
 
 ## 0.95.15-osk8 (SELECT fully inert + dead-A root-caused: OUR 18-frame swallow)
 
