@@ -1,14 +1,20 @@
 /* osk.c -- gamepad on-screen keyboard for the kairo FEP text entry.
  *
+ * 0.95.15 (user decision 2026-08-09): SELECT is INERT everywhere.  No
+ * curated per-prompt cancel table (user: "that sounds time consuming"),
+ * so the back affordance goes entirely: no pill, no cancel binding, no
+ * vk_cancel, no probe knob.  A dead key beats a fatal one (the game's
+ * registered cancel handler is at minimum boot-prompt fatal).
+ *
+ * 0.95.14: PROBE mode (GDS_OSK_CANCEL=null) -- short-lived, REMOVED in
+ * 0.95.15 with the rest of the cancel machinery.
+ *
  * 0.95.13 (user device-tested 0.95.12):
  *   - CANCEL CANNOT KILL THE GAME anymore.  Device log proved the chain:
  *     SELECT -> result null -> the GAME raises its own "An error has
  *     occurred." dialog -> render-loop stop -> clean exit.  A null reply
  *     is never safe on any FepPanel prompt, so cancel now means "back
- *     out UNCHANGED": the prefill snapshot is restored and reported via
- *     the normal OK path.  Boot keeps "Sunny Studios", mid-game renames
- *     keep the old name, and the error path is unreachable from the OSK
- *     (classic keyboard included).
+ *     out UNCHANGED" (superseded by 0.95.15: cancel is gone entirely).
  *   - Caret blink evened to 500ms on / 500ms off (was 600/400 and the
  *     user reported "invisible for shorter than it is visible").
  *
@@ -44,7 +50,7 @@
  *
  * Controls (new style):
  *   dpad move   A/R3 press key    B backspace   X shift cycle   Y space
- *   L1/R1 text caret left/right   SELECT cancel (when offered)   START done
+ *   L1/R1 text caret left/right   START done   (SELECT deliberately inert)
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -74,8 +80,6 @@ extern long gds_mono_ms(void);      /* input.c: shared clock (caret blink) */
 /* ---------------------------------------------------------------- shared */
 static int  g_open, g_done, g_ok;
 static char g_text[128];
-static char g_orig[128];        /* open-time prefill (0.95.13 cancel =
-                                 * "back out unchanged", see vk_cancel) */
 static char g_title[96];
 static int  g_maxlen = 16;
 static int  g_latch;
@@ -161,45 +165,7 @@ static void vk_commit(void)
     funlockfile(stderr);
 }
 
-static void vk_cancel(void)
-{
-    /* 0.95.13: a NULL result is FATAL at the boot prompt -- device log:
-     * CANCEL -> getInputPanelResult null -> the GAME shows "An error has
-     * occurred." -> render-loop stop -> clean exit.  BUT the 0.95.14
-     * disasm of the FepPanel cancel branch (il2cpp 0x17f4e48) proved the
-     * fatal handler is RUNTIME-REGISTERED data (a static-slot delegate,
-     * guarded cbz before the tail dispatch), not hardwired code -- so
-     * SOME other prompt may handle null gracefully.  That is per-prompt
-     * evidence only the device can supply, so the raw Android contract
-     * stays available as an explicit probe: GDS_OSK_CANCEL=null in
-     * gds_env.cfg.  NEVER probe at the boot Company-Name prompt (known
-     * fatal); probe a mid-game rename and read port_launch.log after.
-     * Default remains game-safe: "back out UNCHANGED" -- restore the
-     * open-time prefill and finish on the normal OK path. */
-    const char *probe = getenv("GDS_OSK_CANCEL");
-    if (probe && !strcmp(probe, "null")) {
-        g_open = 0;
-        g_done = 1;
-        g_ok = 0;
-        char vis[160];
-        fprintf(stderr, "[osk] PROBE CANCEL (GDS_OSK_CANCEL=null) -> raw "
-                        "Android null, text=\"%s\" -- check for the game error "
-                        "dialog after this line\n",
-                gds_vis(g_text, vis, sizeof vis));
-        fflush(stderr);
-        return;
-    }
-    text_copy(g_text, sizeof g_text, g_orig);
-    g_caret = (int)strlen(g_text);
-    g_open = 0;
-    g_done = 1;
-    g_ok = 1;
-    char vis[160];
-    fprintf(stderr, "[osk] CANCEL -> back out unchanged, text=\"%s\""
-                    " (null result is game-fatal)\n",
-            gds_vis(g_text, vis, sizeof vis));
-    fflush(stderr);
-}
+
 
 /* ================================================================ CLASSIC
  * The approved Terraria NextOS controller keyboard
@@ -456,7 +422,8 @@ static int  g_style = -1;       /* -1 undecided, 0 new, 1 classic */
 static int  g_sel, g_shift;     /* shift: 0 off, 1 one-shot, 2 caps lock */
 static int  g_page;             /* 0 letters, 1 symbols */
 static int  g_home;             /* index of the 'g' key = open position */
-static char g_negative[16];     /* prompt's cancel label ("" = not offered) */
+static char g_negative[16];     /* prompt's negative label -- LOGS only
+                                 * since 0.95.15 (no cancel affordance) */
 
 /* combined per-page tables (page keys + shared function row), built once */
 static ovk_key_t g_tab_letters[OVK_N_LETTERS + OVK_N_FUNC];
@@ -948,18 +915,9 @@ static void new_draw(void)
                  ovk_baseline_cy(band_cy, 0.58f), cnt, 0.58f);
     }
 
-    /* SELECT-cancel affordance: only when the prompt offers a negative
-     * label (FepPanel negative_, dex-verified).  Lives in the title band
-     * next to the counter now (v2's lonely bottom-band pill was "ugly"). */
-    if (g_negative[0]) {
-        const char *label = g_negative;
-        float lsc = 0.42f;
-        float tw = ovk_textw(label, lsc);
-        float lx = cnt_x - 12.0f - tw;
-        badge_pill(lx - 6.0f - 26.0f, band_cy - 7.0f,
-                   26.0f, 14.0f, "SEL", 0.36f);
-        ovk_emit(QB_DIM, lx, ovk_baseline_cy(band_cy, lsc), label, lsc);
-    }
+    /* SELECT affordance pill REMOVED (0.95.15): there is no cancel
+     * anymore, so nothing to advertise.  The game's negative label is
+     * still parsed into g_negative for the open-line LOG only. */
 
     /* text box + text (scrolled so the CARET stays visible) + caret */
     {
@@ -1139,10 +1097,6 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
         break;
     }
     n = strlen(g_text);
-    /* 0.95.13: remember exactly what the prompt asked with (post-trim),
-     * so SELECT can back out to it -- returning NULL here kills the game
-     * (see vk_cancel). */
-    text_copy(g_orig, sizeof g_orig, g_text);
     g_caret = (int)n;
     g_upper = n == 0 || g_text[n - 1] == ' ';
     /* new style: sentence start -> one-shot shift, exactly like the phone
@@ -1174,8 +1128,9 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
     funlockfile(stderr);
 }
 
-/* per-prompt cancel affordance (kairo FepPanel negative_ label); call
- * right after gds_osk_open from the Utility.startInputPanel hook. */
+/* per-prompt negative label (kairo FepPanel negative_ label); call right
+ * after gds_osk_open from the Utility.startInputPanel hook.  Since
+ * 0.95.15 the value powers the open-line LOG only -- no UI affordance. */
 void gds_osk_set_negative(const char *label)
 {
     if (!g_open || !label || !label[0]) { g_negative[0] = 0; return; }
@@ -1269,12 +1224,12 @@ void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev)
         }
         if (rep2 > 0) rep2--;
     }
-    /* SELECT = cancel only when the prompt offers it (v3): with START and
-     * SELECT now actually arriving (input.c evdev shadow merge), an
-     * unadvertised cancel on e.g. the company-name prompt could put the
-     * game into a re-prompt loop.  Classic keeps its historic behaviour.
-     * START = Done, always. */
-    if (BTNDN(NPB_BACK) && (g_style == 1 || g_negative[0])) vk_cancel();
+    /* START = Done, always.  SELECT is deliberately INERT (0.95.15, user
+     * decision): the game's cancel path is fatal at the boot prompt and
+     * runtime-registered per prompt elsewhere, so no cancel binding
+     * exists anywhere -- a dead key beats a fatal one.  History:
+     * 0.95.10-12 sent raw null (fatal); 0.95.13 "backed out unchanged";
+     * 0.95.14 had a GDS_OSK_CANCEL=null probe knob.  All gone. */
     if (BTNDN(NPB_START)) vk_commit();
 #undef BTN
 #undef BTNDN

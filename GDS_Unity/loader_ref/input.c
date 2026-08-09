@@ -1456,15 +1456,36 @@ void gds_input_poll(void *env, void *player, unsigned long frame) {
     pad_poll();
     frame_update();
     /* 0.84 OSK ownership of the pad (Terraria ter_vkbd_blocking gate):
-     * while the keyboard is open the game sees zero buttons/keys, and the
-     * 18-frame swallow after close keeps the confirming press from leaking
-     * back into the game as a phantom edge (Terraria g_vkbd_swallow). */
-    static int osk_was, osk_swallow;
+     * while the keyboard is open the game sees zero buttons/keys.
+     * 0.95.15: the post-close swallow was a FIXED 18 frames (Terraria
+     * g_vkbd_swallow) == ~0.3-0.6s of TOTAL input silence at device frame
+     * rate ("can't press A for 0.5s right after the game starts", user).
+     * Its only real job is keeping the CONFIRMING press from leaking
+     * into the game as a phantom edge -- a release gate does exactly
+     * that and nothing more: feed zeroes until the pad is fully idle,
+     * resume instantly.  Log each episode so the device can prove the
+     * hold is now release-length, not fixed. */
+    static int osk_was, osk_swallow, osk_swallow_frames;
     int osk_active = gds_osk_active();
-    if (osk_was && !osk_active) osk_swallow = 18;
+    if (osk_was && !osk_active) { osk_swallow = 1; osk_swallow_frames = 0; }
     osk_was = osk_active;
     if (osk_active)
         gds_osk_pad_tick(g_npb, g_npb_prev);
+    if (osk_swallow) {
+        osk_swallow_frames++;
+        int idle = 1;
+        for (int i = 0; i < NPB_COUNT; i++)
+            if (g_npb[i]) { idle = 0; break; }
+        if (idle)
+            for (int i = 0; i < NPA_COUNT; i++)
+                if (g_npa[i] > 0.5f || g_npa[i] < -0.5f) { idle = 0; break; }
+        if (idle) {
+            fprintf(stderr, "[input] osk closed: game input resumed after "
+                            "%d frame(s) of release-gate\n", osk_swallow_frames);
+            fflush(stderr);
+            osk_swallow = 0;
+        }
+    }
     if (osk_active || osk_swallow > 0) {
         if (osk_swallow > 0) osk_swallow--;
         memset(g_key_now, 0, sizeof g_key_now);

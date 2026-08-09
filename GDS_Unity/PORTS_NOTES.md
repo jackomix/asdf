@@ -4,6 +4,29 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.15-osk8 (SELECT fully inert + dead-A root-caused: OUR 18-frame swallow)
+
+- **SELECT removed from the OSK entirely** (user decision 2026-08-09:
+  "no curated list ... just remove the select back button entirely").
+  Binding, SEL pill, `vk_cancel`, `g_orig` snapshot and the 0.95.14
+  probe knob are all gone, in both styles.  The game's cancel path has
+  no trigger left on the OSK; `g_negative` still parses and appears in
+  the open-line log only.  START remains Done.  Asserts 80 -> 74
+  (SELECT-inert now asserted with and without a negative label, both
+  styles; START commits the edited text).
+- **"Can't press A for ~0.5s after the game starts": NOT the game --
+  ours.**  `gds_input_poll` fed a FIXED-18-frame TOTAL input blackout
+  to the game after every OSK close (Terraria `g_vkbd_swallow`), ~0.3-
+  0.6s dead at device frame rate.  Its sole legitimate purpose: keep
+  the confirming press from phantoming into the game as an edge.
+  Replaced with a RELEASE GATE: silence until the pad is fully idle
+  (buttons + stick/shoulder axes), then resume instantly -- ~0ms dead
+  beyond the user's own release.  Each close logs
+  `[input] osk closed: game input resumed after N frame(s)` so the
+  device can confirm the hold tracks release, not a fixed timer.  NOTE:
+  if any A-deadness turns up somewhere NOT immediately after an OSK
+  close, that's a separate beast -- report it with a log.
+
 ## 0.95.14-osk7 (cancel probe knob; cancel-branch disasm says PER-PROMPT)
 
 - **Is the raw Android cancel (null) ever safe?  The BINARY says: it is

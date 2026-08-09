@@ -241,18 +241,18 @@ int main(void) {
     CHECK(g_shake == OVK_SHAKE_FRAMES, "maxlen armed shake/flash");
     CHECK(strcmp(g_text, "aaa") == 0, "overflow char rejected");
 
-    /* 13. START commits; SELECT does NOTHING without a negative label */
+    /* 13. START commits; SELECT is INERT (0.95.15: cancel removed
+     * entirely -- the game's cancel path is fatal at the boot prompt and
+     * runtime-registered per prompt elsewhere; a dead key beats a fatal
+     * one). */
     g_open = 1; g_done = 0; g_ok = 0; g_negative[0] = 0;
     press(NPB_BACK);
-    CHECK(g_open == 1 && g_done == 0, "SELECT ignored when cancel not offered");
+    CHECK(g_open == 1 && g_done == 0, "SELECT inert (no negative label)");
     press(NPB_START);
     CHECK(g_done == 1 && g_ok == 1 && g_open == 0, "START commits");
 
-    /* 14. negative label offered -> SELECT backs out with the ORIGINAL
-     * prefill.  0.95.13: the old NULL result was device-proven game-fatal
-     * (cancel at boot "Company Name" -> the game raises its own error
-     * dialog and exits clean), so cancel must finish as "unchanged OK".
-     * Any mid-prompt edits are undone by the restore. */
+    /* 14. same when the prompt OFFERS a negative label: SELECT still does
+     * nothing, and START commits the EDITED text */
     gds_osk_open("t", "abc", 12);
     release_all();
     gds_osk_set_negative("back");
@@ -260,10 +260,13 @@ int main(void) {
     g_sel = find_key(0, 'd');
     g_shift = 0;
     press(NPB_A);
-    CHECK(strcmp(g_text, "abcd") == 0, "edit made before cancel");
+    CHECK(strcmp(g_text, "abcd") == 0, "edit made");
     press(NPB_BACK);
-    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abc") == 0,
-          "SELECT backs out with ORIGINAL text (game-safe)");
+    CHECK(g_open == 1 && g_done == 0,
+          "SELECT inert even with a negative label offered");
+    press(NPB_START);
+    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abcd") == 0,
+          "START commits the EDITED text");
     gds_osk_open("t", "abc", 12);
     release_all();
     gds_osk_set_negative("");
@@ -271,8 +274,7 @@ int main(void) {
     gds_osk_set_negative("12345678901234567890");
     CHECK(strcmp(g_negative, "back") == 0, "long garbage -> generic back");
 
-    /* 15. classic style: SELECT backs out with original text (same
-     * 0.95.13 game-fatal-null fix), START commits */
+    /* 15. classic style: SELECT inert there too, START commits */
     setenv("GDS_OSK", "classic", 1);
     g_style = -1;
     style_decide();
@@ -284,30 +286,10 @@ int main(void) {
     gds_osk_open("t", "abc", 12);
     release_all();
     press(NPB_BACK);
-    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abc") == 0,
-          "classic SELECT backs out with ORIGINAL text");
+    CHECK(g_open == 1 && g_done == 0, "classic SELECT inert");
     unsetenv("GDS_OSK");
     g_style = -1;
     style_decide();
-
-    /* 16. probe mode: GDS_OSK_CANCEL=null restores the RAW Android null
-     * contract (0.95.14 -- device evidence-gathering for whether the
-     * mid-game cancel handler is benign; disasm showed the cancel handler
-     * is a runtime-registered delegate, not hardwired fatal code) */
-    setenv("GDS_OSK_CANCEL", "null", 1);
-    gds_osk_open("t", "abc", 12);
-    release_all();
-    gds_osk_set_negative("back");
-    press(NPB_BACK);
-    CHECK(g_done == 1 && g_ok == 0,
-          "probe mode returns raw null (old Android contract)");
-    unsetenv("GDS_OSK_CANCEL");
-    gds_osk_open("t", "abc", 12);
-    release_all();
-    gds_osk_set_negative("back");
-    press(NPB_BACK);
-    CHECK(g_done == 1 && g_ok == 1 && strcmp(g_text, "abc") == 0,
-          "probe off -> safe back-out again");
 
     printf(failures ? "\n%d FAILURES\n" : "\nALL OK\n", failures);
     return failures ? 1 : 0;
