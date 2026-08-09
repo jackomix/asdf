@@ -57,6 +57,7 @@ extern void gds_egl_overlay_quads(const float *verts, int nquads,
 extern void gds_egl_overlay_end(void);
 extern int  egl_shim_screen_w(void);
 extern int  egl_shim_screen_h(void);
+extern long gds_mono_ms(void);      /* input.c: shared clock (caret blink) */
 
 /* ---------------------------------------------------------------- shared */
 static int  g_open, g_done, g_ok;
@@ -96,6 +97,15 @@ static void text_copy(char *dst, size_t cap, const char *src)
 #define OVK_SHAKE_FRAMES 22     /* maxlen trip: shake + red flash length */
 static int  g_shake;            /* >0: counter shake/flash frames left */
 
+/* caret blink (0.95.12 user ask): 600ms on / 400ms off, snapped back to
+ * SOLID every time the text or caret moves so it never hides mid-action */
+static long g_blink_t0;
+static void blink_reset(void) { g_blink_t0 = gds_mono_ms(); }
+static int blink_visible(void)
+{
+    return ((gds_mono_ms() - g_blink_t0) % 1000 + 1000) % 1000 < 600;
+}
+
 /* caret-based insert (classic keeps the caret pinned at end, so for it
  * this is exactly the old append-at-end behaviour).  Returns 0 when full. */
 static int insert_char(char c)
@@ -105,6 +115,7 @@ static int insert_char(char c)
     memmove(g_text + g_caret + 1, g_text + g_caret, n - (size_t)g_caret + 1);
     g_text[g_caret] = c;
     g_caret++;
+    blink_reset();
     return 1;
 }
 
@@ -114,6 +125,7 @@ static int vk_backspace(void)
     memmove(g_text + g_caret - 1, g_text + g_caret,
             strlen(g_text) - (size_t)g_caret + 1);
     g_caret--;
+    blink_reset();
     return 1;
 }
 
@@ -924,7 +936,7 @@ static void new_draw(void)
         ovk_emit_clip(QB_TEXT, bx0, bsl, g_text + st, sc, clipx);
         float cx = bx0 + ovk_textw_n(g_text + st,
                                      (size_t)g_caret - st, sc) + 2.0f;
-        if (cx < clipx)
+        if (cx < clipx && blink_visible())   /* user ask: caret blinks */
             RR(cx, (float)by + 8.0f, 3.0f, (float)bh - 16.0f, OVKC_CARET);
         /* L1/R1 caret pills gripping the box edges */
         badge_pill((float)bx - 14.0f, (float)by + (float)bh * 0.5f - 7.5f,
@@ -1027,6 +1039,13 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
         g_latch = 1;            /* swallow pad until full release once */
         if (title && title[0]) text_copy(g_title, sizeof g_title, title);
         else text_copy(g_title, sizeof g_title, "Enter text");
+        /* the game's labels carry the same trailing CR junk its text does
+         * (device log: title="Company Name\x0d") -- dont render a "?" */
+        {
+            size_t tn = strlen(g_title);
+            while (tn > 0 && (unsigned char)g_title[tn - 1] < 0x20)
+                g_title[--tn] = 0;
+        }
     }
     if (initial)
         text_copy(g_text, sizeof g_text, initial);
@@ -1093,6 +1112,7 @@ void gds_osk_open(const char *title, const char *initial, int maxlen)
     g_ok = 0;
     g_shake = 0;                /* a fresh prompt never inherits the
                                  * previous one's red-flash mid-decay */
+    blink_reset();
     char vis_title[128], vis_text[160];
     flockfile(stderr);
     fprintf(stderr, "[osk] open title=\"%s\" rawlen=%zu rawtail=[%s] -> "
@@ -1129,6 +1149,7 @@ void gds_osk_set_text(const char *text)
     g_caret = (int)strlen(g_text);
     g_upper = n == 0 || g_text[n - 1] == ' ';
     g_shift = (n == 0 || g_text[n - 1] == ' ') ? 1 : 0;
+    blink_reset();
 }
 
 void gds_osk_hide(void)
@@ -1194,6 +1215,7 @@ void gds_osk_pad_tick(const unsigned char *cur, const unsigned char *prev)
             g_caret += cd;
             if (g_caret < 0) g_caret = 0;
             if (g_caret > len) g_caret = len;
+            blink_reset();          /* keep the caret solid while walking */
             rep2 = edge_caret ? 8 : 4;
         }
         if (rep2 > 0) rep2--;

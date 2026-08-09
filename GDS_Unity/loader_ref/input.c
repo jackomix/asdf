@@ -285,6 +285,9 @@ static long watch_mono_ms(void) {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
+/* osk.c caret blink needs one shared realtime clock */
+long gds_mono_ms(void) { return watch_mono_ms(); }
+
 static int evdev_find_gamepad(void) {
     /* 0.94.0 device run: this scan matched NOTHING and said so nowhere --
      * the chord was dead and the log was silent about why.  Dump the first

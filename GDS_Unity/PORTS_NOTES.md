@@ -4,6 +4,37 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.12-osk5 (SELECT "crash" SOLVED-BY-LOG + caret blink + title CR trim)
+
+- **The "SELECT crashes the game" verdict: NOT A CRASH, and NOT the
+  quit chord -- the GAME's own cancel policy.**  The user's
+  port_launch.log shows the complete clean sequence: `[osk] CANCEL` ->
+  `isInputPanelFinish -> 1` -> `getInputPanelResult -> (null) "canceled"`
+  (exactly the Android cancel contract) -> `[jni] Kairo.showDialog
+  type=0 title="Error" message="An error has occurred."` -> `Unity
+  requested render-loop stop` -> nativePause -> `exited with code 0`.
+  Zero faults, zero backtrace.  Canceling the boot Company-Name entry
+  makes the GAME raise its own error dialog and shut itself down --
+  the same thing a phone does when you press Android BACK on that
+  required prompt.  Our plumbing did everything right.
+- **Device log FALSIFIED a 0.95.9 dex claim:** Company-Name prompt
+  passes `neg="Back"` (open line logs it), so the SEL pill + armed
+  SELECT-cancel at boot were CORRECT... and the game's answer to that
+  Back is error+quit.  NOTE: also `pos="OK\r"` and `title="Company
+  Name\r"` -- labels carry the same trailing-CR junk the text does.
+  OPEN QUESTION for device: does SELECT-cancel at a MID-GAME rename
+  (e.g. "Game name") also error+quit, or return benignly?  If it
+  errors too, the SEL pill is never useful and should be retired.
+- "have the cursor blink" -> caret blinks 600ms on / 400ms off via a
+  shared clock (new `gds_mono_ms()` input.c export); blink snaps solid
+  on open/set_text/type/backspace/caret-walk so it never hides
+  mid-action (classic OSK left solid).
+- Title trailing control bytes trimmed at open ("Company Name?" was
+  junk from the \x0d); text trim already existed.
+- Housekeeping: host harness files moved from /tmp (wiped every ~20min)
+  into tools/ (test_osk_logic.c, render_osk.c, render_osk.py) with
+  repo-relative includes.  76 asserts green.
+
 ## 0.95.11-osk4 (caret repeat speed + badge AA; SELECT crash PENDING LOG)
 
 - "holding L1/R1 repeats too slow (1.5-2x please)" -> caret repeat
