@@ -32,6 +32,19 @@ Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
   Company Name Done? office intro dialogue? main menu?) and the retail
   A/B: same APK on an Android phone, same moment -- if retail feels the
   same, case closed with gold-standard evidence.
+- **Deploy v3 (md5-verified upload)**: the user's device kept running
+  0.95.13-osk6 through two "still dead-A" reports -- banner in their
+  port_launch.log proved it (loader2 still Friday's build).  The last
+  deploy attempt showed zip activity at the ports dir then nothing
+  changed: consistent with the truncating-upload gremlin RECURRING and
+  v2's integrity test refusing (as designed) without self-healing.  v3:
+  local md5+bytes are compared against the device RIGHT AFTER scp
+  (`!! transfer corrupted: remote RB/RMD5 != local LB/LMD5` evidence
+  printed per attempt), retried up to 5x, abort leaves the live folder
+  untouched; staged version must now EXACTLY equal the expected build,
+  and a successful run states `uploaded + verified (md5 matches)`.
+  Mock-verified: one-corrupt-then-heal installs cleanly (saves carried
+  over); always-corrupt aborts with live folder + save intact.
 
 ## 0.95.15-osk8 (SELECT fully inert + dead-A root-caused: OUR 18-frame swallow)
 

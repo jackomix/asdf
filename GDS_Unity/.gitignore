@@ -7,3 +7,4 @@ GameDevStory_R36S.zip
 GameDevStory_PortMaster.zip
 ports/**/data/
 ports/**/home/
+tools/.gds_askpass.sh

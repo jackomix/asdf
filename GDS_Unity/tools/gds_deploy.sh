@@ -46,7 +46,9 @@ SCPBASE=(scp -o ConnectTimeout=12 -o StrictHostKeyChecking=no -o UserKnownHostsF
 echo "=== Game Dev Story deploy to $HOST ==="
 # v2: atomic install (2026-08-09).  v1 wiped the live folder BEFORE unzip;
 # a truncated upload or full SD card left the device with an empty game dir.
-echo "  deploy script v2 (atomic install, saves-preserving)"
+# v3: the upload itself must now PROVE itself (md5 + byte size vs local)
+# and retries on mismatch -- Sunday's truncating upload recurred.
+echo "  deploy script v3 (atomic install, saves-preserving, md5-verified upload)"
 
 # ---- 1. health + login check (retries; flaky R36S) ----
 up=0
@@ -144,19 +146,35 @@ if [ -z "$GZVER" ] || [ "$GZVER" != "$GDS_EXPECT_VER" ]; then
   fi
 fi
 echo "✓ zip ready ($(du -h "$ZIP" | cut -f1))"
+# The transfer leg gets a witness: local md5+size are compared against the
+# device AFTER scp.  (2026-08-09: the truncating upload that wiped the live
+# folder under v1 kept recurring; user-side download was always fine -- the
+# PC->device copy is the leg that lies, and it now has to prove itself.)
+LOCAL_MD5=$(python3 -c "import hashlib;print(hashlib.md5(open('$ZIP','rb').read()).hexdigest())")
+LOCAL_SZ=$(python3 -c "import os;print(os.path.getsize('$ZIP'))")
+echo "  zip md5=$LOCAL_MD5 bytes=$LOCAL_SZ"
 
-# ---- 3. upload with retries ----
+# ---- 3. upload with retries + hash verification ----
 echo "Uploading to $HOST ..."
-up=0
-for i in 1 2 3 4 5 6 7 8 9 10; do
+okxfer=0
+for i in 1 2 3 4 5; do
   echo "  upload attempt $i..."
-  if "${SCPBASE[@]}" "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip"; then up=1; break; fi
-  echo "  upload failed - retrying in 5s..."; sleep 5
+  if ! "${SCPBASE[@]}" "$ZIP" "$HOST:$PORTS_DIR/gamedevstory.zip"; then
+    echo "  upload failed - retrying in 5s..."; sleep 5; continue
+  fi
+  RMD5=$("${SSHBASE[@]}" "$HOST" "md5sum '$PORTS_DIR/gamedevstory.zip' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
+  RSZ=$("${SSHBASE[@]}" "$HOST" "wc -c < '$PORTS_DIR/gamedevstory.zip' 2>/dev/null | tr -d '[:space:]'" 2>/dev/null || true)
+  if [ "$RMD5" = "$LOCAL_MD5" ] && [ "$RSZ" = "$LOCAL_SZ" ]; then okxfer=1; break; fi
+  echo "  !! transfer corrupted: remote ${RSZ:-?}B/${RMD5:-no-md5} != local ${LOCAL_SZ}B/${LOCAL_MD5}"
+  echo "     retrying..."
 done
-if [ "$up" != "1" ]; then
-  echo "!! Upload failed after 10 tries. Restart the R36S and re-run."; exit 1
+if [ "$okxfer" != "1" ]; then
+  echo "!! Upload could not be verified after 5 tries (flaky wifi? full card?)"
+  echo "   The live game folder was NOT touched. Re-run the deploy; if this"
+  echo "   keeps happening, paste this output -- the md5/size pair names it."
+  exit 1
 fi
-echo "✓ uploaded"
+echo "✓ uploaded + verified (md5 matches)"
 
 # ---- 4. install (ATOMIC v2: stage + verify + swap; never wipes live files) ----
 # 0.95.13 device incident: the user re-deployed and the launcher found
@@ -206,6 +224,7 @@ echo "Installing (staged + verified; old folder kept until the swap)..."
       bail 'staged tree missing libil2cpp.so -- aborting, live folder NOT touched'
   STAGED_VER=\$(grep -a -oE 'reference-port 0\\.[0-9]+\\.[0-9]+(-[a-z0-9]+)?' .gds_install/gamedevstory/loader2 | head -1 | sed 's/reference-port //')
   [ -n \"\$STAGED_VER\" ] || bail 'staged loader2 has no version banner -- aborting, live folder NOT touched'
+  [ \"\$STAGED_VER\" = '$GDS_EXPECT_VER' ] || bail \"staged build is \$STAGED_VER but EXPECTED $GDS_EXPECT_VER -- wrong/stale zip uploaded; aborting, live folder NOT touched\"
   echo \"  staged build verified: \$STAGED_VER\"
 
   # 4) carry over player state the zip does not ship:
