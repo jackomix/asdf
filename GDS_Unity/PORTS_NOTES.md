@@ -4,6 +4,55 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## Controller button-icon UI — FOUND, dormant on Android (host-side audit of 2.6.9)
+
+User asked whether the PC/console-style on-screen controller button icons
+exist anywhere in the Android build ("maybe its a japanese name").  Yes --
+the whole system ships inside this APK, and yes, the user-facing bits are
+partly Japanese-named.  Evidence, host-side only:
+
+- **Glyph atlases are embedded in the game.**  Carved 38 PNGs from
+  `data/KairoLibrary.dll-resources.dat` (IL2CPP embedded-resources blob of
+  the shared `KairoLibrary` assembly; identical copy under
+  `data/Managed/Resources/`).  Resource-name table inside the blob lists:
+  `buttons_ps4.png`, `buttons_switch.png`, `buttons_xbox.png` (512x512
+  sheets: face buttons, L1/R1/L2/R2 | L/R/ZL/ZR + SL/SR | LB/RB/LT/RT,
+  menu/options/view variants, stick clicks, d-pad press states, trigger
+  wiggle frames), plus `button_gamepad.png`, `button_keyboard.png`,
+  `button_cancel.png`, `screen_cursor.png`, `right_click.png`,
+  `touch_effect.png`.  Copies saved to `GDS_Unity/ref/kairolib_buttons/`.
+- **Engine API is `kairo.unity.ui.Canvas`** (same class family as our kjoy
+  hook surface): `SetJoystickButtonDraw` / `ResetJoystickButtonDraw` /
+  `RaiseJoystickButtonDraw` / `DrawJoystickButtons` (screen button-hint
+  layer), `ChangeJoystickButtonType` / `GetJoystickButtonType` (ps4 /
+  switch / xbox sheet select), `SetControllerType` / `ChangeControllerType`
+  / `controllerType`, `get_InvalidJoystick` + `hasJoystick_` field,
+  `IsJoystick` / `IsJoystickEnable` / `IsRemocon` / `IsScreenCursor` /
+  `IsJcMouse` / `IsPointingDevice`, `SetJoystickAsobi` ("asobi" = stick
+  deadzone), `SetJoystickKeyReverse`, `GetJoystickKeyOK/Cancel`,
+  `SetInputGuardJoystick` / `CheckJoystickGuard`, `KEYID_GAMEPAD1/2` in the
+  DoJa-era KEYID table.  Engine settings keys: `JOYSTICK_ENABLE`,
+  `AutoCancelJoystick` (next to debug keys SHOW_DEBUG / SHOW_FPS /
+  SHOW_GUIDEPOINT / SHOW_MEMS).
+- **Japanese-named user-facing part:** the engine langpack (inside the same
+  resources blob) marks up tutorial text with inline glyph tags
+  `<btn=N[,variant]>` that the text renderer swaps for atlas sprites.
+  Only two entries use them -- the JP cursor-mode help:
+  `382,"<btn=10>ボタンを押すとカーソルモードになります。<br><btn=16,1>/<btn=29,0>でカーソルを移動して<br><btn=3>/<btn=0>ボタンでタッチしたのと同じ動きをするよ<br>もう一度、<btn=10>ボタンを押すと元に戻ります。"`
+  ("press <btn=10> for cursor mode; move with <btn=16,1>/<btn=29,0>; <btn=3>/<btn=0> clicks; <btn=10> again to exit"; 383 = same with
+  "select").  Full token census across the entire game tree: only
+  `<btn=0> <btn=3> <btn=10> <btn=16,1> <btn=29,0>`, ONLY inside the
+  KairoLibrary langpack -- the game's own language CSVs contain ZERO
+  `<btn=>` usage.  Legacy names `keypad01.png/keypad02.png` also linger in
+  metadata strings (DoJa-era).
+- **Conclusion:** the PC/console icon system exists in this build but is
+  dormant: no game text ever emits a `<btn=>` tag, and nothing observed
+  on device (user navigates whole game by pad, no icons appear).
+  NOT PROVEN either way: whether any GDS-Android code path ever calls
+  `SetJoystickButtonDraw`/`DrawJoystickButtons`/`DrawScreenCursor` at
+  runtime (needs method-address location + hook probe on device; deferred,
+  pending user call on whether to pursue).
+
 ## 0.95.16-osk9 (swallow gate CORRECTED + probeA phys-vs-game timestamps)
 
 - **0.95.15's release gate was NOT actually what ran on the device.**  A
