@@ -60,6 +60,53 @@ instrumentation to answer the rest in a single device run.
   candidate), 0x171ecec (very large, imms 97/99/100/109 + arrows 273-276
   = key-decider candidate).  All three empirically tagged in the probes.
 
+### 0.95.17-icons1 device run #1 (title-screen-only session — user exited via the game's own End menu; no chord line in log)
+
+Device (Aug 10 01:40): banner 0.95.17-icons1, `armed 17 joy/icon probes`, no
+arm SKIPs (every expect word matched).  probeA pairs consumed at +0ms.
+
+**Verdict-by-silence (the big one):**
+- **D.xx ops (Set/Reset/Raise/ChangeBtnType quartet + draw-list reader) NEVER
+  FIRED all session.**  GetJoystickButtonType (kind 41) never fired either.
+  Device-proven: the icon-hint machinery is never invoked on this build,
+  window covering boot + title + gamepad menu navigation.
+- **A.01 (sf+0x1c "joystick valid" writer) NEVER FIRED** -- the flag never
+  flips on pad input; "press a controller button -> icons on" does NOT
+  happen through that flag here.
+- J.02_InitJoystick never fired (readers run via our kjoy hooks regardless).
+- FIRED: A.02 once at boot (caller 0x17bf2d4 = a VIRTUAL hook dispatch
+  `blr x8` through vtable+0x1a8 = the form/plugin layer asking one
+  joystick-adjacent question once at startup, x0=0).
+- FIRED: K.02 @0x171e988 ONCE at boot with (self=0x7f84357b40, x1=1) --
+  one-shot => **InitScreenCursor, NOT DrawScreenCursor** (a per-frame draw
+  would fire constantly).  Caller 0x1720da0 stores cursor state into the
+  J/K class's sf+0x18.  Neighbour 0x171ff48 computes SCREEN CENTER in
+  floats (calls Unity Screen W/H at 0x1b9e488/0x1b9e4b0, asr+scvtf) =
+  cursor placed at screen center at boot: **the console stick-cursor
+  subsystem is live on Android.**  K.03 (self, 0, 0x28=40) = cursor-size-ish
+  init.  J.01 = keycode table read (x1=4) under it.
+- **The user's "set at export" theory is structurally right**: metadata
+  ships BOTH `kairo.android.plugin.Utility/Config/ad.*` AND
+  `kairo.windows.plugin.Utility`; boot picked the android container
+  (ApplicationManager/container-plugin boot code).  Hint/button-drawing
+  policy lives behind the platform plugin, so there is nothing like a pad
+  event that reroutes Android into the windows behaviors.  Not one variable.
+
+**Watcher bugs found (fix in next build, no rebuild yet):** guard required
+`trap_mapped(sf+0xf8)` so small-static classes (A @0x1ec63d0, J @0x1ebf2c8)
+never printed watch lines at all -> drop guard to +0x40; class name cstrs
+were unreadable at early-print time ("= ?.?.") -> lazy name refresh: retry
+until non-"?" then cache.
+
+**Fork for the user (his call before next build):**
+(a) force-enable the real engine system: sf+0x1c poke does nothing visible
+    (nothing reads it in Android flows); calling SetJoystickButtonDraw
+    ourselves = crafting managed args from outside, surgery-grade, its
+    per-screen content game never provides -> not elegant, low yield.
+(b) OUR overlay hint bar (we own the GL overlay already): bottom hints
+    (A/B/dpad) using the extracted glyph sheets, zero game surgery.
+(c) document dormancy, move on to next port.
+
 ### The probe build (one deployment, default ON, GDS_JPROBE=0 kills it)
 - 17 brk one-shot entry markers (kind 40 prints x0..x3 + caller;
   kind 41 on GetBtnType also dumps instance +0x144/+0x1c4/+0x160 list+len),
