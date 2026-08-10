@@ -645,6 +645,147 @@ static void arm_traps(uintptr_t il2b)
     }
 }
 
+/* ---------------- 0.95.17 joystick-icon statics watcher -------------------
+ * Host audit (PORTS_NOTES "Controller button-icon UI", VA map): the icon
+ * system state lives in the class-static blocks of five input classes the
+ * joystick/draw code touches.  Diffs of those blocks while the user presses
+ * pad buttons name the "enable icons" variable empirically.  Read-only. */
+struct jwatch_class { uint32_t slotva; const char *hint; uintptr_t cls, sf;
+                      unsigned long long snap[32]; int ready; };
+static struct jwatch_class g_jw[5] = {
+    {0x1ec63d0, "A_accessors"}, {0x1ebf2c8, "J_readers"},
+    {0x1ecc9d0, "D_btndraw"},  {0x1ec0b50, "D_cls2"}, {0x1ec0b60, "D_cls3"},
+};
+static long jw_mono_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+static void *joy_watch_thread(void *arg) {
+    (void)arg;
+    static long cool[5][32];
+    int lines = 0;
+    for (;;) {
+        usleep(8000);
+        if (lines > 300) { usleep(1000000); continue; }
+        for (int c = 0; c < 5; c++) {
+            struct jwatch_class *w = &g_jw[c];
+            uintptr_t cell = g_il2b + w->slotva;
+            if (!trap_mapped(cell)) continue;
+            uintptr_t cls = *(uintptr_t *)cell;
+            if (!trap_ptr_ok(cls) || !trap_mapped(cls + 0xb8)) continue;
+            uintptr_t sf = *(uintptr_t *)(cls + 0xb8);
+            if (!trap_ptr_ok(sf) || !trap_mapped(sf + 0xf8)) continue;
+            if (cls != w->cls || sf != w->sf) { w->cls = cls; w->sf = sf; w->ready = 0; }
+            if (!w->ready) {
+                char nb[96], nsb[96];
+                const char *nm = "?", *ns = "?";
+                uintptr_t np = *(uintptr_t *)(cls + 0x10);
+                uintptr_t xp = *(uintptr_t *)(cls + 0x18);
+                if (trap_mapped(np)) nm = trap_cstr(np, nb, sizeof nb);
+                if (trap_mapped(xp)) ns = trap_cstr(xp, nsb, sizeof nsb);
+                fprintf(stderr, "[jwatch] class il2cpp+%#lx (%s) = %s.%s sf=%#lx base:",
+                        (unsigned long)w->slotva, w->hint, ns, nm,
+                        (unsigned long)sf);
+                for (int i = 0; i < 32; i++)
+                    w->snap[i] = *(volatile unsigned long long *)(sf + 8 * i);
+                for (int i = 0; i < 8; i++)
+                    fprintf(stderr, " +%02x=%d", 4 * i, *(volatile int *)(sf + 4 * i));
+                fprintf(stderr, "\n");
+                w->ready = 1;
+                lines++;
+                continue;
+            }
+            for (int i = 0; i < 32; i++) {
+                unsigned long long v = *(volatile unsigned long long *)(sf + 8 * i);
+                if (v == w->snap[i]) continue;
+                unsigned long long old = w->snap[i];
+                w->snap[i] = v;
+                long now = jw_mono_ms();
+                if (now - cool[c][i] < 3000) continue;
+                cool[c][i] = now;
+                fprintf(stderr,
+                        "[jwatch] %s SF+0x%02x: lo %d->%d hi %d->%d newptr %#llx\n",
+                        w->hint, 8 * i,
+                        (int)(old & 0xffffffff), (int)(v & 0xffffffff),
+                        (int)(old >> 32), (int)(v >> 32),
+                        (unsigned long long)v);
+                lines++;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void arm_joy_probes(uintptr_t il2b)
+{
+    /* 0.95.17 (user task): find what enables the console-style controller
+     * button-icon UI.  Host-audit VA map (PORTS_NOTES): entry markers on
+     * the accessor sextet (writes/reads the joystick-valid flag + siblings),
+     * the joystick init/keycode funcs, the button-draw operations quartet,
+     * the GetJoystickButtonType tiny, and the three post-reader candidates.
+     * One-shot entries (kind 40 regs / 41 + instance fields) + the
+     * statics-watcher thread above.  Default ON in this build;
+     * GDS_JPROBE=0 in gds_env.cfg disables everything. */
+    const char *e = getenv("GDS_JPROBE");
+    if (e && !strcmp(e, "0")) {
+        fprintf(stderr, "[jprobe] disabled by GDS_JPROBE=0\n");
+        return;
+    }
+    static const struct { uint32_t va; uint32_t expect; const char *tag; int kind; } J[] = {
+        {0x171acc8, 0x97d65847u, "A.01_set1c",       40},
+        {0x171ad28, 0xf81e0ffeu, "A.02_tail_sf8",    40},
+        {0x171ad88, 0xf81e0ffeu, "A.03_get_sf8",     40},
+        {0x171ade0, 0xf81e0ffeu, "A.04_get_sf10",    40},
+        {0x171ae38, 0xf81e0ffeu, "A.05_get_sf18",    40},
+        {0x171ae90, 0xf81e0ffeu, "A.06_get_sf1c",    40},
+        {0x171aef0, 0xa9ba7bfdu, "A.07_bigInit",     40},
+        {0x171d10c, 0xf81d0ffeu, "J.01_keycode2",    40},
+        {0x171d24c, 0x97d64ee6u, "J.02_InitJoystick",40},
+        {0x171d6a8, 0x97d64dcfu, "D.01_drawlist_rd", 40},
+        {0x171d6d4, 0x97d64dc4u, "D.02_btnOp",       40},
+        {0x171d7b0, 0x97d64d8du, "D.03_btnOp",       40},
+        {0x171d890, 0x97d64d55u, "D.04_btnOp",       40},
+        {0x171d8bc, 0xb9414400u, "D.05_GetBtnType",  41},
+        {0x171e95c, 0x52800020u, "K.01_setter_movw1",40},
+        {0x171e988, 0xf81b0ffeu, "K.02_big_cursor?", 40},
+        {0x171ecec, 0xd101c3ffu, "K.03_big_keyimms", 40},
+    };
+    g_il2b = il2b;
+    int armed = 0;
+    for (size_t i = 0; i < sizeof J / sizeof *J && g_nprobes < MAX_PROBES; i++) {
+        uintptr_t a = il2b + J[i].va;
+        uintptr_t pg = a & ~0xfffUL;
+        if (mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            fprintf(stderr, "[jprobe] arm %s: mprotect fail\n", J[i].tag);
+            continue;
+        }
+        uint32_t cur = *(volatile uint32_t *)a;
+        if (cur != J[i].expect) {
+            fprintf(stderr, "[jprobe] arm %s @+%#x: word %#x != expected %#x (SKIPPED)\n",
+                    J[i].tag, J[i].va, cur, J[i].expect);
+            mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+            continue;
+        }
+        g_probes[g_nprobes].addr = a;
+        g_probes[g_nprobes].orig = cur;
+        g_probes[g_nprobes].hit = 0;
+        g_probes[g_nprobes].cap = 1;
+        g_probes[g_nprobes].kind = J[i].kind;
+        g_probes[g_nprobes].tag = J[i].tag;
+        *(uint32_t *)a = 0xd4200000;
+        __builtin___clear_cache((char *)a, (char *)a + 4);
+        mprotect((void *)pg, 0x1000, PROT_READ | PROT_EXEC);
+        g_nprobes++;
+        armed++;
+    }
+    fprintf(stderr, "[jprobe] armed %d joy/icon probes\n", armed);
+    pthread_t th;
+    if (!pthread_create(&th, NULL, joy_watch_thread, NULL))
+        pthread_detach(th);
+    else
+        fprintf(stderr, "[jwatch] thread spawn failed\n");
+}
+
 
 
 /* 0.95.0 log diet: probes that fire constantly with boot-stable content.
@@ -1241,6 +1382,29 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
                                 trap_cstr(*(uintptr_t *)(k + 0x18), n2, sizeof n2),
                                 trap_cstr(*(uintptr_t *)(k + 0x10), n1, sizeof n1));
                 }
+            } else if (p->kind == 40 || p->kind == 41) {
+                /* 0.95.17 joy/icon investigation entry markers: args dump */
+                fprintf(stderr, "[jprobe]   x0=%#lx x1=%#lx x2=%#lx x3=%#lx\n",
+                        (unsigned long)u->uc_mcontext.regs[0],
+                        (unsigned long)u->uc_mcontext.regs[1],
+                        (unsigned long)u->uc_mcontext.regs[2],
+                        (unsigned long)u->uc_mcontext.regs[3]);
+                if (p->kind == 41) {
+                    /* GetJoystickButtonType entry: instance fields */
+                    uintptr_t self = (uintptr_t)u->uc_mcontext.regs[0];
+                    if (trap_ptr_ok(self) && trap_mapped(self + 0x1c4)) {
+                        uintptr_t lst = *(volatile uintptr_t *)(self + 0x160);
+                        fprintf(stderr,
+                                "[jprobe]   self+0x144(btnType)=%d +0x1c4(steamOff)=%d +0x160(drawList)=%#lx",
+                                *(volatile int *)(self + 0x144),
+                                *(volatile unsigned char *)(self + 0x1c4),
+                                (unsigned long)lst);
+                        if (lst && trap_mapped(lst + 0x18))
+                            fprintf(stderr, " len=%d",
+                                    *(volatile int *)(lst + 0x18));
+                        fprintf(stderr, "\n");
+                    }
+                }
             } else if (p->kind == 32) {
                 /* 0.93.2: name-mangling pinpoint.  At GetFepPanelResult
                  * 0x17f4d08 the RESULT-PRODUCING delegate is live in x20
@@ -1652,7 +1816,7 @@ int main(int argc, char **argv)
         }
     }
 
-    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.16-osk9)\n", gds_gamedir);
+    fprintf(stderr, "[gds] Game Dev Story for NextOS -- gamedir %s (reference-port 0.95.17-icons1)\n", gds_gamedir);
     /* 0.88: prove knob pickup in the log itself.  Two diagnostics in a row
      * failed to fire because the runtime cfg lost its edits (redeploy wipes
      * it) and there was no positive signal either way. */
@@ -1694,6 +1858,7 @@ int main(int argc, char **argv)
                 (void *)il2->base, (void *)uni->base, (void *)main_mod->base);
     arm_fep_fix((uintptr_t)il2->base);   /* always-on; not a probe */
     arm_traps((uintptr_t)il2->base);
+    arm_joy_probes((uintptr_t)il2->base);
 
     /* System.load(libmain.so): its constructors run before JNI_OnLoad. */
     nx_run_init(main_mod);

@@ -4,6 +4,89 @@ Game: `net.kairosoft.android.gamedev3en` 2.6.9, Unity 2022.3.62f2, IL2CPP arm64.
 Target: R36S (ArkOS, RK3326, Mali-G31, 640×480, KMSDRM), custom ELF loader
 (`GDS_Unity/loader_ref`, builds `loader2`, ships in `gamedevstory.zip`).
 
+## 0.95.17-icons1 (controller-icon investigation: research + one-shot probe build)
+
+Goal (user): icons on PC/console appear as soon as a controller button is
+pressed; there's likely ONE variable enabling the whole thing.  Find it
+host-side as far as possible, then ship ONE deployment with enough
+instrumentation to answer the rest in a single device run.
+
+### Tooling facts (record before they bite again)
+- **PHDR mapping: text VA = file offset + 0x4000** (2nd PT_LOAD:
+  vaddr 0xb81194/off 0xb7d194; later segments +0x8000/+0xc000).  All VAs
+  below are ADDRESS-SPACE (as main.c patches and input.c kjoy hooks use);
+  any older notes where "VA == file offset" are off by 0x4000 in text
+  (FepPanel 0x17f4974 = file 0x17f0974, etc.).
+- Il2CppDumper can't be fetched from this sandbox (api.github.com 200 but
+  the release-asset CDN TLS-resets, rc=35).  Analysis was done with local
+  capstone walkers instead (`/home/user/gds_dis.py` converter, `gdswalk*.py`).
+- IL2CPP class-static access shape: `[il2cpp+classSlot] -> Il2CppClass ;
+  klass+0x10 = name cstr; +0x18 = namespace cstr; +0xb8 -> static_fields ;
+  field = static_fields + off`.  Per-method class-init guard flags live on
+  the `0x2000000` page (+0xa21 ... per method).
+
+### VA map (all confirmed against device-proven anchors JoyButton@0x171d8d8
+    JoyAxis@0x171d9c0 JoyPress@0x171dfa4 JoyDown@0x171e428 JoyUp@0x171e500
+    JoyAnalog@0x171e5d8 JoyHoldDown@0x171e680 JoyAnalogPress@0x171e8ac)
+- Accessor sextet (klass slot 0x1ec63d0, guard flags a21..a26; listed in
+  metadata right after the "Canvas" name):
+  - 0x171acc8 STORES to sf+0x1c      (a21)
+  - 0x171ad28 tails via object sf+8  (a22)
+  - 0x171ad88 ldr x0,[sf+8]; ret    (a23)
+  - 0x171ade0 ldr x0,[sf+0x10]; ret (a24)
+  - 0x171ae38 ldr w0,[sf+0x18]; ret (a25)
+  - 0x171ae90 ldr w0,[sf+0x1c]; ret (a26, reads the flag a21 writes)
+  - 0x171aef0 big init-style func right after the sextet
+  - Candidate names in metadata order: get/set_InvalidJoystick,
+    ChangeControllerType, SetControllerType, IsJoystick, IsRemocon --
+    exact pairing pending device values.
+- Joystick init/keycode: 0x171d10c (table reader, imm 96 = Android
+  BUTTON_A), 0x171d24c (big, imm 96, table INIT: explains why the keycode
+  table isn't in .rodata -- it's built by mov/stores at runtime).
+- Button-draw operations (klass slots 0x1ec0b50/0x1ec0b60/0x1ecc9d0,
+  guard flags a3a/a3e/a42-ish): entries **0x171d6d4, 0x171d7b0, 0x171d890**
+  (earlier "0x171d750/0x171d82c" start guesses were LLVM cold blocks;
+  true entries carry the cb0de4+cb0dec class-init pair).  Plus the little
+  list-reader at 0x171d6a8 (`[x0+0x160]` list, returns elem [1]).
+  Candidates: SetJoystickButtonDraw / ResetJoystickButtonDraw /
+  RaiseJoystickButtonDraw / ChangeJoystickButtonType.
+- **CONFIRMED tinies**: 0x171d8bc `ldr w0,[x0,#0x144]; ret` =
+  GetJoystickButtonType (Canvas INSTANCE int +0x144); 0x171d8c4/d0 =
+  Set/IsSteamOffsetEnable (instance byte +0x1c4).  So Canvas has a live
+  instance (the reader funcs' klass slot 0x1ebf2c8 is a DIFFERENT class --
+  the Joy* readers are not Canvas proper; names print at runtime).
+- Post-reader region: 0x171e95c (entry `mov w0,#1`, near imm-360 code),
+  0x171e988 (large, klass loads + virtual draws = DrawScreenCursor
+  candidate), 0x171ecec (very large, imms 97/99/100/109 + arrows 273-276
+  = key-decider candidate).  All three empirically tagged in the probes.
+
+### The probe build (one deployment, default ON, GDS_JPROBE=0 kills it)
+- 17 brk one-shot entry markers (kind 40 prints x0..x3 + caller;
+  kind 41 on GetBtnType also dumps instance +0x144/+0x1c4/+0x160 list+len),
+  each with host-file-verified expect words (loader skips+log on mismatch).
+  First hit = "this function is EVER called", caller VA = who asked.
+- joy statics watcher thread: resolves the five class slots (0x1ec63d0,
+  0x1ebf2c8, 0x1ecc9d0, 0x1ec0b50, 0x1ec0b60), prints ns.name + sf base
+  values, then diffs 256B per class at 125Hz; changes log
+  `[jwatch] <hint> SF+0x..: lo->lo hi->hi` with 3s/slot cooldown, 300-line
+  global cap.  Whatever variable the pad flips lands here, named by VA.
+- Read-only (plus the standard single-word restore/resume brk flow that
+  has been device-proven all along).  No forced writes to game state in
+  this build -- pure measurement, no confounders.
+
+### Device protocol (ONE run captures everything)
+Redeploy (deploy v4, expect banner/witness 0.95.17-icons1), launch, play
+~1-2 min: boot, finish "Hello!", open the system/save menu, navigate with
+the pad only, then quit via chord.  Pull /roms/ports/port_launch.log
+BEFORE relaunching.  Verdict readout:
+- [jprobe] D.xx hits -> the game DOES call the icon draw ops (caller VA
+  says who); none -> engine-only, Android never drives it.
+- [jwatch] A_accessors SF+0x1c flip on pad input -> the "joystick valid"
+  variable; SF+0x18/0x10 movement = controllerType/device candidates.
+- [jwatch] class lines CONFIRM or FIX every class-slot attribution.
+- If a variable flip appears an icon knob exists: next build pokes it
+  (e.g. force btnType/controllerType) under an env flag.
+
 ## Controller button-icon UI — FOUND, dormant on Android (host-side audit of 2.6.9)
 
 User asked whether the PC/console-style on-screen controller button icons
